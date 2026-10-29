@@ -1,0 +1,336 @@
+#!/usr/bin/python3 -I
+"""ares-listen (FEAT-lt32 C2): push-to-talk for the Ask Ares window. Records, transcribes on this machine, prints JSON.
+
+    ares-listen              record the default PipeWire source until SIGTERM (key release) or the 30 s cap, then
+                             transcribe through the local STT route and print the text
+    ares-listen ptt-down     SUPER+SHIFT+SPACE press: open the chat window in listening mode (no-op while recording)
+    ares-listen ptt-up       SUPER+SHIFT+SPACE release: SIGTERM the recorder (stop and transcribe)
+    ares-listen cancel       Esc / window closed: SIGINT the recorder (discard; nothing is sent anywhere)
+
+The chat window (askchat.luau) runs the default mode through `noctalia.runStream`. Every stdout line is one JSON event:
+
+    {"t": "listening", "elapsed": S}      at start and once per whole second
+    {"t": "level", "v": 0..1}             input level, at most 12 per second
+    {"t": "transcribing"}                 recording stopped, audio sent to the STT route
+    {"t": "text", "text": "..."}          the transcript ("" when nothing usable was heard: no POST is made)
+    {"t": "error", "title": "..."}        uppercase reason (mic or STT failure)
+    {"t": "cancelled"}                    SIGINT: the recording was discarded without a POST
+
+Privacy (D5): audio lives only in this process's memory. `pw-record --raw` streams s16le to a pipe, the WAV is built
+in an io.BytesIO and POSTed to 127.0.0.1:8765 (`/v1/audio/transcriptions`, hermes-data-tts serve.py). Nothing is
+written to disk except $XDG_RUNTIME_DIR/ares-listen.pid (removed on exit). No `--target`: the default source (S6).
+
+Test seams (env only): ARES_LISTEN_RECORDER (argv as a JSON list), ARES_LISTEN_STT_URL, ARES_LISTEN_MAX_S,
+ARES_LISTEN_MSG (the noctalia-primary-msg binary).
+"""
+import array
+import io
+import json
+import math
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import wave
+
+RATE = 16000
+WIDTH = 2                                   # s16le mono
+MIN_S = 0.3                                 # shorter than this is a stray tap: empty text, no POST
+FPS = 12                                    # level events per second (Design: <= 12 fps)
+STOP_GRACE_S = 0.2                          # recorder drain after SIGTERM before SIGKILL
+STT_TIMEOUT_S = 30
+WAIT_PID_S = 1.5                            # ptt-up / cancel racing a recorder that is still starting
+PANEL = "liquidtron/ares:askchat"
+
+HOME = "{{ .chezmoi.homeDir }}"
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+PIDFILE = os.path.join(RUNTIME, "ares-listen.pid")
+MAX_S = float(os.environ.get("ARES_LISTEN_MAX_S") or 30)
+STT_URL = os.environ.get("ARES_LISTEN_STT_URL") or "http://127.0.0.1:8765/v1/audio/transcriptions"
+MSG = os.environ.get("ARES_LISTEN_MSG") or f"{HOME}/.local/bin/noctalia-primary-msg"
+RECORDER = (json.loads(os.environ["ARES_LISTEN_RECORDER"]) if os.environ.get("ARES_LISTEN_RECORDER")
+            else ["pw-record", "--rate", str(RATE), "--channels", "1", "--format", "s16", "--raw", "-"])
+
+_stop = None                                # None | "stop" (SIGTERM) | "cancel" (SIGINT, or the reader went away)
+
+
+def emit(t, **fields):
+    global _stop
+    try:
+        sys.stdout.write(json.dumps({"t": t, **fields}, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except OSError:                         # the window closed the stream: nobody wants this recording
+        _stop = "cancel"
+        sys.stdout = open(os.devnull, "w")
+
+
+def on_sigterm(_sig, _frame):
+    global _stop
+    if _stop is None:
+        _stop = "stop"
+
+
+def on_sigint(_sig, _frame):
+    global _stop
+    _stop = "cancel"                        # wins over a pending stop
+
+
+# ---------------------------------------------------------------------------------------------------- pure helpers
+
+def level(pcm):
+    """0..1 loudness of s16le `pcm`: RMS mapped linearly from -60 dBFS (0) to 0 dBFS (1)."""
+    a = array.array("h")
+    a.frombytes(bytes(pcm[: len(pcm) // 2 * 2]))
+    if sys.byteorder == "big":
+        a.byteswap()
+    if not a:
+        return 0.0
+    rms = math.sqrt(sum(x * x for x in a) / len(a))
+    if rms < 1:
+        return 0.0
+    return round(max(0.0, min(1.0, (20 * math.log10(rms / 32768) + 60) / 60)), 3)
+
+
+def wav_bytes(pcm):
+    """A 16 kHz mono 16-bit WAV of `pcm`, built in memory."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(WIDTH)
+        w.setframerate(RATE)
+        w.writeframes(bytes(pcm[: len(pcm) // 2 * 2]))
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------------------------------- pidfile
+
+def live_pid():
+    """The pid in the pidfile when that process is a running ares-listen, else None."""
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"ares-listen" not in f.read():
+                return None
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return None
+    return pid
+
+
+def claim():
+    fd = os.open(PIDFILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"{os.getpid()}\n")
+
+
+def release():
+    try:
+        with open(PIDFILE) as f:
+            mine = f.read().strip() == str(os.getpid())
+        if mine:
+            os.unlink(PIDFILE)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------------------------------- record
+
+def stop_recorder(rec, fd, pcm, keep):
+    """SIGTERM the recorder and (when `keep`) drain what it flushes, for at most STOP_GRACE_S."""
+    try:
+        rec.terminate()
+    except OSError:
+        pass
+    deadline = time.monotonic() + STOP_GRACE_S
+    while keep:
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([fd], [], [], left)[0]:
+            break
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        pcm += chunk
+    try:
+        rec.wait(max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        rec.kill()
+        rec.wait()
+    rec.stdout.close()
+
+
+def _die_with_parent():
+    """Recorder child: SIGTERM it if ares-listen dies (SIGKILL/OOM), so the mic is never left open."""
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        pass
+
+
+def record():
+    """Raw s16le from the recorder until a signal, EOF or the cap. Returns (pcm, eof) or None when it cannot start."""
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+    signal.set_wakeup_fd(wake_w)            # a signal wakes the select at once (not after the next frame)
+    try:
+        rec = subprocess.Popen(RECORDER, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=_die_with_parent)
+    except OSError:
+        return None
+    fd = rec.stdout.fileno()
+    pcm = bytearray()
+    cap = int(MAX_S * RATE) * WIDTH
+    start = time.monotonic()
+    next_frame = start + 1 / FPS
+    second = 0
+    eof = False
+    emit("listening", elapsed=0)
+    while _stop is None and len(pcm) < cap:
+        now = time.monotonic()
+        if now - start >= MAX_S:
+            break
+        ready = select.select([fd, wake_r], [], [], max(0.0, min(next_frame, start + MAX_S) - now))[0]
+        if wake_r in ready:
+            try:
+                os.read(wake_r, 64)
+            except BlockingIOError:
+                pass
+        if fd in ready:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                eof = True
+                break
+            pcm += chunk
+        now = time.monotonic()
+        if now >= next_frame and _stop is None:
+            if int(now - start) != second:
+                second = int(now - start)
+                emit("listening", elapsed=second)
+            emit("level", v=level(pcm[-(RATE * WIDTH // FPS):]))
+            next_frame = now + 1 / FPS
+    stop_recorder(rec, fd, pcm, keep=_stop != "cancel" and not eof)
+    signal.set_wakeup_fd(-1)
+    os.close(wake_r)
+    os.close(wake_w)
+    del pcm[cap:]
+    return pcm, eof
+
+
+def transcribe(pcm):
+    """(text, None) or (None, error title). The WAV exists only in memory; proxies are bypassed (loopback only)."""
+    req = urllib.request.Request(STT_URL, data=wav_bytes(pcm), method="POST", headers={"Content-Type": "audio/wav"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=STT_TIMEOUT_S) as resp:
+            reply = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return None, f"STT FAILED // HTTP {e.code}"
+    except (urllib.error.URLError, OSError):
+        return None, "STT OFFLINE"
+    except ValueError:
+        return None, "STT BAD REPLY"
+    if not isinstance(reply, dict) or not isinstance(reply.get("text", ""), str):
+        return None, "STT BAD REPLY"
+    return " ".join(reply.get("text", "").split()), None
+
+
+def listen():
+    if live_pid() not in (None, os.getpid()):
+        emit("error", title="ALREADY LISTENING")
+        return 1
+    signal.signal(signal.SIGTERM, on_sigterm)
+    signal.signal(signal.SIGINT, on_sigint)
+    claim()
+    try:
+        got = record()
+        if got is None:
+            emit("error", title="MIC UNAVAILABLE")
+            return 1
+        pcm, eof = got
+        if _stop == "cancel":
+            del pcm[:]
+            emit("cancelled")
+            return 0
+        if len(pcm) < int(MIN_S * RATE) * WIDTH:
+            if eof and _stop is None:
+                emit("error", title="MIC STOPPED")
+                return 1
+            emit("text", text="")
+            return 0
+        emit("transcribing")
+        text, err = transcribe(pcm)
+        del pcm[:]
+        if _stop == "cancel":               # Esc while transcribing: drop the result
+            emit("cancelled")
+        elif err:
+            emit("error", title=err)
+            return 1
+        else:
+            emit("text", text=text)
+        return 0
+    finally:
+        release()
+
+
+# ---------------------------------------------------------------------------------------------------- control
+
+def wait_pid():
+    """The recorder pid, waiting briefly: a quick tap can release before the window has started the recorder."""
+    deadline = time.monotonic() + WAIT_PID_S
+    while True:
+        pid = live_pid()
+        if pid is not None or time.monotonic() >= deadline:
+            return pid
+        time.sleep(0.05)
+
+
+def msg(*args):
+    try:
+        subprocess.run([MSG, *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def ptt_down():
+    if live_pid() is not None:
+        return 0                            # already recording (key repeat, double press)
+    msg("panel-open", PANEL, "listen")      # closed window: onOpen("listen")
+    msg("plugin", PANEL, "all", "listen")   # open window: onIpc("listen"); askchat ignores a duplicate start
+    return 0
+
+
+def signal_recorder(sig):
+    pid = wait_pid()
+    if pid is not None:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+    return 0
+
+
+USAGE = "usage: ares-listen [ptt-down | ptt-up | cancel]"
+
+
+def main(argv):
+    if not argv:
+        return listen()
+    if argv == ["ptt-down"]:
+        return ptt_down()
+    if argv == ["ptt-up"]:
+        return signal_recorder(signal.SIGTERM)
+    if argv == ["cancel"]:
+        return signal_recorder(signal.SIGINT)
+    print(USAGE, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

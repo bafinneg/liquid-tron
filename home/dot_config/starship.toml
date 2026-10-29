@@ -1,0 +1,83 @@
+# Tron Compute — Starship prompt
+# Managed by apply-theme.sh — do not edit directly
+#
+# Palette:
+#   cyan   #0abdc6  primary   (directory, time)
+#   blue   #0072ff  secondary (git branch, ssh user/host)
+#   amber  #ff8c00  active    (git status, cmd_duration, caret, lang/docker context)
+#   red    #ff003c  error     (non-zero exit, error caret)
+
+add_newline = false
+command_timeout = 1000
+
+format = """
+$username\
+$directory\
+$git_branch\
+$git_status\
+$cmd_duration\
+$status\
+$character"""
+
+right_format = """$time"""
+
+[directory]
+style = "bold #0abdc6"
+truncation_length = 3
+truncation_symbol = "…/"
+read_only = " "
+read_only_style = "#ff003c"
+
+[git_branch]
+format = " [$symbol$branch]($style)"
+symbol = " "
+style = "#0072ff"
+
+[git_status]
+format = " [$all_status$ahead_behind]($style)"
+style = "#ff8c00"
+conflicted = "="
+ahead = "⇡${count}"
+behind = "⇣${count}"
+diverged = "⇡${ahead_count}⇣${behind_count}"
+untracked = "?${count}"
+stashed = "\\$${count}"
+modified = "!${count}"
+staged = "+${count}"
+renamed = "»${count}"
+deleted = "✘${count}"
+
+[cmd_duration]
+format = " [ $duration]($style)"
+style = "#ff8c00"
+min_time = 5000
+show_milliseconds = false
+
+[status]
+format = " [$symbol$status]($style)"
+symbol = "✘ "
+style = "#ff003c"
+disabled = false
+pipestatus = true
+
+[character]
+success_symbol = " [❯](bold #ff8c00)"
+error_symbol = " [❯](bold #ff003c)"
+
+[username]
+format = "[$user]($style) "
+style_user = "#0072ff"
+style_root = "#ff003c bold"
+show_always = false
+
+[hostname]
+format = "[$hostname]($style) "
+style = "#0072ff"
+ssh_only = true
+ssh_symbol = " "
+
+[time]
+format = "[$time]($style)"
+style = "#0abdc6 dimmed"
+time_format = "%H:%M"
+disabled = false

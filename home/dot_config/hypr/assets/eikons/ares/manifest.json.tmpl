@@ -1,0 +1,80 @@
+{
+  "source": "{{ .chezmoi.homeDir }}/.nvm/versions/node/v24.14.1/lib/node_modules/herm-tui/assets/eikons/ares.eikon",
+  "source_url": "https://raw.githubusercontent.com/liftaris/eikon/main/eikons/ares/",
+  "name": "ares",
+  "author": "kaio",
+  "width": 48,
+  "height": 24,
+  "states": [
+    {
+      "state": "idle",
+      "fps": 16,
+      "color": "#7aa2f7",
+      "frame_count": 65,
+      "loop_from": 0
+    },
+    {
+      "state": "listening",
+      "fps": 16,
+      "color": "#9ece6a",
+      "frame_count": 82,
+      "loop_from": 33
+    },
+    {
+      "state": "thinking",
+      "fps": 16,
+      "color": "#e0af68",
+      "frame_count": 33,
+      "loop_from": 33
+    },
+    {
+      "state": "speaking",
+      "fps": 16,
+      "color": "#bb9af7",
+      "frame_count": 82,
+      "loop_from": 33
+    },
+    {
+      "state": "working",
+      "fps": 16,
+      "color": "#ff9e64",
+      "frame_count": 65,
+      "loop_from": 0
+    },
+    {
+      "state": "error",
+      "fps": 16,
+      "color": "#f7768e",
+      "frame_count": 33,
+      "loop_from": 33
+    }
+  ],
+  "generated_for": "hyprlock cmd[update] animated label",
+  "frame_counts": {
+    "idle": 65,
+    "listening": 82,
+    "thinking": 33,
+    "speaking": 82,
+    "working": 65,
+    "error": 33
+  },
+  "cycle_order": [
+    "idle",
+    "listening",
+    "thinking",
+    "speaking",
+    "working",
+    "error"
+  ],
+  "cycle_total_frames": 360,
+  "render": {
+    "frame_markup": "plain",
+    "color_owner": "hyprlock.conf label color rgba(10, 189, 198, 1)",
+    "source_state_colors": "states[].color and ares.eikon only; not rendered",
+    "generator": "tools/eikon/ares_frames.py --mode plain --write",
+    "frames_sha256_aggregate": "026a9777b570b396db80ac55a67cd97b2063d619a2d5b6882a6cdb464de14003",
+    "source_frames_sha256_aggregate": "4a4aa11740f9ffa4a282cea172a8258ae18302a813c076aea2377a2002b453f7",
+    "restore": "tools/eikon/ares_frames.py --mode source --write",
+    "lt26": "LT26R-6"
+  }
+}

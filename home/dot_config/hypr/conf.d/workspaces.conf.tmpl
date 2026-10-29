@@ -1,0 +1,15 @@
+# Split-monitor workspaces — FEAT-workspace-split-monitor.
+#
+# Workspace ownership is now provided by the split-monitor-workspaces hyprpm
+# plugin, loaded in hyprland.conf before any split-* dispatcher binds parse.
+# The plugin creates 3 persistent workspaces per monitor. Brian's user-facing
+# model is local numbering on the focused monitor: workspace 1, 2, or 3 on
+# whichever monitor currently has focus.
+#
+# Monitor priority uses live output names from `hyprctl monitors -j`:
+#   DP-2 → left   (Dell AW2725Q {{ .monitors.left.serial }}, x=0)
+#   DP-3 → center (ASUS PG42UQ {{ .monitors.center.serial }}, x=3840)
+#   DP-4 → right  (Dell AW2725Q {{ .monitors.right.serial }}, x=7680)
+#
+# Do not add retired named-workspace rules here; those belong to the old
+# activity model and are intentionally absent.

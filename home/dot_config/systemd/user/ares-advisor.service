@@ -1,0 +1,13 @@
+[Unit]
+Description=Ares advisor — watches the machine and speaks through the centre meter
+After=graphical-session.target ares-presence-hub.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I %h/.local/bin/ares-advisor run
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

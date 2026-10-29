@@ -1,0 +1,512 @@
+-- Ask Ares chat window (FEAT-lt32 C1): a floating, centred plugin panel (1000x680, exclusive keyboard focus) opened by
+-- the ASK button (askbutton.luau) and SUPER+SPACE. Enter sends, SHIFT+ENTER adds a line, TAB toggles ZGX / CLOUD,
+-- CTRL+N starts a new Conversation, Esc closes (host).
+--
+-- Engine: ares-ask through noctalia.runStream (same shQuote / seq-guard rules as ask.luau). The first cloud message
+-- starts a Hermes Conversation; ares-ask then prints {"t":"session","id":SID} and every later cloud message runs with
+-- `--resume SID`, so OPEN IN HERMES (ares-summon --hermes SID) shows the same thread. LOCAL is single-turn.
+-- ares-ask is started with --no-watch: its launcher-layer watcher would cancel a run that has no launcher open.
+--
+-- The composer is a ui.input: uncontrolled (the host owns the text), `focus = true` fires once when the control is
+-- created. Its key is stable across re-renders; it changes only on open, after a send and on a new Conversation, so
+-- the field empties and takes focus again.
+-- No timers, no frame ticks: the panel redraws on stream lines and key events only; nothing runs while it is closed.
+-- Window border/radius come from the host panel chrome (shell.panel.borders); shadow is off in config.toml.
+--
+-- Voice (FEAT-lt32 C2, push-to-talk only): `ares-listen ptt-down` (SUPER+SHIFT+SPACE press) opens the window with
+-- context "listen" and also sends the plugin event `listen` (for an already open window); the mic button does the
+-- same. Either starts `ares-listen` through runStream under its own `listenSeq` guard. Its events drive the Listening
+-- state: composer border and label red `LISTENING`, level bars, elapsed; then `TRANSCRIBING`; a non-empty text is sent
+-- on the current route (or seeds the composer while an answer is still streaming). Release (`ptt-up`) or a second mic
+-- click stops it; Esc / close discards it (`ares-listen cancel`). A repeated open with "listen" never rebuilds the input.
+
+local ASK = "{{ .chezmoi.homeDir }}/.local/bin/ares-ask"
+local LISTEN = "{{ .chezmoi.homeDir }}/.local/bin/ares-listen"
+local SUMMON = "{{ .chezmoi.homeDir }}/.local/bin/ares-summon"
+local MSG = "{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg"
+local DOT = "\u{00B7}"
+local MAX_TEXT = 4000
+local MAX_TITLE = 48
+
+local DIM = "on_surface_variant"
+local FAINT = "on_surface_variant/0.6"
+local CYAN = "primary"
+local AMBER = "#ff8c00"
+local FIELD = "#0d0d1a"
+local CHIP = "primary/0.14"
+local RED = "#ff003c" -- design-system red; the only colour C2 adds, used in the window only (never on the bar)
+local LEVEL_BARS = 16
+
+local runtimeDir = noctalia.getenv("XDG_RUNTIME_DIR")
+if runtimeDir == nil or runtimeDir == "" then
+  runtimeDir = "/run/user/1000"
+end
+local LAST = runtimeDir .. "/ares/ask-last.json"
+
+local isOpen = false
+local route = "local" -- "local" (ZGX: qwen on zgx-02, the default since HQ-0062) | "cloud"
+local sid = nil -- Hermes session id of the current Conversation
+local title = nil
+local messages = {} -- { { who = "you" | "ares", text, partial } }
+local running = false
+local statusText = nil
+local seq = 0 -- bumped per send / new Conversation; lines from older streams are dropped
+local scrollRev = 0
+local composerGen = 0 -- composer key suffix: a new key empties the field and re-takes focus
+local recent = {} -- ask-last.json ring, newest first
+local gen = 0 -- bumped on open / close; a stale ask-last.json read is dropped
+local listening = nil -- nil | "listening" | "transcribing"
+local listenSeq = 0 -- bumped per recording / cancel; lines from an older ares-listen are dropped
+local levels = {} -- newest last, at most LEVEL_BARS
+local listenSecs = 0
+local composerValue = nil -- seeds a fresh composer (voice text that arrived while an answer was streaming)
+
+local render -- forward declaration
+
+-- ------------------------------------------------------------------------------------------------- helpers
+
+local function trim(s)
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- POSIX single quoting, the rule ares-ask sh_quote() and ask.luau shQuote() share.
+local function shQuote(text)
+  return "'" .. text:gsub("'", "'\\''") .. "'"
+end
+
+local function command(r, question, resume)
+  local c = ASK .. " --" .. r .. " --no-watch"
+  if resume ~= nil and r == "cloud" then
+    c = c .. " --resume " .. shQuote(resume)
+  end
+  return c .. " -- " .. shQuote(question)
+end
+
+local function headline(text)
+  local s = trim((text:gsub("%c", " "):gsub("%s+", " "))):upper()
+  local n = utf8.len(s)
+  if n ~= nil and n > MAX_TITLE then
+    s = s:sub(1, utf8.offset(s, MAX_TITLE - 2) - 1) .. "..."
+  end
+  return s
+end
+
+local function bump()
+  scrollRev = scrollRev + 1
+end
+
+local function tellButton(state)
+  noctalia.runAsync({ MSG, "plugin", "liquidtron/ares:askbutton", "all", "state", state })
+end
+
+local function clockOf(ev)
+  if type(ev.title) == "string" then
+    return ev.title:match("%d%d:%d%d")
+  end
+  return nil
+end
+
+-- ------------------------------------------------------------------------------------------------- stream
+
+local function finish(text)
+  local m = messages[#messages]
+  if m ~= nil and m.who == "ares" then
+    m.text = text
+    m.partial = false
+  end
+  running = false
+  statusText = nil
+end
+
+local function onLine(mySeq, line)
+  if mySeq ~= seq then
+    return -- a replaced run
+  end
+  local ev = noctalia.json.decode(line)
+  if type(ev) ~= "table" or type(ev.t) ~= "string" then
+    return
+  end
+  if ev.t == "status" or ev.t == "partial" then
+    local clock = clockOf(ev)
+    statusText = "ARES // ANSWERING" .. (clock and (" " .. clock) or "")
+    local m = messages[#messages]
+    if ev.t == "partial" and m ~= nil and type(ev.lines) == "table" then
+      m.text = table.concat(ev.lines, "\n")
+    end
+  elseif ev.t == "answer" then
+    finish(type(ev.full) == "string" and ev.full or "")
+  elseif ev.t == "session" then
+    if type(ev.id) == "string" and ev.id ~= "" then
+      sid = ev.id
+    end
+  elseif ev.t == "yield" or ev.t == "error" then
+    local text = type(ev.title) == "string" and ev.title or "ERROR"
+    if type(ev.lines) == "table" and #ev.lines > 0 then
+      text = text .. "\n" .. table.concat(ev.lines, "\n")
+    end
+    finish(text)
+  elseif ev.t == "cancelled" then
+    finish("CANCELLED")
+  end
+  bump()
+  render()
+end
+
+local function send(text)
+  text = trim(text or "")
+  if text == "" or running then
+    return
+  end
+  if #text > MAX_TEXT then
+    text = text:sub(1, MAX_TEXT)
+  end
+  if title == nil then
+    title = headline(text)
+  end
+  seq = seq + 1
+  local mySeq = seq
+  messages[#messages + 1] = { who = "you", text = text }
+  messages[#messages + 1] = { who = "ares", text = "", partial = true }
+  running = true
+  statusText = "ARES // ANSWERING"
+  composerValue = nil
+  composerGen = composerGen + 1
+  local ok = noctalia.runStream(command(route, text, sid), function(line)
+    onLine(mySeq, line)
+  end)
+  if not ok then
+    finish("ARES IS BUSY // TRY AGAIN")
+  end
+  bump()
+  render()
+end
+
+local function newConversation()
+  seq = seq + 1 -- drops any stream still talking
+  sid = nil
+  title = nil
+  messages = {}
+  running = false
+  statusText = nil
+  composerGen = composerGen + 1
+  bump()
+  render()
+end
+
+local function openHermes()
+  if sid ~= nil then
+    noctalia.runAsync({ SUMMON, "--hermes", sid })
+  else
+    noctalia.runAsync({ SUMMON })
+  end
+  panel.close()
+end
+
+local function toggleRoute()
+  route = route == "cloud" and "local" or "cloud"
+  render()
+end
+
+-- ------------------------------------------------------------------------------------------------- voice
+
+local function listenDone(note)
+  listening = nil
+  levels = {}
+  if note ~= nil and not running then
+    statusText = note
+  end
+end
+
+local function onListenLine(mySeq, line)
+  if mySeq ~= listenSeq then
+    return -- a cancelled or replaced recording
+  end
+  local ev = noctalia.json.decode(line)
+  if type(ev) ~= "table" or type(ev.t) ~= "string" then
+    return
+  end
+  if ev.t == "listening" then
+    if type(ev.elapsed) == "number" then
+      listenSecs = math.floor(ev.elapsed)
+    end
+  elseif ev.t == "level" then
+    if type(ev.v) == "number" then
+      levels[#levels + 1] = math.max(0, math.min(1, ev.v))
+      if #levels > LEVEL_BARS then
+        table.remove(levels, 1)
+      end
+    end
+  elseif ev.t == "transcribing" then
+    listening = "transcribing"
+  elseif ev.t == "text" then
+    local text = type(ev.text) == "string" and trim(ev.text) or ""
+    listenDone(text == "" and "HEARD NOTHING" or nil)
+    if text ~= "" then
+      if running then
+        composerValue = text -- an answer is still streaming: the words wait in the composer for Enter
+        composerGen = composerGen + 1
+      else
+        send(text) -- sets the status line and renders
+        return
+      end
+    end
+  elseif ev.t == "error" then
+    listenDone("VOICE // " .. (type(ev.title) == "string" and ev.title or "ERROR"))
+  elseif ev.t == "cancelled" then
+    listenDone(nil)
+  end
+  render()
+end
+
+local function startListen()
+  if not isOpen or listening ~= nil then
+    return -- one recording at a time; a repeated ptt-down / open("listen") is a no-op
+  end
+  listenSeq = listenSeq + 1
+  local mySeq = listenSeq
+  listening = "listening"
+  levels = {}
+  listenSecs = 0
+  if not running then
+    statusText = nil
+  end
+  local ok = noctalia.runStream(LISTEN, function(line)
+    onListenLine(mySeq, line)
+  end)
+  if not ok then
+    listenDone("VOICE // BUSY // TRY AGAIN")
+  end
+  render()
+end
+
+local function stopListen()
+  if listening == "listening" then
+    noctalia.runAsync({ LISTEN, "ptt-up" })
+  end
+end
+
+local function cancelListen()
+  if listening ~= nil then
+    listenSeq = listenSeq + 1 -- the stream's remaining lines are dropped
+    listenDone(nil)
+    noctalia.runAsync({ LISTEN, "cancel" })
+  end
+end
+
+local function micClick()
+  if listening == nil then
+    startListen()
+  else
+    stopListen()
+  end
+end
+
+-- ------------------------------------------------------------------------------------------------- views
+
+local function chip()
+  local text = route == "cloud" and ("CLOUD " .. DOT .. " OPUS 5.5") or ("ZGX " .. DOT .. " QWEN 7B")
+  return ui.row({ key = "route", fill = CHIP, radius = 6, paddingH = 10, paddingV = 4, align = "center",
+    onClick = toggleRoute }, {
+    ui.label({ text = text, fontSize = 11, fontWeight = "bold", color = CYAN, maxLines = 1 }),
+  })
+end
+
+local function header()
+  return ui.row({ key = "head", gap = 12, align = "center" }, {
+    ui.image({ path = "assets/helm/00.png", width = 28, height = 28 }),
+    ui.label({ text = "ARES", fontSize = 15, fontWeight = "bold", color = CYAN, maxLines = 1 }),
+    ui.label({ key = "title", text = title or "NEW CONVERSATION", fontSize = 13, color = DIM, maxLines = 1,
+      flexGrow = 1 }),
+    chip(),
+    ui.button({ key = "hermes", text = "OPEN IN HERMES", glyph = "external-link", variant = "ghost",
+      controlSize = "sm", onClick = openHermes }),
+    ui.label({ key = "esc", text = "ESC", fontSize = 10.5, color = FAINT, maxLines = 1 }),
+  })
+end
+
+local function messageNode(i, m)
+  local mine = m.who == "you"
+  local body
+  if mine then
+    body = ui.label({ text = m.text, fontSize = 14 })
+  elseif m.text == "" then
+    body = ui.label({ text = "...", fontSize = 14, color = AMBER })
+  else
+    body = ui.markdown({ text = m.text })
+  end
+  return ui.column({ key = "msg-" .. tostring(i), gap = 4, paddingV = 6 }, {
+    ui.label({ text = mine and "YOU" or "ARES", fontSize = 10.5, fontWeight = "bold",
+      color = mine and FAINT or CYAN, maxLines = 1 }),
+    body,
+  })
+end
+
+local function recentNode(i, entry)
+  local q = entry.question
+  return ui.row({ key = "recent-" .. tostring(i), gap = 10, align = "center", paddingH = 10, paddingV = 8,
+    radius = 8, fill = FIELD, onClick = function()
+      send(q)
+    end }, {
+    ui.label({ text = (entry.route == "local") and "ZGX" or "CLOUD", fontSize = 10, color = FAINT, width = 56 }),
+    ui.label({ text = headline(q), fontSize = 13, maxLines = 1, flexGrow = 1 }),
+  })
+end
+
+local function transcript()
+  local kids = {}
+  if #messages == 0 then
+    kids[#kids + 1] = ui.label({ key = "empty", text = "ASK ARES ANYTHING", fontSize = 16, fontWeight = "bold",
+      color = DIM, maxLines = 1 })
+    if #recent > 0 then
+      kids[#kids + 1] = ui.label({ key = "recent-head", text = "RECENT", fontSize = 10.5, color = FAINT, maxLines = 1 })
+      for i, entry in ipairs(recent) do
+        kids[#kids + 1] = recentNode(i, entry)
+      end
+    end
+  else
+    for i, m in ipairs(messages) do
+      kids[#kids + 1] = messageNode(i, m)
+    end
+  end
+  return ui.scroll({ key = "transcript", gap = 6, flexGrow = 1, stickToBottom = true, scrollToBottomRev = scrollRev },
+    kids)
+end
+
+-- Listening strip: red label, level bars (oldest left) and elapsed. Sits after the input so the input keeps its slot.
+local function listenStrip()
+  local kids = {
+    ui.label({ text = listening == "transcribing" and "TRANSCRIBING" or "LISTENING", fontSize = 11,
+      fontWeight = "bold", color = RED, maxLines = 1 }),
+  }
+  if listening == "listening" then
+    local bars = {}
+    for i = 1, LEVEL_BARS do
+      local v = levels[#levels - LEVEL_BARS + i] or 0
+      bars[i] = ui.box({ width = 3, height = 3 + math.floor(v * 17 + 0.5), radius = 1, fill = RED })
+    end
+    kids[#kids + 1] = ui.row({ key = "levels", gap = 2, align = "center", height = 20 }, bars)
+    kids[#kids + 1] = ui.label({ text = string.format("%02d:%02d", listenSecs // 60, listenSecs % 60), fontSize = 11,
+      color = RED, maxLines = 1 })
+  end
+  return ui.row({ key = "listen", gap = 8, align = "center" }, kids)
+end
+
+local function composer()
+  local kids = {
+    ui.input({
+      key = "composer-" .. tostring(composerGen),
+      value = composerValue,
+      placeholder = running and "ARES IS ANSWERING..." or "ASK ARES",
+      focus = true,
+      multiline = true,
+      submitOnEnter = true,
+      frameVisible = false,
+      fontSize = 14,
+      flexGrow = 1,
+      onSubmit = function(value)
+        send(value)
+      end,
+    }),
+  }
+  if listening ~= nil then
+    kids[#kids + 1] = listenStrip()
+  end
+  kids[#kids + 1] = ui.button({ key = "mic", glyph = listening == nil and "microphone" or "player-stop",
+    variant = "ghost", controlSize = "sm", onClick = micClick,
+    tooltip = listening == nil and "TALK // OR HOLD SUPER+SHIFT+SPACE" or "STOP AND SEND" })
+  local props = { key = "composer-row", gap = 10, align = "center", paddingH = 12, paddingV = 8, radius = 8,
+    fill = FIELD }
+  if listening ~= nil then
+    props.border = RED -- Listening state (Design); the window is not the bar, so this stroke never meets a bar edge
+    props.borderWidth = 1
+  end
+  return ui.row(props, kids)
+end
+
+render = function()
+  if not isOpen then
+    return
+  end
+  local kids = { header(), transcript() }
+  if statusText ~= nil then
+    kids[#kids + 1] = ui.label({ key = "status", text = statusText, fontSize = 11, color = AMBER, maxLines = 1 })
+  end
+  kids[#kids + 1] = composer()
+  kids[#kids + 1] = ui.label({ key = "keys",
+    text = "ENTER SEND   SHIFT+ENTER NEW LINE   TAB ROUTE   CTRL+N NEW   HOLD SUPER+SHIFT+SPACE TALK   ESC CLOSE",
+    fontSize = 10.5, color = FAINT, maxLines = 1 })
+  panel.render(ui.column({ padding = 18, gap = 10, flexGrow = 1, radius = 10 }, kids))
+end
+
+-- ------------------------------------------------------------------------------------------------- entry points
+
+local function loadRecent()
+  local myGen = gen
+  noctalia.readFileAsync(LAST, function(contents, _err)
+    if myGen ~= gen or not isOpen or contents == nil then
+      return
+    end
+    local d = noctalia.json.decode(contents)
+    if type(d) ~= "table" then
+      return
+    end
+    local ring = type(d.recent) == "table" and d.recent or { d }
+    local out = {}
+    for i = 1, math.min(3, #ring) do
+      if type(ring[i]) == "table" and type(ring[i].question) == "string" then
+        out[#out + 1] = ring[i]
+      end
+    end
+    recent = out
+    render()
+  end)
+end
+
+function onOpen(context)
+  if isOpen then
+    -- Already open (panel-open from ptt-down): keep the composer and its text; only start listening.
+    if context == "listen" then
+      startListen()
+    else
+      render()
+    end
+    return
+  end
+  gen = gen + 1
+  isOpen = true
+  composerValue = nil
+  composerGen = composerGen + 1 -- fresh composer: empty field, focus on open
+  tellButton("open")
+  render()
+  loadRecent()
+  if context == "listen" then
+    startListen()
+  end
+end
+
+function onClose()
+  cancelListen() -- Esc or an outside click discards a recording
+  gen = gen + 1
+  isOpen = false
+  tellButton("closed")
+end
+
+-- `noctalia-primary-msg plugin liquidtron/ares:askchat all listen` (sent by ares-listen ptt-down): push-to-talk while
+-- the window is already open. Ignored while closed; the panel-open sent just before it opens with "listen" instead.
+function onIpc(event, _payload)
+  if event == "listen" then
+    startListen()
+  end
+end
+
+-- capture_keys = Tab, ctrl+n (the host consumes only these; Esc always closes).
+function onKey(chord, pressed)
+  if not pressed or not isOpen then
+    return
+  end
+  if chord == "Tab" then
+    toggleRoute()
+  elseif chord == "ctrl+n" then
+    newConversation()
+  end
+end

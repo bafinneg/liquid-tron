@@ -1,0 +1,13 @@
+[Unit]
+Description=ws-sweep: Depth Sweep workspace transition feedback (Quickshell)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/qs -n -c ws-sweep
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

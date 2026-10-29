@@ -1,0 +1,77 @@
+#!/usr/bin/env sh
+set -eu
+
+runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+status_file=$runtime_dir/rofi-mocr-status
+# Keep fallback state out of XDG_RUNTIME_DIR. Quickshell logs can fill that
+# tmpfs, and the launcher must remain available even when runtime storage is
+# exhausted.
+state_dir=${TMPDIR:-/tmp}
+rofi_disabled_file=$state_dir/rofi-renderer-broken-$(id -u)
+rofi_error_log=$state_dir/rofi-renderer-error-$(id -u).log
+fallback='MOCR-Q // SYSTEM INDEX // FUZZY MATCH ACTIVE'
+
+status=$(cat "$status_file" 2>/dev/null || printf '%s\n' "$fallback")
+
+launch_fuzzel() {
+    fuzzel \
+        --namespace=launcher \
+        --prompt='APPS // ' \
+        --placeholder='filter installed applications' \
+        --lines=10 \
+        --width=64 \
+        --font='IosevkaTerm Nerd Font SemiBold 13' \
+        --icon-theme=Nordzy-cyan-dark \
+        --show-actions \
+        --match-mode=fzf \
+        --fields=name,generic,exec,categories,keywords,comment \
+        --background-color=06060cf2 \
+        --text-color=c0c0d0ff \
+        --prompt-color=0abdc6ff \
+        --input-color=e0e0f0ff \
+        --match-color=0abdc6ff \
+        --selection-color=0072ffff \
+        --selection-text-color=e0e0f0ff \
+        --selection-match-color=e0e0f0ff \
+        --border-color=0abdc6ff \
+        --border-width=2 \
+        --border-radius=10 \
+        --horizontal-pad=12 \
+        --vertical-pad=12 \
+        --inner-pad=12
+}
+
+launcher_rc=0
+
+if [ -e "$rofi_disabled_file" ]; then
+    launch_fuzzel || launcher_rc=$?
+else
+    # Rofi 2.0.0 can exit 65 when prompt/message options appear after
+    # `-show drun`, so keep presentation flags before the mode selector. The
+    # explicit theme flag is required because this build otherwise renders the
+    # launcher with the default horizontal bar theme despite loading config.rasi.
+    # If rofi's renderer crashes again, record a runtime-only sentinel and keep
+    # the primary hotkeys useful with fuzzel's Wayland-native drun surface.
+    rofi_rc=0
+    rofi -theme "$HOME/.config/rofi/theme.rasi" -p 'APPS //' -mesg "STATUS // $status" -show drun 2>"$rofi_error_log" || rofi_rc=$?
+
+    case "$rofi_rc" in
+        0|1)
+            ;;
+        65|13[4-9])
+            { printf '%s\n' "rofi rc=$rofi_rc; using fuzzel fallback" >"$rofi_disabled_file"; } 2>/dev/null || :
+            launch_fuzzel || launcher_rc=$?
+            ;;
+        *)
+            exit "$rofi_rc"
+            ;;
+    esac
+fi
+
+# Refresh the next-launch cache after the palette closes. Live-state derivation
+# stays off the keystroke-to-visible path.
+if command -v "$HOME/.config/rofi/scripts/rofi-status-writer" >/dev/null 2>&1; then
+    "$HOME/.config/rofi/scripts/rofi-status-writer" >/dev/null 2>&1 &
+fi
+
+exit "$launcher_rc"

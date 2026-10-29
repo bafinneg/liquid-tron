@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RMPC — Liquid Tron
+GenericName=Music Player
+Comment=Liquid Tron music console with album art, spectrum and playback telemetry
+Exec=kitty --class rmpc-liquid-tron --title "RMPC / LIQUID TRON" -o "font_family=IosevkaTerm Nerd Font Mono" -o font_size=12 -o "background=#0a0a14" -o background_opacity=1 -o window_padding_width=8 {{ .chezmoi.homeDir }}/.local/bin/rmpc
+TryExec={{ .chezmoi.homeDir }}/.local/bin/rmpc
+Icon=multimedia-player
+Terminal=false
+StartupNotify=true
+Categories=AudioVideo;Audio;Player;
+Keywords=music;mpd;rmpc;tron;

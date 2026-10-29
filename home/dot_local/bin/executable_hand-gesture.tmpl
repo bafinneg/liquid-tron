@@ -1,0 +1,2074 @@
+#!{{ .chezmoi.homeDir }}/.local/share/hand-gesture/venv/bin/python -I
+"""hand-gesture: webcam hand gestures drive Hyprland workspaces and windows (HANDGESTURE).
+
+An open palm held for half a second arms the clutch. While armed, a vertical swipe cycles the focused
+monitor's local workspaces (swipe up = next, swipe down = previous). A closed fist held for 0.6 s disarms.
+There is no horizontal swipe action. Frames stay in memory; nothing is written to disk and nothing leaves the machine.
+
+Phase 2 (only while armed): a one-hand pinch (thumb tip to index tip) held 0.12 s drags the focused window (pixels when
+floating, move-direction steps when tiled); a two-hand pinch resizes it; a held Victory sign toggles fullscreen.
+Swipes are suppressed while any pinch is active. HAND_GESTURE_DRYRUN=1 logs Hyprland dispatches instead of running them.
+
+Usage:
+  hand-gesture run                  daemon (hand-gesture.service)
+  hand-gesture toggle               start or stop hand-gesture.service
+  hand-gesture --probe --seconds N  print "frames=N hands=N ms_p50=X luma=Y" and exit (2 if no camera)
+
+HUD state is published atomically to $XDG_RUNTIME_DIR/hand-gesture/state.json (see StateWriter).
+Optional config: ~/.config/hand-gesture/config.json (invert_vertical, swipe_dist, swipe_window_s, arm_hold_s,
+mirror_x, drag_enabled, resize_enabled, fullscreen_enabled, pinch_on, pinch_off).
+"""
+import argparse
+import collections
+import ctypes
+import json
+import math
+import os
+import re
+import signal
+import select
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+
+CAMERA = "{{ .camera_by_id }}"
+MODEL = os.path.expanduser("~/.local/share/hand-gesture/models/gesture_recognizer.task")
+CONFIG = os.path.expanduser("~/.config/hand-gesture/config.json")
+ACTION = "{{ .chezmoi.homeDir }}/.config/hypr/scripts/workspace-cycle-vertical"
+UNIT = "hand-gesture.service"
+CAPTURE_W, CAPTURE_H, CAPTURE_FPS = 640, 360, 30
+PROCESS_HZ = 15
+PALM_IDS = (0, 5, 9, 13, 17)
+
+ARM_SCORE = 0.6
+FIST_HOLD_S = 0.6
+ARMED_TIMEOUT_S = 6.0
+HANDEDNESS_MIN = 0.5
+COOLDOWN_S = 0.35            # no second fire at all inside this window
+EMA_ALPHA = 0.75
+DIR_RATIO = 1.5              # |dy| must exceed this multiple of |dx|
+DROPOUT_GRACE_S = 0.35       # a fast swipe blurs the hand out for a few frames; keep its track this long
+EXIT_DIST_FACTOR = 0.6       # shorter travel accepted when the hand vanishes mid-swipe heading to an edge
+EXIT_MIN_SPEED = 0.6         # frame heights per second at the moment of loss (excludes slowly lowering the hand)
+PROCESS_HZ_ARMED = 30
+TRACE_LEN = 1800
+FLING_DIST = 0.06            # fast path: this much travel from the turning point ...
+FLING_SPEED = 0.6            # ... while moving at least this fast (frame heights/s over the last ~0.1 s)
+VEL_WINDOW_S = 0.1
+REVERSE_GUARD_S = 1.0        # after a swipe, the opposite direction needs a pause and a firm flick for this long
+REVERSE_SPEED = 1.0          # (the hand's natural return stroke is slower than a deliberate flick)
+PAUSE_SPEED = 0.3
+PAUSE_S = 0.15               # ... and afterwards only once the hand has been still this long (or has left view)
+ARM_QUIET_S = 0.25           # ignore motion just after arming (the palm is being lowered into place)
+NEAR_MISS_PEAK = 0.5
+SLOW_MIN_SPEED = 0.45       # the full-stroke path still needs the hand to be moving (no fire on drift or a stroke's tail)
+REPEAT_REBOUND = 0.08        # how far the hand has come back since a fire (diagnostic in the swipe log line)
+ONE_STROKE_S = 0.6           # one stroke = one swipe: nothing fires inside this window after a fire ...
+SETTLE_SPEED = 0.25          # frame heights (or widths) per second below which the hand counts as settled
+SETTLE_WINDOW_S = 0.15
+MAX_WRITE_HZ = 10.0
+READ_FAIL_REOPEN = 30
+LOCK_POLL_S = 1.0
+
+# -- phase 2: pinch-drag, two-hand resize, fullscreen
+PINCH_HOLD_S = 0.12          # a pinch must be held this long to engage
+PINCH_GRACE_S = 0.25         # a drag survives this long with the hand missing (motion blur)
+PINCH_MATCH_DIST = 0.25      # frame fraction: same hand if its pinch point is this close to the previous one
+MONITOR_W, MONITOR_H = 3840, 2160
+DRAG_GAIN = 1.5              # 1 frame width of hand travel = 1.5 monitor widths of window travel
+RESIZE_GAIN = 1.0            # 1 frame width of change in hand spacing = 1 monitor width of resize
+TILED_STEP = 0.12            # frame travel per tiled move step
+DISPATCH_HZ = 30.0
+DISPATCH_GAP_S = 1.0 / DISPATCH_HZ - 1e-4
+RESIZE_DEADBAND = 0.01       # frame fraction of spacing change before a resize dispatch
+FS_HOLD_S = 0.4
+FS_SCORE = 0.6
+FS_COOLDOWN_S = 1.2
+FS_MAX_SPEED = 0.6           # frame sizes per second: a Victory sign swept through a swipe is not a fullscreen request
+FS_AFTER_SWIPE_S = 0.6
+FS_LABEL_S = 1.0
+CONFIDENT_OTHERS = ("Open_Palm", "Closed_Fist", "Pointing_Up", "Thumb_Up", "Thumb_Down", "ILoveYou")
+ADDR_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+FULLSCREEN_EXPR = 'hl.dsp.window.fullscreen({ mode = "fullscreen" })'
+
+# -- phase 3A: flick to monitor, reticles
+FLICK_LOOKBACK_S = 0.35      # a flick acts on the window the reticle held this long before the fire (the hand has moved on)
+RETICLE_HOLD_S = 0.2         # keep drawing the primary this long after a dropout
+TRACK_MATCH = 0.25           # frame fraction: mean nearest-landmark distance that still counts as the same hand
+TRACK_STALE_S = 0.6          # a lost primary track is replaced by whoever appears after this long
+DWELL_MOVE_PX = 90.0         # the reticle counts as still while it stays inside this radius of where the dwell began
+EURO_MIN_CUTOFF = 1.0
+EURO_BETA = 0.05
+EURO_DCUTOFF = 1.0
+SEND_HZ = 30.0
+NOWIN_LOG_S = 2.0
+HIT_REFRESH_S = 0.5
+# -- phase 4: the primary reticle is the real pointer
+ASPECT = CAPTURE_W / CAPTURE_H   # the frame is 16:9: x fractions times this are in frame heights
+POINTER_HZ = 60.0
+POINTER_MIN_PX = 2.0
+FREEZE_SPEED = 1.2           # frame heights per second: faster than this the pointer holds still (a stroke, not aiming)
+FREEZE_LINGER_S = 0.12
+FREEZE_BACK_S = 0.15         # a freeze puts the pointer back where it was this long before the stroke was seen
+PRECISION_SPEED = 0.25       # slower than this the pointer moves with PRECISION_GAIN
+PRECISION_FAST = 0.6         # faster than this the precision offset melts away
+PRECISION_GAIN = 0.4
+OFFSET_TAU_S = 0.6
+PRECISION_DEAD_PX = 8.0       # the precision zone ignores hand wobble inside this radius of where the hand slowed
+OFFSET_MAX_PX = 120.0         # the precision zone never lets the pointer trail the hand by more than this
+PINCH_BACK_S = 0.2           # a pinch pins the pointer where it was this long before the fingers closed
+CLICK_TAP_S = 0.3
+CLICK_MOVE_PX = 25.0
+DRAG_HOLD_S = 0.35           # pinch held still this long, then moved = window drag
+DRAG_START_MOVE = 0.012      # frame fraction of pinch-point travel that counts as moved
+BUTTON_HOLD_S = 0.04
+CLICK_FLASH_S = 0.25
+STROKE_SPEED = 0.5           # stroke state machine: REST -> STROKE above this ...
+REST_SPEED = 0.25            # ... and back to REST only after this long below this speed
+REST_S = 0.18
+MIN_REFIRE_S = 0.7
+REVERSE_WINDOW_S = 1.5
+REVERSE_PEAK_FRAC = 0.6
+REVERSE_PEAK_MIN = 1.0
+FLICK_RATIO = 1.2            # horizontal if |dx| (in frame heights) > this x |dy| over the fastest 0.15 s
+FLICK_SEG_S = 0.15
+PALMS_HOLD_S = 0.5
+PALMS_SCORE = 0.6
+MIDDLE_TIP = 12
+HAND_LOSS_RELEASE_S = 0.5
+DEFAULT_MONITORS = [{"id": 1, "name": "DP-4", "x": 0, "y": 360, "width": 3840, "height": 2160},
+                    {"id": 0, "name": "DP-2", "x": 3840, "y": 0, "width": 3840, "height": 2160},
+                    {"id": 2, "name": "DP-3", "x": 7680, "y": 360, "width": 3840, "height": 2160}]
+ARMED_STATES = ("arming", "armed", "cooldown")
+
+DEFAULTS = {"invert_vertical": False, "flick_monitor_enabled": True, "reticle_enabled": True,
+            "pointer_enabled": True, "click_enabled": True, "focus_dwell_s": 0.0,
+            "reticle_box": [0.15, 0.15, 0.85, 0.85], "swipe_dist": 0.12, "swipe_window_s": 0.6, "arm_hold_s": 0.5,
+            "mirror_x": True, "drag_enabled": True, "resize_enabled": True, "fullscreen_enabled": True,
+            "pinch_on": 0.25, "pinch_off": 0.40}
+LIMITS = {"swipe_dist": (0.05, 0.6), "swipe_window_s": (0.15, 1.5), "arm_hold_s": (0.2, 2.0),
+          "pinch_on": (0.1, 0.45), "pinch_off": (0.15, 0.8), "focus_dwell_s": (0.0, 3.0)}
+BOOLS = ("invert_vertical", "mirror_x", "drag_enabled", "resize_enabled", "fullscreen_enabled",
+         "flick_monitor_enabled", "reticle_enabled", "pointer_enabled", "click_enabled")
+
+
+def load_config(path=CONFIG):
+    """Defaults overlaid with the optional file; wrong types are ignored and numbers are clamped."""
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return cfg
+    if not isinstance(raw, dict):
+        return cfg
+    for k in BOOLS:
+        if isinstance(raw.get(k), bool):
+            cfg[k] = raw[k]
+    for k, (lo, hi) in LIMITS.items():
+        v = raw.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+            cfg[k] = float(max(lo, min(hi, v)))
+            if k == "focus_dwell_s" and 0 < cfg[k] < 0.15:
+                cfg[k] = 0.15
+    box = raw.get("reticle_box")
+    if (isinstance(box, list) and len(box) == 4
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in box)
+            and 0 <= box[0] < box[2] <= 1 and 0 <= box[1] < box[3] <= 1 and box[2] - box[0] >= 0.2 and box[3] - box[1] >= 0.2):
+        cfg["reticle_box"] = [float(v) for v in box]
+    if cfg["pinch_off"] < cfg["pinch_on"] + 0.05:        # keep real hysteresis
+        cfg["pinch_off"] = min(0.8, cfg["pinch_on"] + 0.05)
+    return cfg
+
+
+def _d(lms, a, b):
+    return math.hypot(lms[a][0] - lms[b][0], lms[a][1] - lms[b][1])
+
+
+def pinch_info(lms):
+    """(ratio, point): thumb tip (4) to index tip (8) distance over hand size (wrist 0 to middle MCP 9), and the
+    midpoint of the two tips. ratio is None when the hand is degenerate."""
+    size = _d(lms, 0, 9)
+    pt = ((lms[4][0] + lms[8][0]) / 2, (lms[4][1] + lms[8][1]) / 2)
+    if size < 1e-4:
+        return None, pt
+    return _d(lms, 4, 8) / size, pt
+
+
+def victory_shape(lms):
+    """Landmark fallback for dim light: index and middle extended, ring and pinky curled (tip vs PIP from the wrist)."""
+    def ext(tip, pip):
+        return _d(lms, 0, tip) > 1.15 * _d(lms, 0, pip)
+
+    def curled(tip, pip):
+        return _d(lms, 0, tip) < 1.0 * _d(lms, 0, pip)
+    return ext(8, 6) and ext(12, 10) and curled(16, 14) and curled(20, 18)
+
+
+def move_px_expr(addr, dx, dy):
+    return f'hl.dsp.window.move({{ "{{" }} x = {int(dx)}, y = {int(dy)}, relative = true, window = "address:{addr}" }})'
+
+
+def move_dir_expr(addr, direction):
+    return f'hl.dsp.window.move({{ "{{" }} direction = "{direction}", window = "address:{addr}" }})'
+
+
+def resize_expr(addr, dx, dy):
+    return f'hl.dsp.window.resize({{ "{{" }} x = {int(dx)}, y = {int(dy)}, relative = true, window = "address:{addr}" }})'
+
+
+def move_monitor_expr(addr, monitor):
+    return f'hl.dsp.window.move({{ "{{" }} monitor = "{monitor}", window = "address:{addr}" }})'
+
+
+def fullscreen_expr(addr):
+    return f'hl.dsp.window.fullscreen({{ "{{" }} mode = "fullscreen", window = "address:{addr}" }})'
+
+
+def cursor_move_expr(x, y):
+    return f'hl.dsp.cursor.move({{ "{{" }} x = {int(x)}, y = {int(y)} }})'
+
+
+def focus_expr(addr):
+    return f'hl.dsp.focus({{ "{{" }} window = "address:{addr}" }})'
+
+
+class OneEuro:
+    """One Euro filter (Casiez et al.): heavy smoothing while the signal is slow, little lag while it is fast."""
+
+    def __init__(self, min_cutoff=EURO_MIN_CUTOFF, beta=EURO_BETA, dcutoff=EURO_DCUTOFF):
+        self.min_cutoff, self.beta, self.dcutoff = min_cutoff, beta, dcutoff
+        self.x = self.dx = self.t = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, t, v):
+        if self.x is None or t <= self.t:
+            self.x, self.dx, self.t = v, 0.0, t
+            return v
+        dt = t - self.t
+        self.t = t
+        d = (v - self.x) / dt
+        a = self._alpha(self.dcutoff, dt)
+        self.dx = a * d + (1 - a) * self.dx
+        cutoff = self.min_cutoff + self.beta * abs(self.dx)
+        a = self._alpha(cutoff, dt)
+        self.x = a * v + (1 - a) * self.x
+        return self.x
+
+
+def track_distance(a, b):
+    """Mean over a's landmarks of the distance to the nearest landmark of b (frame fractions)."""
+    tot = 0.0
+    for p in a:
+        tot += min(math.hypot(p[0] - q[0], p[1] - q[1]) for q in b)
+    return tot / len(a)
+
+
+def desktop_rect(monitors):
+    """(x0, y0, x1, y1) bounding box of all monitors in layout coordinates."""
+    return (min(m["x"] for m in monitors), min(m["y"] for m in monitors),
+            max(m["x"] + m["width"] for m in monitors), max(m["y"] + m["height"] for m in monitors))
+
+
+def window_at(windows, x, y):
+    """Topmost window containing (x, y). `windows` is already ordered top first."""
+    for w in windows:
+        wx, wy = w["at"]
+        ww, wh = w["size"]
+        if wx <= x < wx + ww and wy <= y < wy + wh:
+            return w
+    return None
+
+
+def palm_centre(lms):
+    """Mean of landmarks 0,5,9,13,17. lms: sequence of (x, y) in 0..1 image coordinates."""
+    xs = [lms[i][0] for i in PALM_IDS]
+    ys = [lms[i][1] for i in PALM_IDS]
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+
+def middle_ratio(lms):
+    """thumb tip (4) to middle-finger tip (12) over hand size: the right-click contact."""
+    size = _d(lms, 0, 9)
+    return None if size < 1e-4 else _d(lms, 4, MIDDLE_TIP) / size
+
+
+def clamp_to_monitors(monitors, x, y):
+    """(x, y) pulled into the nearest monitor rectangle (the layout has holes where monitors are offset)."""
+    best, bd = (x, y), None
+    for m in monitors:
+        cx = min(max(x, m["x"]), m["x"] + m["width"] - 1)
+        cy = min(max(y, m["y"]), m["y"] + m["height"] - 1)
+        d = (cx - x) ** 2 + (cy - y) ** 2
+        if bd is None or d < bd:
+            best, bd = (cx, cy), d
+            if d == 0:
+                break
+    return best
+
+
+def monitor_at(monitors, x, y):
+    for m in monitors:
+        if m["x"] <= x < m["x"] + m["width"] and m["y"] <= y < m["y"] + m["height"]:
+            return m
+    return None
+
+
+class NullPointer:
+    """The engine's pointer backend when none is wired in (tests, disabled reticle)."""
+
+    def move(self, x, y):
+        pass
+
+    def button(self, name, down):
+        pass
+
+    def set_active(self, on):
+        pass
+
+    def release_all(self):
+        pass
+
+    def cursor_pos(self):
+        return None
+
+
+class GestureEngine:
+    """Pure state machine. Time is injected through update(now, ...); actions through `runner(direction)`.
+
+    States: idle, arming, armed, cooldown, paused, nocam. A frame is a dict
+    {"gesture": str, "score": float, "handedness": float, "lms": [(x, y) x21]} or None for no hand.
+    """
+
+    def __init__(self, cfg=None, runner=None, wall_ms=None, dispatch=None, active=None, windows=None, monitors=None,
+                 pointer=None, focused=None):
+        self.cfg = dict(DEFAULTS)
+        self.cfg.update(cfg or {})
+        self.runner = runner or (lambda direction: None)
+        self.dispatch = dispatch or (lambda expr: None)      # runs a Hyprland Lua dispatch expression
+        self.active = active or (lambda: None)               # focused window dict (address, floating, fullscreen)
+        self.windows = windows or (lambda: [])               # cached hit-test list, topmost first
+        self.monitors = monitors or (lambda: DEFAULT_MONITORS)
+        self.wall_ms = wall_ms or (lambda: int(time.time() * 1000))
+        self.ptr = pointer or NullPointer()
+        self.focused = focused or (lambda: self._active_window())      # cheap focused-window lookup (stroke start)
+        self.state = "idle"
+        self.hand = False
+        self.x = 0.5
+        self.y = 0.5
+        self.progress = 0.0
+        self.last = None
+        self.last_ms = 0
+        self._ema = None
+        self._hist = collections.deque()
+        self._palm_since = None
+        self._fist_since = None
+        self._last_hand_t = None
+        self._cool_until = 0.0
+        self._settled = True
+        self._external = None          # "paused" / "nocam" override
+        self._miss_since = None
+        self._quiet_until = 0.0
+        self._fire_t = -1e9
+        self._fire_dir = None
+        self._apex = 0.5
+        self._rebounded = True
+        self._still_since = None
+        self._stroke = None
+        # phase 2
+        self.n_hands = 0
+        self.mode = None                  # "drag" | "resize" | None
+        self.x2 = self.y2 = None          # second hand's pinch point (image coordinates) while two hands are seen
+        self._now = 0.0
+        self._pinching = False
+        self._prev_pts = []               # [(pt, shape)] from the previous frame, for hysteresis and hand matching
+        self._count = 0
+        self._shape_since = None
+        self._blocked = False             # a pinch that ended a resize (or found no window) stays inert until released
+        self._pmiss = None
+        self._win = None
+        self._anchor = None
+        self._dpt = None
+        self._acc = [0.0, 0.0]
+        self._last_disp = -1e9
+        self._ndisp = 0
+        self._total = [0.0, 0.0]
+        self._tile = [0.0, 0.0]
+        self._rpts = None
+        self._rref = None
+        self._fire_now = -1e9
+        self._vic_since = None
+        self._vic_ready = True
+        self._fs_cool = 0.0
+        self._fs_until = 0.0
+        # phase 3A: reticles
+        self._ptrack = None               # primary hand's landmarks (track continuity)
+        self._ptrack_t = -1e9
+        self._strack = None
+        self._filt = {}                   # "p" / "s" -> (OneEuro u, OneEuro v)
+        self._ret = {}                    # "p" / "s" -> reticle dict (desktop px)
+        self._ret_t = -1e9
+        self._tgt_hist = collections.deque()
+        self._dwell = None
+        self._focus_flash = -1e9
+        self._nowin_t = -1e9
+        self.cap_ms = 0
+        # phase 4: the reticle is the real pointer
+        self._P = None                    # pointer position, desktop px (float)
+        self._pv = collections.deque()    # primary palm samples for the pointer-freeze speed
+        self._fast_until = -1e9
+        self._fast_on = False
+        self._btn_down = None
+        self._pph = collections.deque()   # (t, x, y) of the pointer itself
+        self._fprev = None
+        self._slow_anchor = None
+        self._sm_still = None
+        self._stroke_t0 = 0.0
+        self._kind = None                 # \"L\" / \"R\" contact of the primary hand (hysteresis memory)
+        self._ck = None                   # contact in progress {kind, t0, p0, void}
+        self._rel_at = None               # scheduled button release
+        self._rel_btn = None
+        self._flash_until = -1e9
+        self._ps_t = -1e9                 # last pointer send
+        self._ps_xy = None
+        self._anchor = None
+        self._stroke_win = None
+        self._shist = collections.deque()
+        self._reacq = False
+        self._lost_t = None
+        self._lost_for = 0.0
+        self.hand_speed = 0.0
+        self._dev_on = False
+        # stroke state machine (section 3)
+        self._sm = "REST"                 # REST -> STROKE -> FIRED -> RECOVER -> REST
+        self._sm_peak = 0.0
+        self._fired_peak = 0.0
+        self._pal2_since = None
+        self._pal2_ready = True
+
+    # -- external overrides -------------------------------------------------
+    def set_external(self, name):
+        """name in (None, "paused", "nocam"). While set, frames are ignored. Clearing returns to idle."""
+        if name == self._external:
+            return
+        self._external = name
+        self._release_pointer()
+        self._sync_device(False)
+        self._end_mode(self._now, "external")
+        self._reset_tracking()
+        self.state = name or "idle"
+        self.hand = False
+        self.progress = 0.0
+
+    def _reset_tracking(self):
+        self._ema = None
+        self._hist.clear()
+        self._palm_since = None
+        self._fist_since = None
+        self._last_hand_t = None
+
+    # -- main entry ---------------------------------------------------------
+    def update(self, now, frame, others=None):
+        """frame: the primary hand (or None); others: further hands seen in the same image (num_hands=2)."""
+        if self._external:
+            return self.state
+        self._now = now
+        cands = [f for f in [frame] + list(others or ()) if f and f.get("handedness", 1.0) >= HANDEDNESS_MIN]
+        usable = cands[0] if cands else None
+        if len(cands) > 1 and self._ema is not None:        # keep following the same hand for swipes
+            usable = min(cands, key=lambda f: math.hypot(palm_centre(f["lms"])[0] - self._ema[0],
+                                                         palm_centre(f["lms"])[1] - self._ema[1]))
+        self.n_hands = len(cands)
+        self._update_reticle(now, cands)
+        self._service_buttons(now)
+        if usable:
+            self._track(now, usable)
+            self._miss_since = None
+        else:
+            self.hand = False
+            self._palm_since = None
+            self._fist_since = None
+            if self._miss_since is None:
+                self._miss_since = now
+            if now - self._miss_since > DROPOUT_GRACE_S:
+                self._ema = None
+                self._hist.clear()
+            if now - self._miss_since > HAND_LOSS_RELEASE_S:
+                self._release_pointer()
+        gesture = usable["gesture"] if usable else None
+        score = usable.get("score", 0.0) if usable else 0.0
+
+        if self.state == "cooldown" and now >= self._cool_until:
+            self.state = "armed"
+        if self.state in ("armed", "cooldown"):
+            self._update_pinch(now, cands)
+            if self._ck is not None:
+                self._pinching = True
+            self._update_fullscreen(now, usable)
+            self._update_palms(now, cands)
+        else:
+            self._release_pointer()
+            self._end_mode(now, "disarm")
+            self._reset_pinch()
+        if self.state == "idle" or self.state == "arming":
+            self._update_arming(now, gesture, score)
+        else:
+            self._update_armed(now, gesture)
+        self._sync_device(self.state in ("armed", "cooldown"))
+        return self.state
+
+    def _track(self, now, frame):
+        cx, cy = palm_centre(frame["lms"])
+        if self._ema is None:
+            self._ema = (cx, cy)
+        else:
+            a = EMA_ALPHA
+            self._ema = (a * cx + (1 - a) * self._ema[0], a * cy + (1 - a) * self._ema[1])
+        self.hand = True
+        self.x, self.y = self._ema
+        self._last_hand_t = now
+        self._hist.append((now, self.x, self.y))
+        self._shist.append((now, self.x * ASPECT, self.y))
+        while self._shist and now - self._shist[0][0] > 0.5:
+            self._shist.popleft()
+        horizon = max(self.cfg["swipe_window_s"], SETTLE_WINDOW_S) + 0.05
+        while self._hist and now - self._hist[0][0] > horizon:
+            self._hist.popleft()
+
+    def _update_arming(self, now, gesture, score):
+        hold = self.cfg["arm_hold_s"]
+        if gesture == "Open_Palm" and score >= ARM_SCORE:
+            if self._palm_since is None:
+                self._palm_since = now
+            self.progress = min(1.0, (now - self._palm_since) / hold)
+            if now - self._palm_since >= hold:
+                self.state = "armed"
+                self.progress = 0.0
+                self._palm_since = None
+                self._fist_since = None
+                self._settled = True
+                self._quiet_until = now + ARM_QUIET_S
+                self._fire_dir = None
+                self._sm = "REST"
+                self._sm_still = None
+                self._last_hand_t = now
+            else:
+                self.state = "arming"
+        else:
+            self._palm_since = None
+            self.progress = 0.0
+            self.state = "idle"
+
+    def _update_armed(self, now, gesture):
+        if self.hand is False:
+            self._still_since = None                  # a hand that left view has not been at rest
+            if self.state == "armed" and self._miss_since == now:
+                self._detect_swipe(now, vanished=True)     # the hand just blurred out or left the frame
+                if self.state != "armed":
+                    return
+            if self._last_hand_t is not None and now - self._last_hand_t >= ARMED_TIMEOUT_S:
+                self._disarm()
+            elif self._last_hand_t is None:
+                self._last_hand_t = now
+            return
+        if self._pinching:                # no swipe and no fist-disarm progress while a pinch is active
+            self._hist.clear()
+            self._stroke = None
+            self._fist_since = None
+            self.progress = 0.0
+            self._still_since = None
+            self._quiet_until = max(self._quiet_until, now + COOLDOWN_S)
+            return
+        self._sm_step(now)
+        if gesture == "Closed_Fist":
+            if self.state == "armed":
+                self._detect_swipe(now)
+                if self.state != "armed":
+                    self._fist_since = None
+                    return
+            if self._fist_since is None:
+                self._fist_since = now
+            self.progress = min(1.0, (now - self._fist_since) / FIST_HOLD_S)
+            if now - self._fist_since >= FIST_HOLD_S:
+                self._disarm()
+            return
+        self._fist_since = None
+        self.progress = 0.0
+        if self.state != "armed":
+            return                      # cooldown
+        self._detect_swipe(now)
+
+    def _disarm(self):
+        self.state = "idle"
+        self.progress = 0.0
+        self._release_pointer()
+        self._end_mode(self._now, "disarm")
+        self._reset_pinch()
+        self._reset_tracking()
+
+    # -- phase 2: pinch-drag, resize, fullscreen -------------------------------------------
+    def _log(self, msg):
+        print(f"hand-gesture: {msg}", file=sys.stderr, flush=True)
+
+    def _reset_pinch(self):
+        self._prev_pts = []
+        self._count = 0
+        self._shape_since = None
+        self._blocked = False
+        self._pmiss = None
+        self._pinching = False
+        self._anchor = None
+        self.x2 = self.y2 = None
+        self._vic_since = None
+        self._pal2_since = None
+
+    def _send(self, now, expr):
+        self._last_disp = now
+        self._ndisp += 1
+        try:
+            reply = self.dispatch(expr)
+        except Exception as e:                   # a failing dispatch must not kill the daemon
+            self._log(f"dispatch failed: {e}")
+            return f"error: {e}"
+        if isinstance(reply, str) and reply.strip() not in ("", "ok"):
+            self._log(f"dispatch reply: {reply.strip()[:120]}")
+            return reply
+        return "ok"
+
+    def _update_pinch(self, now, hands):
+        cfg = self.cfg
+        if not (cfg["drag_enabled"] or cfg["resize_enabled"]):
+            self._pinching = False
+            return
+        if not hands:                              # hand missing: ride out a short dropout, then let go
+            if self.mode:
+                if self._pmiss is None:
+                    self._pmiss = now
+                if now - self._pmiss > PINCH_GRACE_S:
+                    self._end_mode(now, "lost")
+                    self._reset_pinch()
+            else:
+                self._reset_pinch()
+            self._pinching = self.mode is not None
+            return
+        self._pmiss = None
+        infos = []
+        for h in hands:
+            ratio, pt = pinch_info(h["lms"])
+            infos.append((ratio, pt))
+        infos.sort(key=lambda i: i[1][0])
+        shapes = []
+        for ratio, pt in infos:
+            prev = None
+            best = PINCH_MATCH_DIST
+            for ppt, pshape in self._prev_pts:
+                d = math.hypot(pt[0] - ppt[0], pt[1] - ppt[1])
+                if d <= best:
+                    best, prev = d, pshape
+            on = ratio is not None and (ratio < cfg["pinch_on"] or (bool(prev) and ratio < cfg["pinch_off"]))
+            shapes.append(on)
+        self._prev_pts = [(i[1], s) for i, s in zip(infos, shapes)]
+        count = sum(shapes)
+        pts = [i[1] for i, s in zip(infos, shapes) if s]
+        if len(infos) == 2:
+            self.x2, self.y2 = infos[1][1]
+        else:
+            self.x2 = self.y2 = None
+        if count == 1 and self.mode is None:
+            if self._anchor is None or count != self._count:
+                self._anchor = pts[0]
+            elif math.hypot(pts[0][0] - self._anchor[0], pts[0][1] - self._anchor[1]) >= DRAG_START_MOVE \
+                    and now - self._shape_since < DRAG_HOLD_S:
+                self._anchor = pts[0]                # moved before holding still: start the hold over
+                self._shape_since = now
+        else:
+            self._anchor = None
+        if count != self._count:
+            if self.mode == "resize" and count < 2:
+                self._end_mode(now, "release")
+                self._blocked = count > 0
+            elif self.mode == "drag" and count != 1:
+                self._end_mode(now, "release" if count == 0 else "second-hand")
+            self._count = count
+            self._shape_since = now if count else None
+        if count == 0:
+            self._blocked = False
+        self._pinching = count > 0 or self.mode is not None
+        if count and not self.mode and not self._blocked and now - self._shape_since >= PINCH_HOLD_S:
+            if count == 1 and cfg["drag_enabled"]:
+                if now - self._shape_since >= DRAG_HOLD_S and self._anchor is not None and \
+                        math.hypot(pts[0][0] - self._anchor[0], pts[0][1] - self._anchor[1]) >= DRAG_START_MOVE:
+                    self._start_drag(now, self._anchor, infos, shapes)
+            elif count == 2 and cfg["resize_enabled"]:
+                self._start_resize(now, pts)
+        if self.mode == "drag" and count == 1:
+            self._follow_drag(now, pts[0])
+        elif self.mode == "resize" and count == 2:
+            self._follow_resize(now, pts)
+
+    def _target_window(self):
+        """The compositor's choice: follow_mouse focuses the window under the pointer, so that is the target."""
+        w = self._active_window()
+        if not w or not ADDR_RE.match(str(w.get("address", ""))) or w.get("fullscreen"):
+            return None
+        return w
+
+    def _start_drag(self, now, pt, infos, shapes):
+        win = self._target_window()
+        if win is None:
+            self._blocked = True
+            self._log_nowin("pinch-drag")
+            return
+        self._win = win
+        self.mode = "drag"
+        self._dpt = pt
+        self._anchor = None
+        self._acc = [0.0, 0.0]
+        self._total = [0.0, 0.0]
+        self._tile = [0.0, 0.0]
+        self._ndisp = 0
+        self._t0 = now
+        self._log(f"pinch-drag start floating={int(bool(win.get('floating')))} hands={self.n_hands}")
+
+    def _follow_drag(self, now, pt):
+        a = EMA_ALPHA
+        sm = (a * pt[0] + (1 - a) * self._dpt[0], a * pt[1] + (1 - a) * self._dpt[1])
+        dx, dy = sm[0] - self._dpt[0], sm[1] - self._dpt[1]
+        self._dpt = sm
+        if self.cfg["mirror_x"]:
+            dx = -dx                      # the camera sees Brian mirrored: his right is image left
+        addr = self._win["address"]
+        if self._win.get("floating"):
+            self._acc[0] += dx * DRAG_GAIN * MONITOR_W
+            self._acc[1] += dy * DRAG_GAIN * MONITOR_H
+            if now - self._last_disp >= DISPATCH_GAP_S:
+                ix, iy = int(round(self._acc[0])), int(round(self._acc[1]))
+                if ix or iy:
+                    self._acc[0] -= ix
+                    self._acc[1] -= iy
+                    self._total[0] += ix
+                    self._total[1] += iy
+                    self._send(now, move_px_expr(addr, ix, iy))
+                    self._nudge_pointer(now, ix, iy)        # the pointer rides with the window it holds
+        else:
+            self._tile[0] += dx
+            self._tile[1] += dy
+            tx, ty = self._tile
+            if max(abs(tx), abs(ty)) >= TILED_STEP and now - self._last_disp >= DISPATCH_GAP_S:
+                if abs(tx) >= abs(ty):
+                    d = "r" if tx > 0 else "l"
+                else:
+                    d = "d" if ty > 0 else "u"
+                self._tile = [0.0, 0.0]
+                self._total[0 if d in "lr" else 1] += 1
+                self._send(now, move_dir_expr(addr, d))
+
+    def _start_resize(self, now, pts):
+        if self.mode == "drag":
+            self._end_mode(now, "resize")
+        win = self._win if self._win is not None else self._target_window()
+        win = self._target_window() if win is None else win
+        if win is None:
+            self._blocked = True
+            self._log_nowin("resize")
+            return
+        self._win = win
+        self.mode = "resize"
+        self._rref = (abs(pts[0][0] - pts[1][0]), abs(pts[0][1] - pts[1][1]))
+        self._rpts = list(pts)
+        self._total = [0.0, 0.0]
+        self._ndisp = 0
+        self._t0 = now
+        self._log(f"resize start hands={self.n_hands} spacing_x={self._rref[0]:.3f} spacing_y={self._rref[1]:.3f}")
+
+    def _follow_resize(self, now, pts):
+        a = EMA_ALPHA
+        self._rpts = [(a * p[0] + (1 - a) * q[0], a * p[1] + (1 - a) * q[1]) for p, q in zip(pts, self._rpts)]
+        sx = abs(self._rpts[0][0] - self._rpts[1][0])
+        sy = abs(self._rpts[0][1] - self._rpts[1][1])
+        ex, ey = sx - self._rref[0], sy - self._rref[1]
+        ax = ex if abs(ex) >= RESIZE_DEADBAND else 0.0
+        ay = ey if abs(ey) >= RESIZE_DEADBAND else 0.0
+        if (ax or ay) and now - self._last_disp >= DISPATCH_GAP_S:
+            dw, dh = int(round(ax * RESIZE_GAIN * MONITOR_W)), int(round(ay * RESIZE_GAIN * MONITOR_H))
+            if dw or dh:
+                self._rref = (self._rref[0] + (ax if dw else 0.0), self._rref[1] + (ay if dh else 0.0))
+                self._total[0] += dw
+                self._total[1] += dh
+                self._send(now, resize_expr(self._win["address"], dw, dh))
+
+    def _end_mode(self, now, why):
+        mode, self.mode = self.mode, None
+        if mode == "drag":
+            self._log(f"pinch-drag end dx={self._total[0]:.0f} dy={self._total[1]:.0f} dispatches={self._ndisp} "
+                      f"t={now - self._t0:.2f} why={why}")
+        elif mode == "resize":
+            self._log(f"resize end dw={self._total[0]:.0f} dh={self._total[1]:.0f} dispatches={self._ndisp} "
+                      f"t={now - self._t0:.2f} why={why}")
+        if mode:
+            self._win = None
+            self._quiet_until = max(self._quiet_until, now + COOLDOWN_S)
+            self._hist.clear()
+
+    def _log_nowin(self, what):
+        if self._now - self._nowin_t >= NOWIN_LOG_S:        # at most one line per pinch, and none in a burst
+            self._nowin_t = self._now
+            self._log(f"{what} skipped no window")
+
+    # -- phase 3A: reticles and dwell-to-focus ---------------------------------------------
+    def _reticle_off(self):
+        self._release_pointer()
+        self._ptrack = self._strack = None
+        self._filt.clear()
+        self._ret = {}
+        self._tgt_hist.clear()
+        self._dwell = None
+        self._P = None
+        self._fprev = None
+        self._pph.clear()
+        self._pv.clear()
+
+    def _reticle_window(self, t):
+        """(dwell option only) the window under the primary reticle at time t, or None."""
+        best = None
+        for ts, w in self._tgt_hist:
+            if ts <= t:
+                best = w
+            else:
+                break
+        return best
+
+    def _raw_xy(self, lms):
+        cfg = self.cfg
+        x, y = lms[8]
+        if cfg["mirror_x"]:
+            x = 1.0 - x
+        bx0, by0, bx1, by1 = cfg["reticle_box"]
+        u = min(1.0, max(0.0, (x - bx0) / (bx1 - bx0)))
+        v = min(1.0, max(0.0, (y - by0) / (by1 - by0)))
+        x0, y0, x1, y1 = desktop_rect(self.monitors())
+        return x0 + u * (x1 - x0), y0 + v * (y1 - y0)
+
+    def _reticle_xy(self, key, lms, now):
+        fu, fv = self._filt.setdefault(key, (OneEuro(), OneEuro()))       # filtered in desktop pixels
+        x, y = self._raw_xy(lms)
+        return fu(now, x), fv(now, y)
+
+    # -- phase 4: the primary reticle is the real pointer -------------------------------------
+    def _palm_speed(self, now, lms):
+        """Palm speed in frame heights per second over the last ~0.15 s (x scaled to height units)."""
+        cx, cy = palm_centre(lms)
+        self._pv.append((now, cx * ASPECT, cy))
+        while self._pv and now - self._pv[0][0] > 0.4:
+            self._pv.popleft()
+        pts = [p for p in self._pv if now - p[0] <= 0.15 + 1e-6]
+        if len(pts) < 2 or pts[-1][0] <= pts[0][0]:
+            return 0.0
+        return math.hypot(pts[-1][1] - pts[0][1], pts[-1][2] - pts[0][2]) / (pts[-1][0] - pts[0][0])
+
+    def _p_back(self, now, seconds):
+        """Where the pointer was `seconds` ago (the newest sample at least that old, else the oldest)."""
+        best = None
+        for t, x, y in self._pph:
+            if t <= now - seconds:
+                best = (x, y)
+            else:
+                break
+        if best is None and self._pph:
+            best = self._pph[0][1:]
+        return best
+
+    def _set_pointer(self, xy):
+        self._P = [float(xy[0]), float(xy[1])]
+        self._emit_pointer(self._now, force=True)
+
+    def _gain(self, speed):
+        if speed <= PRECISION_SPEED:
+            return PRECISION_GAIN
+        if speed >= PRECISION_FAST:
+            return 1.0
+        return PRECISION_GAIN + (1.0 - PRECISION_GAIN) * (speed - PRECISION_SPEED) / (PRECISION_FAST - PRECISION_SPEED)
+
+    def _move_pointer(self, now, F, speed):
+        """Relative pointer from the filtered absolute hand position F: gain <1 while the hand is slow (precision
+        zone, sub-pixel float accumulation), 1 when quick, the leftover offset melts away while the hand moves,
+        frozen during a stroke and during a pinch."""
+        if self._P is None:
+            self._P = [F[0], F[1]]
+            self._fprev = F
+        if self._reacq and self._lost_for > 1.0:
+            self._P = [F[0], F[1]]               # the hand was away a while: start from where it is now
+        dF = (F[0] - self._fprev[0], F[1] - self._fprev[1]) if self._fprev is not None else (0.0, 0.0)
+        self._fprev = F
+        fast = speed > FREEZE_SPEED
+        if fast:
+            if not self._fast_on:
+                back = self._p_back(now, FREEZE_BACK_S)
+                if back is not None:
+                    self._P = [back[0], back[1]]       # the stroke began a moment ago: the pointer was aiming there
+            self._fast_until = now + FREEZE_LINGER_S
+        self._fast_on = fast
+        pinned = self._ck is not None or self.mode is not None
+        if not (pinned or now < self._fast_until):
+            g = self._gain(speed)
+            if speed <= PRECISION_SPEED:
+                a = self._slow_anchor = self._slow_anchor or F
+                ex, ey = F[0] - a[0], F[1] - a[1]
+                n = math.hypot(ex, ey)
+                if n <= PRECISION_DEAD_PX:
+                    dF = (0.0, 0.0)
+                else:
+                    k = (n - PRECISION_DEAD_PX) / n
+                    dF = (ex * k, ey * k)
+                    self._slow_anchor = (a[0] + dF[0], a[1] + dF[1])
+            else:
+                self._slow_anchor = None
+            self._P[0] += g * dF[0]
+            self._P[1] += g * dF[1]
+            if g >= 1.0 or speed > PRECISION_SPEED:       # the hand is travelling: let the leftover offset melt
+                k = min(1.0, (speed - PRECISION_SPEED) / (PRECISION_FAST - PRECISION_SPEED))
+                dt = max(0.0, now - (self._pph[-1][0] if self._pph else now))
+                f = 1.0 - math.exp(-dt * k / OFFSET_TAU_S)
+                self._P[0] += (F[0] - self._P[0]) * f
+                self._P[1] += (F[1] - self._P[1]) * f
+            x0, y0, x1, y1 = desktop_rect(self.monitors())
+            if F[0] <= x0 + 1 or F[0] >= x1 - 1:      # the hand reached the edge of its box: the screen edge is reachable
+                self._P[0] = F[0]
+            if F[1] <= y0 + 1 or F[1] >= y1 - 1:
+                self._P[1] = F[1]
+            ox, oy = self._P[0] - F[0], self._P[1] - F[1]
+            n = math.hypot(ox, oy)
+            if n > OFFSET_MAX_PX:
+                self._P[0] = F[0] + ox * OFFSET_MAX_PX / n
+                self._P[1] = F[1] + oy * OFFSET_MAX_PX / n
+        cx, cy = clamp_to_monitors(self.monitors(), self._P[0], self._P[1])
+        self._P = [cx, cy]
+        self._pph.append((now, cx, cy))
+        while self._pph and now - self._pph[0][0] > 1.0:
+            self._pph.popleft()
+        self._emit_pointer(now)
+
+    def _emit_pointer(self, now, force=False):
+        if self._P is None or not self.cfg["pointer_enabled"]:
+            return
+        xy = (int(round(self._P[0])), int(round(self._P[1])))
+        if self._ps_xy is not None:
+            if math.hypot(xy[0] - self._ps_xy[0], xy[1] - self._ps_xy[1]) < POINTER_MIN_PX and not force:
+                return
+            if xy == self._ps_xy:
+                return
+        if now - self._ps_t < 1.0 / POINTER_HZ - 1e-6 and not force:
+            return
+        self._ps_t, self._ps_xy = now, xy
+        try:
+            self.ptr.move(*xy)
+        except Exception as e:                 # a failing pointer must not kill the daemon
+            self._log(f"pointer failed: {e}")
+
+    def _nudge_pointer(self, now, dx, dy):
+        if self._P is not None:
+            self._P[0] += dx
+            self._P[1] += dy
+            self._emit_pointer(now, force=True)
+
+    def _contact(self, now, prim):
+        """Pinch grammar on the primary hand: thumb+index = left, thumb+middle = right. A short still tap clicks."""
+        cfg = self.cfg
+        lm = prim["lms"]
+        ri, _ = pinch_info(lm)
+        rm = middle_ratio(lm)
+        on, off = cfg["pinch_on"], cfg["pinch_off"]
+        kind = None
+        if self._kind == "L":
+            kind = "L" if ri is not None and ri < off else None
+        elif self._kind == "R":
+            kind = "R" if rm is not None and rm < off and (ri is None or ri > on) else None
+        elif ri is not None and ri < on:
+            kind = "L"
+        elif rm is not None and rm < on and (ri is None or ri > off):
+            kind = "R"
+        self._kind = kind
+        ck = self._ck
+        cx, cy = palm_centre(lm)
+        if kind and ck is None:
+            back = self._p_back(now, PINCH_BACK_S)
+            if back is not None and self._P is not None:
+                self._P = [back[0], back[1]]
+                self._emit_pointer(now, force=True)
+            self._ck = {"kind": kind, "t0": now, "pc": (cx, cy), "void": False, "drag": False,
+                        "p": tuple(self._P) if self._P else None}
+        elif ck is not None and kind != ck["kind"]:
+            self._finish_contact(now)
+            if kind:
+                self._contact(now, prim)
+        elif ck is not None:
+            x0, y0, x1, y1 = desktop_rect(self.monitors())
+            bx0, by0, bx1, by1 = cfg["reticle_box"]
+            mv = math.hypot((cx - ck["pc"][0]) / (bx1 - bx0) * (x1 - x0),
+                            (cy - ck["pc"][1]) / (by1 - by0) * (y1 - y0)) * PRECISION_GAIN
+            if mv >= CLICK_MOVE_PX or self.mode == "resize":
+                ck["void"] = True
+            if self.mode == "drag":
+                ck["drag"] = True
+
+    def _finish_contact(self, now):
+        ck, self._ck = self._ck, None
+        if ck is None or ck["void"] or ck["drag"] or self.mode:
+            return
+        if not self.cfg["click_enabled"] or now - ck["t0"] > CLICK_TAP_S:
+            return
+        name = "left" if ck["kind"] == "L" else "right"
+        p = ck["p"]
+        self._log(f"click {name} at {int(p[0]) if p else -1},{int(p[1]) if p else -1}")
+        self._press(now, name)
+
+    def _press(self, now, name):
+        try:
+            self.ptr.button(name, True)
+            self._btn_down = name
+            self._rel_at = now + BUTTON_HOLD_S
+            self._flash_until = now + CLICK_FLASH_S
+        except Exception as e:
+            self._log(f"click failed: {e}")
+
+    def _service_buttons(self, now):
+        if self._btn_down and self._rel_at is not None and now >= self._rel_at:
+            self._release_buttons()
+
+    def _release_buttons(self):
+        name, self._btn_down, self._rel_at = self._btn_down, None, None
+        if name:
+            try:
+                self.ptr.button(name, False)
+            except Exception as e:
+                self._log(f"release failed: {e}")
+
+    def _release_pointer(self):
+        """Disarm, pause, hand loss or exit: never leave a button held or a contact half-finished."""
+        self._release_buttons()
+        self._ck = None
+        self._kind = None
+        try:
+            self.ptr.release_all()
+        except Exception:
+            pass
+
+    def _sync_device(self, on):
+        if on != self._dev_on:
+            self._dev_on = on
+            try:
+                self.ptr.set_active(on)
+            except Exception as e:
+                self._log(f"pointer device: {e}")
+
+    def close(self):
+        self._release_pointer()
+        self._sync_device(False)
+
+    def _update_reticle(self, now, cands):
+        if not self.cfg["reticle_enabled"] or self.state not in ARMED_STATES:
+            if self._ret or self._ptrack is not None:
+                self._reticle_off()
+            return
+        prim = sec = None
+        fresh = now - self._ptrack_t <= TRACK_STALE_S
+        if cands:
+            if self._ptrack is not None and fresh:
+                best = min(cands, key=lambda f: track_distance(self._ptrack, f["lms"]))
+                if track_distance(self._ptrack, best["lms"]) <= TRACK_MATCH or now - self._ret_t > RETICLE_HOLD_S:
+                    prim = best                    # (a track unmatched for 0.2 s is re-seeded from what is seen now)
+            else:
+                prim = cands[0]
+                self._filt.pop("p", None)
+            rest = [c for c in cands if c is not prim]
+            if prim is not None and rest:
+                sec = rest[0]
+                if self._strack is not None and len(rest) > 1:
+                    sec = min(rest, key=lambda f: track_distance(self._strack, f["lms"]))
+        if prim is None:
+            if self._lost_t is None:
+                self._lost_t = now
+            if now - self._lost_t > HAND_LOSS_RELEASE_S:
+                self._release_pointer()
+            if now - self._ret_t > RETICLE_HOLD_S:
+                self._ret = {}
+                self._dwell = None
+                self._tgt_hist.clear()
+                self._fprev = None
+                self._pv.clear()
+                self._reacq = True
+            return
+        self._lost_for = 0.0 if self._lost_t is None else now - self._lost_t
+        if self._lost_for > RETICLE_HOLD_S:
+            self._reacq = True
+            self._fprev = None
+            self._filt.pop("p", None)
+        self._lost_t = None
+        self._ptrack, self._ptrack_t = prim["lms"], now
+        self._ret_t = now
+        ratio, _ = pinch_info(prim["lms"])
+        fx, fy = self._reticle_xy("p", prim["lms"], now)
+        speed = self._palm_speed(now, prim["lms"])
+        self.hand_speed = speed
+        self._now = now
+        self._contact(now, prim)
+        self._move_pointer(now, (fx, fy), speed)
+        if self._reacq:
+            self._reacq = False
+        px, py = self._P
+        tgt = None
+        if self.cfg["focus_dwell_s"] > 0:
+            tgt = self._hit(px, py)
+            self._tgt_hist.append((now, tgt))
+            while self._tgt_hist and now - self._tgt_hist[0][0] > 1.0:
+                self._tgt_hist.popleft()
+        pinched = self.mode is not None or self._ck is not None or (ratio is not None and ratio < self.cfg["pinch_on"])
+        btn = self._btn_down is not None or now < self._flash_until or self.mode is not None
+        self._ret = {"p": {"x": px, "y": py, "pinch": pinched, "over": tgt is not None, "dwell": 0.0, "btn": btn}}
+        if self.cfg["focus_dwell_s"] > 0:
+            self._update_dwell(now, tgt, px, py)
+            if self._dwell is not None:
+                self._ret["p"]["dwell"] = self._dwell_progress(now)
+        if sec is not None:
+            self._strack = sec["lms"]
+            sx, sy = self._reticle_xy("s", sec["lms"], now)
+            sr, _ = pinch_info(sec["lms"])
+            self._ret["s"] = {"x": sx, "y": sy, "pinch": sr is not None and sr < self.cfg["pinch_on"],
+                              "over": False, "dwell": 0.0, "btn": False}
+        else:
+            self._strack = None
+            self._filt.pop("s", None)
+
+    def _hit(self, x, y):
+        try:
+            return window_at(self.windows(), x, y)
+        except Exception:
+            return None
+
+    def _update_dwell(self, now, tgt, px, py):
+        d = self._dwell
+        if tgt is None or self._pinching or self.mode or self.state != "armed":
+            self._dwell = None if tgt is None else d
+            if tgt is None or d is None:
+                return
+            d["since"] = now                      # hold the fill while a pinch or a cooldown is going on
+            return
+        if d is None or d["addr"] != tgt["address"]:
+            d = self._dwell = {"addr": tgt["address"], "since": now, "anchor": (px, py),
+                               "done": tgt.get("focusHistoryID") == 0, "t_focus": -1e9}
+        if math.hypot(px - d["anchor"][0], py - d["anchor"][1]) > DWELL_MOVE_PX:
+            d["anchor"], d["since"] = (px, py), now
+        elif not d["done"] and now - d["since"] >= self.cfg["focus_dwell_s"]:
+            d["done"], d["t_focus"] = True, now
+            self._log("dwell focus")
+            self._send(now, focus_expr(tgt["address"]))
+
+    def _dwell_progress(self, now):
+        d = self._dwell
+        if d["done"]:
+            return 1.0 if now - d["t_focus"] < 0.25 else 0.0
+        return min(1.0, (now - d["since"]) / self.cfg["focus_dwell_s"])
+
+    def reticle_payload(self):
+        """One JSON-able message for the HUD socket: desktop pixels, camera capture time for latency checks."""
+        out = []
+        for key in ("p", "s"):
+            r = self._ret.get(key)
+            if r:
+                out.append({"id": key, "x": round(r["x"], 1), "y": round(r["y"], 1), "pinch": bool(r["pinch"]),
+                            "over": bool(r["over"]), "dwell": round(r["dwell"], 3), "btn": bool(r.get("btn"))})
+        return {"v": 1, "cap_ms": self.cap_ms, "r": out}
+
+    def _update_fullscreen(self, now, usable):
+        """Victory (score >= 0.6, or the landmark shape when the model is unsure) held 0.4 s toggles fullscreen."""
+        cfg = self.cfg
+        ok = False
+        if cfg["fullscreen_enabled"] and usable and self.state == "armed" and not self._pinching \
+                and self.n_hands == 1 and now - self._fire_now >= FS_AFTER_SWIPE_S:
+            g, sc = usable["gesture"], usable.get("score", 0.0)
+            ok = (g == "Victory" and sc >= FS_SCORE) or \
+                 (not (g in CONFIDENT_OTHERS and sc >= FS_SCORE) and g != "Victory" and victory_shape(usable["lms"]))
+            if ok and self._speed(now) > FS_MAX_SPEED:
+                ok = False
+            ratio, _ = pinch_info(usable["lms"])
+            if ratio is not None and ratio < cfg["pinch_on"]:
+                ok = False
+        if not ok:
+            self._vic_since = None
+            self._vic_ready = True              # the sign must be dropped before it can fire again
+            return
+        if now < self._fs_cool or not self._vic_ready:
+            return
+        if self._vic_since is None:
+            self._vic_since = now
+        self.progress = min(1.0, (now - self._vic_since) / FS_HOLD_S)
+        if now - self._vic_since >= FS_HOLD_S:
+            self._vic_since = None
+            self._vic_ready = False
+            self._fs_cool = now + FS_COOLDOWN_S
+            self._fs_until = now + FS_LABEL_S
+            self.progress = 0.0
+            self._hist.clear()
+            fs = self._fullscreen_window()
+            if fs is not None:
+                self._log("fullscreen exit")
+                self._send(now, fullscreen_expr(fs["address"]))
+            else:
+                self._log("fullscreen toggle")
+                self._send(now, FULLSCREEN_EXPR)
+
+    def _fullscreen_window(self):
+        """The focused window when fullscreen, else any fullscreen window on the pointer's monitor, else None."""
+        try:
+            wins = list(self.windows())
+        except Exception:
+            wins = []
+        foc = self._focused_window()
+        if foc and foc.get("fullscreen") and ADDR_RE.match(str(foc.get("address", ""))):
+            return foc
+        mon = monitor_at(self.monitors(), *self._P) if self._P is not None else None
+        for w in wins:
+            if w.get("fullscreen") and ADDR_RE.match(str(w.get("address", ""))) \
+                    and (mon is None or w.get("monitor") in (None, mon.get("id"))):
+                return w
+        return None
+
+    def _update_palms(self, now, cands):
+        """Both open palms facing the camera held 0.5 s exit fullscreen (and do nothing when nothing is fullscreen)."""
+        ok = (self.cfg["fullscreen_enabled"] and self.state == "armed" and len(cands) == 2 and not self._pinching
+              and all(c["gesture"] == "Open_Palm" and c.get("score", 0.0) >= PALMS_SCORE for c in cands))
+        if not ok:
+            self._pal2_since = None
+            self._pal2_ready = True
+            return
+        if not self._pal2_ready or now < self._fs_cool:
+            return
+        if self._pal2_since is None:
+            self._pal2_since = now
+        if now - self._pal2_since < PALMS_HOLD_S:
+            return
+        self._pal2_since = None
+        self._pal2_ready = False
+        fs = self._fullscreen_window()
+        if fs is None:
+            return
+        self._fs_cool = now + FS_COOLDOWN_S
+        self._fs_until = now + FS_LABEL_S
+        self._log("fullscreen exit (both palms)")
+        self._send(now, fullscreen_expr(fs["address"]))
+
+    def _span(self, now):
+        return (now - self._hist[0][0]) if self._hist else 0.0
+
+    def _speed(self, now):
+        pts = [p for p in self._hist if now - p[0] <= SETTLE_WINDOW_S]
+        if len(pts) < 2 or pts[-1][0] <= pts[0][0]:
+            return 0.0 if len(pts) < 2 else 0.0
+        dt = pts[-1][0] - pts[0][0]
+        return math.hypot(pts[-1][1] - pts[0][1], pts[-1][2] - pts[0][2]) / dt
+
+    def _vel(self, t_end, idx):
+        pts = [p for p in self._hist if t_end - p[0] <= VEL_WINDOW_S + 1e-6]
+        if len(pts) < 2:
+            pts = list(self._hist)[-2:]
+        if len(pts) < 2 or pts[-1][0] <= pts[0][0]:
+            return 0.0
+        return (pts[-1][idx] - pts[0][idx]) / (pts[-1][0] - pts[0][0])
+
+    def _vy(self, t_end):
+        return self._vel(t_end, 2)
+
+    def _fsp(self, now, window=0.1):
+        """Palm speed in frame heights per second over the last `window` seconds (x scaled to height units)."""
+        pts = [p for p in self._shist if now - p[0] <= window + 1e-6]
+        if len(pts) < 2 or pts[-1][0] <= pts[0][0]:
+            return 0.0
+        return math.hypot(pts[-1][1] - pts[0][1], pts[-1][2] - pts[0][2]) / (pts[-1][0] - pts[0][0])
+
+    def _sm_step(self, now):
+        """Stroke state machine, one step per frame with a hand: REST -> STROKE (speed over 0.5) -> FIRED ->
+        RECOVER -> REST. A new stroke may only start from REST; REST needs the hand below 0.25 frame heights per
+        second for 0.18 s (a hand that left view starts over) and 0.7 s since the last fire."""
+        sp = self._fsp(now)
+        if self._sm in ("FIRED", "RECOVER"):
+            self._fired_peak = max(self._fired_peak, sp) if self._sm == "FIRED" else self._fired_peak
+            if self._sm == "FIRED" and sp < STROKE_SPEED:
+                self._sm = "RECOVER"
+        if sp < REST_SPEED:
+            if self._sm_still is None:
+                self._sm_still = now
+            if now - self._sm_still >= REST_S and now - self._fire_now >= MIN_REFIRE_S:
+                if self._sm != "REST":
+                    self._sm = "REST"
+                    self._sm_peak = 0.0
+                    self._stroke_win = None
+        else:
+            self._sm_still = None
+        if self._sm == "REST" and sp > STROKE_SPEED:
+            self._sm = "STROKE"
+            self._sm_peak = 0.0
+            self._stroke_t0 = now
+            self._stroke_win = self._focused_window()      # follow_mouse: the window under the pointer when it began
+        if self._sm == "STROKE":
+            self._sm_peak = max(self._sm_peak, sp)
+
+    def _focused_window(self):
+        """The window the compositor focuses (the one under the pointer), preferring the cached list."""
+        try:
+            for w in self.windows():
+                if w.get("focusHistoryID") == 0:
+                    return w
+        except Exception:
+            pass
+        return self._active_window()
+
+    def _detect_swipe(self, now, vanished=False):
+        """Fire on a fast flick early in the stroke (travel from the turning point + current speed), or on a
+        slower full stroke (swipe_dist within swipe_window_s). Vertical strokes change workspace; horizontal
+        strokes (|dx| > 1.2 x |dy| over the fastest 0.15 s, x scaled by 16:9) move the window to the adjacent
+        monitor. The stroke state machine allows one fire per stroke. Measured from the last sighting."""
+        if not self._hist or now < self._quiet_until:
+            return
+        t_end, nx, ny = self._hist[-1]
+        win = [p for p in self._hist if t_end - p[0] <= self.cfg["swipe_window_s"]]
+        if len(win) < 2:
+            return
+        sdx = sdy = 0.0                                  # the fastest 0.15 s segment of the stroke, in frame heights
+        for i, a in enumerate(win):
+            for b in win[i + 1:]:
+                if b[0] - a[0] > FLICK_SEG_S + 1e-6:
+                    break
+                dx, dy = (b[1] - a[1]) * ASPECT, b[2] - a[2]
+                if math.hypot(dx, dy) > math.hypot(sdx, sdy):
+                    sdx, sdy = dx, dy
+        horiz = self.cfg["flick_monitor_enabled"] and abs(sdx) > FLICK_RATIO * abs(sdy)
+        if horiz and self.n_hands > 1:
+            return                                      # two hands in view: a track jump is not a flick
+        if horiz:
+            v = self._vel(t_end, 1) * ASPECT
+            ax, ox, k = 1, 2, ASPECT
+        else:
+            v = self._vel(t_end, 2)
+            ax, ox, k = 2, 1, 1.0
+        if abs(v) < 1e-6:
+            self._end_stroke()
+            return
+        neg = v < 0
+        ext = max(win, key=lambda p: p[ax]) if neg else min(win, key=lambda p: p[ax])
+        cur, off = (nx, ny) if horiz else (ny, nx)
+        travel, dx = abs(cur - ext[ax]) * k, (off - ext[ox]) * (1.0 if horiz else ASPECT)
+        direction = ("left" if neg else "right") if horiz else ("up" if neg else "down")
+        vy = v                                          # the speed along the stroke axis from here on
+        speed_need = FLING_SPEED * (0.75 if vanished else 1.0)
+        reason = None
+        if not horiz and travel <= DIR_RATIO * abs(dx):
+            reason = "angle"
+        elif not ((travel >= FLING_DIST and abs(vy) >= speed_need)
+                  or (travel >= self.cfg["swipe_dist"] and abs(vy) >= SLOW_MIN_SPEED and not vanished)):
+            reason = "short" if travel < FLING_DIST else "slow"
+        elif self._sm not in ("REST", "STROKE") or now - self._fire_now < MIN_REFIRE_S:
+            reason = "continuation"            # one stroke = one swipe: still the stroke (or its return) that fired
+        elif (self._fire_dir and direction != self._fire_dir and self._opposite(direction, self._fire_dir)
+              and now - self._fire_now < REVERSE_WINDOW_S
+              and not (max(self._sm_peak, abs(vy)) >= max(REVERSE_PEAK_FRAC * self._fired_peak, REVERSE_PEAK_MIN))):
+            reason = "return"
+        if reason is None:
+            print(f"hand-gesture: swipe {direction} travel={travel:.3f} dx={dx:+.3f} v={abs(vy):.2f}"
+                  f"{' (vanished)' if vanished else ''}", file=sys.stderr, flush=True)
+            self._stroke = None
+            self._fire(direction, now)
+            return
+        if abs(vy) >= NEAR_MISS_PEAK * 0.8 or self._stroke:
+            st = self._stroke or {"peak": 0.0}
+            if abs(vy) >= st["peak"]:
+                st.update(peak=abs(vy), travel=travel, dx=dx, dir=direction)
+            st["reason"] = reason
+            self._stroke = st
+            if abs(vy) < PAUSE_SPEED:
+                self._end_stroke()
+
+    @staticmethod
+    def _opposite(a, b):
+        return {a, b} in ({"up", "down"}, {"left", "right"})
+
+    def _end_stroke(self):
+        st, self._stroke = self._stroke, None
+        if st and st.get("peak", 0) >= NEAR_MISS_PEAK and st.get("travel", 0) >= 0.04 and st.get("reason") not in ("return", "continuation"):
+            print(f"hand-gesture: near-miss {st['dir']} travel={st['travel']:.3f} dx={st['dx']:+.3f} "
+                  f"v={st['peak']:.2f} reason={st['reason']}", file=sys.stderr, flush=True)
+
+    def _fire(self, physical, now):
+        # swipe up (image y decreasing) -> next workspace -> script arg "down"
+        horizontal = physical in ("left", "right")
+        arg = "down" if physical == "up" else "up"
+        if self.cfg["invert_vertical"]:
+            arg = "up" if arg == "down" else "down"
+        self.last = physical
+        self.last_ms = self.wall_ms()
+        self.state = "cooldown"
+        self._cool_until = now + COOLDOWN_S
+        self._fire_t = self._hist[-1][0] if self._hist else now
+        self._fire_now = now
+        self._fire_dir = physical
+        self._fired_peak = max(self._sm_peak, self._fsp(now))
+        self._sm = "FIRED"
+        self._sm_still = None
+        last = self._hist[-1] if self._hist else None
+        self._hist.clear()
+        if last:
+            self._hist.append(last)       # the next swipe's travel starts here, not before this one
+        if horizontal:
+            self.last = self._user_side(physical)       # the HUD arrow follows the user's view
+            self._flick(now)
+            return
+        try:
+            self.runner(arg)
+        except Exception as e:           # a failing action must not kill the daemon
+            print(f"hand-gesture: action failed: {e}", file=sys.stderr, flush=True)
+
+    # -- phase 3A: flick to the adjacent monitor -----------------------------------------
+    def _user_side(self, physical):
+        if self.cfg["mirror_x"]:                          # the camera sees Brian mirrored
+            return "left" if physical == "right" else "right"
+        return physical
+
+    def _flick(self, now):
+        side = self.last
+        win = self._stroke_win or self._focused_window()       # the window under the pointer when the stroke began
+        if win is None or not ADDR_RE.match(str(win.get("address", ""))) or "at" not in win or "size" not in win:
+            self._log_nowin(f"flick {side}")
+            return
+        mons = sorted(self.monitors(), key=lambda m: m["x"])
+        cx, cy = win["at"][0] + win["size"][0] / 2, win["at"][1] + win["size"][1] / 2
+        cur = None
+        for i, m in enumerate(mons):
+            if m["x"] <= cx < m["x"] + m["width"]:
+                cur = i
+        if cur is None and win.get("monitor") is not None:
+            cur = next((i for i, m in enumerate(mons) if m.get("id") == win["monitor"]), None)
+        nxt = None if cur is None else cur + (1 if side == "right" else -1)
+        if nxt is None or not 0 <= nxt < len(mons):
+            self._log(f"flick {side} not moved: at the outer edge" if cur is not None else
+                      f"flick {side} not moved: window is on no known monitor")
+            return
+        reply = self._send(now, move_monitor_expr(win["address"], mons[nxt]["name"]))
+        if reply != "ok":
+            self._log(f"flick {side} not moved: dispatch failed")
+            return
+        self._log(f"flick {side} moved {win['address']} {mons[cur]['name']} -> {mons[nxt]['name']}")
+        self._send(now, focus_expr(win["address"]))      # focus follows the moved window
+
+    def _active_window(self):
+        try:
+            return self.active()
+        except Exception:
+            return None
+
+    # -- HUD ------------------------------------------------------------------
+    def snapshot(self):
+        return {
+            "v": 1,
+            "at_ms": self.wall_ms(),
+            "state": self.state,
+            "hand": bool(self.hand),
+            "x": round(min(1.0, max(0.0, 1.0 - self.x)), 3),    # mirrored so the dot follows the user's view
+            "y": round(min(1.0, max(0.0, self.y)), 3),
+            "progress": round(min(1.0, max(0.0, self.progress)), 3),
+            "last": self.last,
+            "last_ms": self.last_ms,
+            "mode": self._mode_label(),
+            "hands": self.n_hands,
+            "x2": None if self.x2 is None else round(min(1.0, max(0.0, 1.0 - self.x2)), 3),
+            "y2": None if self.y2 is None else round(min(1.0, max(0.0, self.y2)), 3),
+        }
+
+    def _mode_label(self):
+        if self.mode:
+            return self.mode
+        if self.state in ("armed", "cooldown") and self._now < self._fs_until:
+            return "fullscreen"
+        return None
+
+
+def runtime_dir():
+    return os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+
+class Trace:
+    """Numbers-only ring of the last TRACE_LEN processed frames, flushed atomically once a second
+    to $XDG_RUNTIME_DIR/hand-gesture/trace.jsonl (kept after exit for tuning; tmpfs, gone at logout)."""
+
+    def __init__(self, directory, clock=time.monotonic):
+        self.path = os.path.join(directory, "trace.jsonl")
+        self.rows = collections.deque(maxlen=TRACE_LEN)
+        self.clock = clock
+        self._flushed = clock()
+
+    def add(self, now, fr, engine):
+        if fr is None and engine.state == "idle":
+            return                        # keep the ring for gesture sessions, not empty idle frames
+        self.rows.append({"t": round(now, 3), "hand": fr is not None,
+                          "g": fr["gesture"] if fr else None, "s": round(fr["score"], 2) if fr else None,
+                          "x": round(engine.x, 3), "y": round(engine.y, 3),
+                          "st": engine.state, "set": engine._settled,
+                          "mode": engine._mode_label(), "n": engine.n_hands})
+        if self.clock() - self._flushed >= 1.0:
+            self.flush()
+
+    def flush(self):
+        self._flushed = self.clock()
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                f.writelines(json.dumps(r, separators=(",", ":")) + "\n" for r in self.rows)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+
+class StateWriter:
+    """Atomic state.json writer: immediate on state change, at most 10 Hz otherwise."""
+
+    def __init__(self, directory=None, clock=time.monotonic):
+        self.dir = directory or os.path.join(runtime_dir(), "hand-gesture")
+        self.path = os.path.join(self.dir, "state.json")
+        self.clock = clock
+        self._last_state = None
+        self._last_last_ms = None
+        self._last_mode = None
+        self._last_t = -1e9
+
+    def write(self, snap):
+        now = self.clock()
+        changed = (snap["state"] != self._last_state or snap["last_ms"] != self._last_last_ms
+                   or snap.get("mode") != self._last_mode)
+        if not changed and (not snap["hand"] or now - self._last_t < 1.0 / MAX_WRITE_HZ):
+            return False
+        os.makedirs(self.dir, exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snap, f, separators=(",", ":"))
+        os.replace(tmp, self.path)
+        self._last_state = snap["state"]
+        self._last_last_ms = snap["last_ms"]
+        self._last_mode = snap.get("mode")
+        self._last_t = now
+        return True
+
+    def remove(self):
+        for p in (self.path, self.path + ".tmp"):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def hypr_env(env=None):
+    """Environment with HYPRLAND_INSTANCE_SIGNATURE (newest instance dir when missing)."""
+    env = dict(os.environ if env is None else env)
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        d = f"/run/user/{os.getuid()}/hypr"
+        try:
+            dirs = [os.path.join(d, n) for n in os.listdir(d) if os.path.isdir(os.path.join(d, n))]
+            if dirs:
+                env["HYPRLAND_INSTANCE_SIGNATURE"] = os.path.basename(max(dirs, key=os.path.getmtime))
+        except OSError:
+            pass
+    env.setdefault("XDG_RUNTIME_DIR", runtime_dir())
+    return env
+
+
+DRYRUN = os.environ.get("HAND_GESTURE_DRYRUN") == "1"
+
+
+def run_dispatch(expr, run=subprocess.run):
+    """hyprctl dispatch '<lua expr>' (HAND_GESTURE_DRYRUN=1 logs it instead)."""
+    if DRYRUN:
+        print(f"hand-gesture: dryrun dispatch {expr}", file=sys.stderr, flush=True)
+        return
+    r = run(["hyprctl", "dispatch", expr], timeout=2, env=hypr_env(), check=False,
+            capture_output=True, text=True)
+    return (getattr(r, "stdout", "") or "").strip() or "ok"
+
+
+class HyprPointer:
+    """Pointer backend. Cursor motion goes straight to Hyprland's request socket (the same bytes `hyprctl dispatch`
+    sends, no process per move). Buttons go through a uinput virtual pointer that exists only while armed."""
+
+    NAME = "hand-gesture-pointer"
+
+    def __init__(self, dryrun=False, uinput_factory=None):
+        self.dryrun = dryrun
+        self._factory = uinput_factory
+        self._ui = None
+        self._held = set()
+
+    # -- Hyprland socket
+    @staticmethod
+    def socket_path():
+        env = hypr_env()
+        return os.path.join(runtime_dir(), "hypr", env.get("HYPRLAND_INSTANCE_SIGNATURE", ""), ".socket.sock")
+
+    def request(self, text):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.25)
+        try:
+            s.connect(self.socket_path())
+            s.sendall(text.encode())
+            s.shutdown(socket.SHUT_WR)
+            out = b""
+            while True:
+                b = s.recv(65536)
+                if not b:
+                    break
+                out += b
+            return out.decode(errors="replace")
+        finally:
+            s.close()
+
+    def move(self, x, y):
+        if self.dryrun:
+            return
+        self.request("dispatch " + cursor_move_expr(x, y))
+
+    def cursor_pos(self):
+        try:
+            a, b = self.request("cursorpos").split(",")
+            return int(a), int(b)
+        except (OSError, ValueError):
+            return None
+
+    # -- uinput
+    def _open(self):
+        if self._factory is not None:
+            return self._factory()
+        import evdev
+        from evdev import ecodes as e
+        cap = {e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT], e.EV_REL: [e.REL_X, e.REL_Y]}
+        return evdev.UInput(cap, name=self.NAME)
+
+    def set_active(self, on):
+        if on and self._ui is None and not self.dryrun:
+            self._ui = self._open()
+            print("hand-gesture: virtual pointer created", file=sys.stderr, flush=True)
+        elif not on and self._ui is not None:
+            self.release_all()
+            try:
+                self._ui.close()
+            finally:
+                self._ui = None
+            print("hand-gesture: virtual pointer destroyed", file=sys.stderr, flush=True)
+
+    def button(self, name, down):
+        if self.dryrun:
+            print(f"hand-gesture: dryrun button {name} {'down' if down else 'up'}", file=sys.stderr, flush=True)
+            return
+        if self._ui is None:
+            raise OSError("no virtual pointer")
+        from evdev import ecodes as e
+        code = e.BTN_LEFT if name == "left" else e.BTN_RIGHT
+        self._ui.write(e.EV_KEY, code, 1 if down else 0)
+        self._ui.syn()
+        (self._held.add if down else self._held.discard)(name)
+
+    def release_all(self):
+        for name in list(self._held):
+            try:
+                self.button(name, False)
+            except OSError:
+                self._held.discard(name)
+
+
+def active_window(run=subprocess.run):
+    """The focused window from `hyprctl activewindow -j`, or None."""
+    r = run(["hyprctl", "activewindow", "-j"], timeout=2, env=hypr_env(), check=False,
+            capture_output=True, text=True)
+    try:
+        w = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return w if isinstance(w, dict) and w.get("address") else None
+
+
+def run_action(direction):
+    if DRYRUN:
+        print(f"hand-gesture: dryrun workspace-cycle {direction}", file=sys.stderr, flush=True)
+        return
+    subprocess.run([ACTION, direction], timeout=2, env=hypr_env(), check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def screen_locked(run=subprocess.run):
+    """True while hyprlock or the Ares lock shell is running."""
+    for cmd in (["pgrep", "-x", "hyprlock"], ["pgrep", "-f", "[q]s -n -c ares-lock"]):
+        try:
+            if run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1).returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return False
+
+
+def visible_windows(clients, monitors):
+    """Hit-test list, topmost first: mapped windows on a workspace that is showing on some monitor
+    (floating above tiled, then most recently focused first)."""
+    shown = set()
+    for m in monitors:
+        shown.add((m.get("activeWorkspace") or {}).get("id"))
+        sw = (m.get("specialWorkspace") or {}).get("id")
+        if sw:
+            shown.add(sw)
+    out = []
+    for c in clients:
+        if not c.get("mapped", True) or c.get("hidden") or (c.get("workspace") or {}).get("id") not in shown:
+            continue
+        if not (ADDR_RE.match(str(c.get("address", ""))) and c.get("at") and c.get("size")):
+            continue
+        out.append(c)
+    out.sort(key=lambda c: (not c.get("floating"), c.get("focusHistoryID", 99)))
+    return out
+
+
+class HyprCache:
+    """Clients and monitors from hyprctl, refreshed on Hyprland events (socket2) or every HIT_REFRESH_S,
+    never per frame. Reads are lock-free snapshots."""
+
+    EVENTS = (b"openwindow", b"closewindow", b"movewindow", b"activewindow", b"workspace", b"focusedmon",
+              b"monitoradded", b"monitorremoved", b"fullscreen", b"changefloatingmode", b"activespecial",
+              b"configreloaded")
+
+    def __init__(self, run=subprocess.run):
+        self.run = run
+        self.windows = []
+        self.monitors = list(DEFAULT_MONITORS)
+        self._stop = False
+        self._last = 0.0
+
+    def _json(self, what):
+        r = self.run(["hyprctl", what, "-j"], timeout=2, env=hypr_env(), check=False, capture_output=True, text=True)
+        return json.loads(r.stdout)
+
+    def refresh(self):
+        try:
+            mons = self._json("monitors")
+            clients = self._json("clients")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return
+        if mons:
+            self.monitors = [{"id": m["id"], "name": m["name"], "x": m["x"], "y": m["y"],
+                              "width": int(m["width"] / (m.get("scale") or 1)),
+                              "height": int(m["height"] / (m.get("scale") or 1))} for m in mons]
+        self.windows = visible_windows(clients, mons)
+        self._last = time.monotonic()
+
+    def _sock2(self):
+        env = hypr_env()
+        path = os.path.join(runtime_dir(), "hypr", env.get("HYPRLAND_INSTANCE_SIGNATURE", ""), ".socket2.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(path)
+        return s
+
+    def loop(self):
+        sock = None
+        while not self._stop:
+            if sock is None:
+                try:
+                    sock = self._sock2()
+                except OSError:
+                    sock = None
+            hit = False
+            if sock is not None:
+                try:
+                    r, _, _ = select.select([sock], [], [], HIT_REFRESH_S)
+                    if r:
+                        data = sock.recv(65536)
+                        if not data:
+                            sock.close()
+                            sock = None
+                        else:
+                            hit = any(e in data for e in self.EVENTS)
+                except OSError:
+                    sock = None
+            else:
+                time.sleep(HIT_REFRESH_S)
+            if hit and time.monotonic() - self._last < 0.1:
+                continue
+            if hit or time.monotonic() - self._last >= HIT_REFRESH_S:
+                self.refresh()
+
+    def start(self):
+        self.refresh()
+        threading.Thread(target=self.loop, daemon=True, name="hypr-cache").start()
+
+
+class ReticleServer:
+    """Newline-delimited JSON over a Unix socket ($XDG_RUNTIME_DIR/hand-gesture/reticle.sock). The HUD connects
+    and reads; a client that cannot keep up is dropped, never waited for."""
+
+    def __init__(self, directory=None):
+        self.dir = directory or os.path.join(runtime_dir(), "hand-gesture")
+        self.path = os.path.join(self.dir, "reticle.sock")
+        self.srv = None
+        self.clients = []
+        self._last_msg = None
+
+    def start(self):
+        os.makedirs(self.dir, exist_ok=True)
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        os.chmod(self.path, 0o600)
+        self.srv.listen(4)
+        self.srv.setblocking(False)
+
+    def _accept(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except (BlockingIOError, OSError):
+                return
+            c.setblocking(False)
+            self.clients.append(c)
+            if self._last_msg:
+                self._write(c, self._last_msg)
+
+    def _write(self, c, data):
+        try:
+            c.send(data)
+            return True
+        except (BlockingIOError, OSError):
+            return False
+
+    def send(self, payload):
+        if self.srv is None:
+            return 0
+        self._accept()
+        data = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+        self._last_msg = data
+        alive = [c for c in self.clients if self._write(c, data)]
+        for c in self.clients:
+            if c not in alive:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+        self.clients = alive
+        return len(alive)
+
+    def close(self):
+        for c in self.clients:
+            try:
+                c.close()
+            except OSError:
+                pass
+        self.clients = []
+        if self.srv is not None:
+            self.srv.close()
+            self.srv = None
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+# -- camera path (imports cv2 / mediapipe lazily) ---------------------------------------
+def open_camera():
+    import cv2
+    cv2.setNumThreads(1)
+    cap = cv2.VideoCapture(CAMERA, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_H)
+    cap.set(cv2.CAP_PROP_FPS, CAPTURE_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def make_recognizer():
+    import mediapipe as mp  # noqa: F401
+    from mediapipe.tasks.python import vision, BaseOptions
+    opt = vision.GestureRecognizerOptions(
+        base_options=BaseOptions(model_asset_path=MODEL),
+        running_mode=vision.RunningMode.VIDEO, num_hands=2,
+        min_hand_presence_confidence=0.3, min_tracking_confidence=0.3)   # hold the track through motion blur
+    return vision.GestureRecognizer.create_from_options(opt)
+
+
+def recognize(rec, frame_bgr, ts_ms):
+    """Run the recogniser on one BGR frame; returns a list of engine frame dicts (empty when no hand)."""
+    import cv2
+    import mediapipe as mp
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    res = rec.recognize_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts_ms)
+    out = []
+    for i, lm in enumerate(res.hand_landmarks or ()):
+        g = res.gestures[i][0] if res.gestures and len(res.gestures) > i and res.gestures[i] else None
+        h = res.handedness[i][0].score if res.handedness and len(res.handedness) > i and res.handedness[i] else 1.0
+        out.append({"gesture": g.category_name if g else "None", "score": g.score if g else 0.0,
+                    "handedness": h, "lms": [(p.x, p.y) for p in lm]})
+    return out
+
+
+def set_pdeathsig():
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def cmd_probe(seconds):
+    import cv2
+    cap = open_camera()
+    if cap is None:
+        print("frames=0 hands=0 ms_p50=0 luma=0 nocam")
+        return 2
+    rec = make_recognizer()
+    n = hands = 0
+    ms, lum = [], []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < seconds:
+        ok, f = cap.read()
+        if not ok:
+            continue
+        n += 1
+        lum.append(float(f.mean()))
+        a = time.perf_counter()
+        r = recognize(rec, f, int(time.monotonic() * 1000))
+        ms.append((time.perf_counter() - a) * 1000)
+        hands += bool(r)
+    cap.release()
+    p50 = sorted(ms)[len(ms) // 2] if ms else 0.0
+    print(f"frames={n} hands={hands} ms_p50={p50:.1f} luma={(sum(lum) / len(lum) if lum else 0):.1f}")
+    return 0 if n else 2
+
+
+def cmd_run():
+    import cv2
+    cv2.setNumThreads(1)
+    set_pdeathsig()
+    writer = StateWriter()
+    cache = HyprCache()
+    cache.start()
+    ret = ReticleServer()
+    ret.start()
+    pointer = HyprPointer(dryrun=DRYRUN)
+    engine = GestureEngine(load_config(), run_action, dispatch=run_dispatch, active=active_window,
+                           windows=lambda: cache.windows, monitors=lambda: cache.monitors, pointer=pointer)
+    ret_state = {"on": False, "t": -1e9}
+
+    trace = None
+
+    def bye(*_):
+        engine.close()
+        if trace is not None:
+            trace.flush()
+        writer.remove()
+        ret.close()
+        os._exit(0)
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+
+    rec = make_recognizer()
+    trace = Trace(writer.dir)  # noqa: F841 (read by bye)
+    cap = None
+    fails = 0
+    frame_no = 0
+    last_lock_check = -1e9
+    locked = False
+    next_open = 0.0
+    try:
+        while True:
+            now = time.monotonic()
+            if now - last_lock_check >= LOCK_POLL_S:
+                last_lock_check = now
+                locked = screen_locked()
+            if locked:
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                engine.set_external("paused")
+                writer.write(engine.snapshot())
+                time.sleep(0.5)
+                continue
+            if cap is None:
+                if now < next_open:
+                    time.sleep(0.2)
+                    continue
+                cap = open_camera()
+                fails = 0
+                if cap is None:
+                    next_open = now + 2.0
+                    engine.set_external("nocam")
+                    writer.write(engine.snapshot())
+                    continue
+            engine.set_external(None)
+            ok, frame = cap.read()
+            if not ok:
+                fails += 1
+                if fails >= READ_FAIL_REOPEN:
+                    cap.release()
+                    cap = None
+                    next_open = now + 1.0
+                else:
+                    time.sleep(0.02)
+                continue
+            fails = 0
+            now = time.monotonic()
+            frame_no += 1     # pace by frame count: time pacing aliased 30 Hz to ~20 Hz on a 30 fps camera
+            every = 1 if engine.state in ("armed", "cooldown", "arming") or engine.mode else max(1, CAPTURE_FPS // PROCESS_HZ)
+            if frame_no % every:
+                continue
+            fr = recognize(rec, frame, int(now * 1000))
+            engine.cap_ms = int(time.time() * 1000) - int((time.monotonic() - now) * 1000)
+            engine.update(now, fr[0] if fr else None, fr[1:])
+            writer.write(engine.snapshot())
+            if engine._ret or ret_state["on"]:           # nothing is sent (or drawn) while disarmed
+                ret_state["on"] = bool(engine._ret)
+                ret.send(engine.reticle_payload())
+            trace.add(now, fr[0] if fr else None, engine)
+    finally:
+        engine.close()
+        writer.remove()
+        ret.close()
+
+
+def cmd_toggle():
+    r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", UNIT])
+    verb = "stop" if r.returncode == 0 else "start"
+    subprocess.run(["systemctl", "--user", verb, UNIT])
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="hand-gesture", description="webcam hand gestures for Hyprland workspaces")
+    ap.add_argument("cmd", nargs="?", choices=["run", "toggle"])
+    ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--seconds", type=float, default=5.0)
+    a = ap.parse_args(argv)
+    if a.probe:
+        return cmd_probe(a.seconds)
+    if a.cmd == "run":
+        return cmd_run()
+    if a.cmd == "toggle":
+        return cmd_toggle()
+    ap.print_help()
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main())

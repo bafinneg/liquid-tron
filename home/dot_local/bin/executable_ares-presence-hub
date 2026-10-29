@@ -1,0 +1,640 @@
+#!/usr/bin/env -S python3 -I
+"""ares-presence-hub: the only writer of presence.json and the only Noctalia pusher (FEAT-ares-bar-ai-clients C1).
+
+Merges, once a second or on a nudge datagram:
+  - $XDG_RUNTIME_DIR/ares/procs/presence-<pid>.json   per-process ares-bar-state files (pid alive, < 35 min old)
+  - ~/.hermes/profiles/fullpower/state.db              Hermes sessions active in the last 30 min (read-only)
+  - $XDG_RUNTIME_DIR/ares/claude/<session_id>.json     Claude Code hook files (ares-claude-hook)
+into $XDG_RUNTIME_DIR/ares/presence.json (v2) and pushes it to the Ares instrument when it changed.
+
+Privacy: only ids, titles, states, models, cwd and counts are read; message content is never queried.
+
+Usage: ares-presence-hub [--base DIR] [--db PATH] [--once]
+"""
+import argparse
+import glob
+import json
+import os
+import select
+import signal
+import socket
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+PRIORITY = ("needs_you", "error", "thinking", "working", "listening", "done", "idle")
+_RANK = {s: i for i, s in enumerate(PRIORITY)}
+PROC_STALE_MS = 35 * 60 * 1000
+DB_WINDOW_S = 30 * 60
+CLAUDE_STALE_MS = 6 * 3600 * 1000
+LISTENING_S = 120
+DONE_MS = 8000
+MAX_TITLE, MAX_SUMMARY, MAX_SUB_TITLE, MAX_SUBS = 60, 80, 40, 8
+MIN_EMIT_MS = 250                       # <= 4 pushes/s
+ALERT_REFRESH_MS = 2_000                 # re-mark a seen Hermes workspace while a request is open
+REFRESH_MS = 30_000                     # rewrite at least this often so age_ms stays fresh
+SKIP_SOURCE_PREFIXES = ("analyzer-", "cron")
+SESSION_KEYS = ("session_id", "platform", "model", "state", "started_ms")
+REQUEST_KEYS = ("kind", "request_id", "session_id", "opened_ms")
+# Absolute path: the systemd user manager's PATH has no ~/.local/bin, and a bare name failed silently (fix round 1).
+MSG = os.environ.get("ARES_HUB_MSG") or os.path.expanduser("~/.local/bin/noctalia-primary-msg")
+PUSH_ARGV = [MSG, "plugin", "liquidtron/ares:instrument", "all", "state"]
+HERMES_CLASS = "com.nousresearch.hermes"
+DB_QUERY = ("SELECT id, source, parent_session_id, title, last_activity_description, last_activity_at, model, cwd "
+            "FROM sessions WHERE ended_at IS NULL AND last_activity_at > ?")
+
+
+def default_base():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(runtime, "ares")
+
+
+def default_db():
+    return os.environ.get("ARES_HUB_STATE_DB") or os.path.expanduser("~/.hermes/profiles/fullpower/state.db")
+
+
+# ------------------------------------------------------------------ pure merge
+
+def _txt(v, n):
+    if not isinstance(v, str):
+        return ""
+    return " ".join(v.split())[:n]
+
+
+def _state(v):
+    return v if isinstance(v, str) and v in _RANK else "idle"
+
+
+def _best(states):
+    return min(states, key=_RANK.__getitem__, default="idle")
+
+
+def _num(v, default=0):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+
+
+def merge(now_ms, procs, db_rows, claude, prev=None):
+    """Pure merge of the three sources into the v2 presence dict."""
+    procs = [p for p in procs if isinstance(p, dict) and now_ms - _num(p.get("written_ms"), 0) < PROC_STALE_MS]
+    procs.sort(key=lambda p: -_num(p.get("written_ms")))            # newest first
+
+    proc_state, proc_session, requests, proc_children = {}, {}, {}, {}
+    for p in procs:
+        for c in p.get("children") or []:
+            if isinstance(c, dict) and isinstance(c.get("id"), str) and isinstance(c.get("parent"), str):
+                proc_children.setdefault(c["parent"], {}).setdefault(c["id"], True)
+        for s in p.get("sessions") or []:
+            if not isinstance(s, dict) or not isinstance(s.get("session_id"), str):
+                continue
+            sid = s["session_id"]
+            st = _state(s.get("state"))
+            proc_state[sid] = _best([proc_state[sid], st]) if sid in proc_state else st
+            proc_session.setdefault(sid, (s, _num(p.get("written_ms"))))
+        for r in p.get("requests") or []:
+            if isinstance(r, dict) and isinstance(r.get("request_id"), str):
+                requests.setdefault(r["request_id"], {k: r.get(k) for k in REQUEST_KEYS})
+
+    # ---- Hermes rows from state.db
+    now_s = now_ms / 1000.0
+    live = []
+    for r in db_rows:
+        if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+            continue
+        src = r.get("source") if isinstance(r.get("source"), str) else ""
+        if src.startswith(SKIP_SOURCE_PREFIXES):
+            continue
+        at = _num(r.get("last_activity_at"), None)
+        if at is None or at <= now_s - DB_WINDOW_S:
+            continue
+        live.append((r, src, at))
+    db_chats = {r["id"]: (r, at) for r, src, at in live if src != "subagent"}
+    db_subs = {}
+    for r, src, at in live:
+        parent = r.get("parent_session_id")
+        if src == "subagent" and parent in db_chats:
+            db_subs.setdefault(parent, []).append(r)
+
+    chats = {}
+    for sid, (r, at) in db_chats.items():
+        state = proc_state.get(sid) or ("listening" if now_s - at < LISTENING_S else "idle")
+        pm = proc_session.get(sid, ({}, 0))[0]
+        chats[sid] = {"id": sid, "client": "hermes", "title": _txt(r.get("title"), MAX_TITLE),
+                      "summary": _txt(r.get("last_activity_description"), MAX_SUMMARY), "state": state,
+                      "subagents": 0, "sub": [], "act": at * 1000.0,
+                      "model": _txt(r.get("model") or pm.get("model"), 64), "open": {"kind": "hermes", "id": sid}}
+        for sub in db_subs.get(sid, []):
+            chats[sid]["sub"].append({"id": sub["id"], "title": _txt(sub.get("title"), MAX_SUB_TITLE),
+                                      "state": "working"})
+    nested = {x["id"] for subs in db_subs.values() for x in subs} | {k for kids in proc_children.values() for k in kids}
+    live_rows = {r["id"]: (r, src) for r, src, _at in live}
+    for sid, (s, written) in proc_session.items():                  # live in a process but absent from the db
+        platform = s.get("platform") if isinstance(s.get("platform"), str) else ""
+        if sid in nested:
+            continue                                                 # already shown under its parent chat
+        if sid not in chats and not (platform.startswith("analyzer-") or platform == "cron"):
+            row, src = live_rows.get(sid, ({}, ""))
+            title = _txt(row.get("title"), MAX_TITLE)                # an orphaned subagent still has a db title
+            if not title:                                            # descriptor of last resort, never blank
+                where = os.path.basename(_txt(row.get("cwd"), 512).rstrip("/"))
+                kind = "Subagent" if src == "subagent" else "Hermes chat"
+                title = _txt(" · ".join(x for x in (kind, where or platform, sid[-6:]) if x), MAX_TITLE)
+            chats[sid] = {"id": sid, "client": "hermes", "title": title, "summary": "", "state": proc_state[sid],
+                          "subagents": 0, "sub": [], "act": written, "model": _txt(s.get("model"), 64),
+                          "open": {"kind": "hermes", "id": sid}}
+    for sid, kids in proc_children.items():                         # live children the db may not list yet
+        if sid in chats:
+            known = {x["id"] for x in chats[sid]["sub"]}
+            for kid in kids:
+                kid = _txt(kid, 64)                                 # clip before the dedupe check
+                if kid and kid not in known:
+                    known.add(kid)
+                    chats[sid]["sub"].append({"id": kid, "title": "subagent", "state": "working"})
+
+    # ---- Claude files
+    claude_chats = []
+    hermes_children = 0
+    for c in claude:
+        if not isinstance(c, dict) or not isinstance(c.get("session_id"), str):
+            continue
+        updated = _num(c.get("updated_ms"), 0)
+        if now_ms - updated >= CLAUDE_STALE_MS or c.get("state") in ("ended", "end") or c.get("ended"):
+            continue
+        state = _state(c.get("state"))
+        if state == "done" and now_ms - updated >= DONE_MS:
+            state = "idle"
+        subs = [{"id": _txt(x.get("id"), 64), "title": _txt(x.get("type"), MAX_SUB_TITLE), "state": "working"}
+                for x in c.get("subagents") or [] if isinstance(x, dict)]
+        parent = c.get("hermes_parent")
+        if isinstance(parent, str) and parent in chats:
+            hermes_children += 1
+            chats[parent]["sub"].append({"id": c["session_id"], "title": _txt(c.get("title"), MAX_SUB_TITLE) or "claude",
+                                         "state": state})
+            continue
+        if isinstance(parent, str) and parent:
+            continue                                                 # a Hermes worker whose chat is gone
+        cwd = _txt(c.get("cwd"), 512)
+        # Claude Code sends session_title only once a session is named: fall back to the cwd basename (fix round 2).
+        title = _txt(c.get("title"), MAX_TITLE) or _txt(os.path.basename(cwd.rstrip("/")) or cwd, MAX_TITLE)
+        claude_chats.append({"id": c["session_id"], "client": "claude", "title": title,
+                             "summary": "", "state": state, "subagents": len(subs), "sub": subs, "act": updated,
+                             "model": _txt(c.get("model"), 64),
+                             "open": {"kind": "claude", "id": c["session_id"], "cwd": cwd}})
+
+    all_chats = list(chats.values()) + claude_chats
+    for ch in all_chats:
+        if ch["client"] == "hermes":
+            ch["subagents"] = len(ch["sub"])
+        ch["sub"] = ch["sub"][:MAX_SUBS]
+        ch["age_ms"] = max(0, int(now_ms - ch.pop("act")))
+    all_chats.sort(key=lambda ch: (ch["state"] != "needs_you", ch["age_ms"], ch["id"]))
+
+    def client(name):
+        mine = [c for c in all_chats if c["client"] == name]
+        return {"chats": len(mine), "subagents": sum(c["subagents"] for c in mine),
+                "state": _best([c["state"] for c in mine])}
+
+    state = "needs_you" if requests else _best([c["state"] for c in all_chats])
+    since = prev["since_ms"] if prev and prev.get("state") == state and "since_ms" in prev else int(now_ms)
+
+    sessions = {}
+    for sid, (s, _w) in proc_session.items():
+        if sid not in chats:
+            continue                                                 # dropped proc-only (analyzer/cron)
+        sessions[sid] = {k: s.get(k) for k in SESSION_KEYS if k in s}
+        sessions[sid]["state"] = proc_state[sid]
+    last_tool = next((p["last_tool"] for p in procs if isinstance(p.get("last_tool"), str) and p["last_tool"]), "")
+    proc_workers = sum(int(_num(p.get("workers"))) for p in procs)
+    db_workers = sum(len(v) for v in db_subs.values())
+    return {
+        "v": 2,
+        "state": state,
+        "since_ms": since,
+        "sessions": sorted(sessions.values(), key=lambda s: (_num(s.get("started_ms")), str(s.get("session_id")))),
+        "workers": max(proc_workers, db_workers) + hermes_children + sum(c["subagents"] for c in claude_chats),
+        "tool_calls": sum(int(_num(p.get("tool_calls"))) for p in procs),
+        "last_tool": last_tool,
+        "requests": sorted(requests.values(), key=lambda r: (_num(r.get("opened_ms")), str(r.get("request_id")))),
+        "clients": {"hermes": client("hermes"), "claude": client("claude")},
+        "chats": all_chats,
+    }
+
+
+# ------------------------------------------------------------------ source readers
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def read_procs(base, alive=pid_alive):
+    out = []
+    for path in sorted(glob.glob(os.path.join(base, "procs", "presence-*.json"))):
+        d = _load(path)
+        if d is None:
+            continue
+        if not alive(d.get("pid")):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        out.append(d)
+    return out
+
+
+def read_claude(base):
+    return [d for d in (_load(p) for p in sorted(glob.glob(os.path.join(base, "claude", "*.json")))) if d]
+
+
+def read_db(path, now_s, last_good):
+    """Active Hermes sessions, or last_good when the db is missing/locked/odd. Never raises."""
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
+        con.row_factory = sqlite3.Row
+        return [dict(r) for r in con.execute(DB_QUERY, (now_s - DB_WINDOW_S,))]
+    except Exception:
+        return last_good
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+
+# ------------------------------------------------------------------ output
+
+def ensure_dir(base):
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    if stat.S_IMODE(os.stat(base).st_mode) != 0o700:
+        os.chmod(base, 0o700)
+
+
+def write_atomic(base, name, data):
+    ensure_dir(base)
+    fd, tmp = tempfile.mkstemp(prefix=".presence.", suffix=".tmp", dir=base)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
+            f.write(data)
+        os.replace(tmp, os.path.join(base, name))
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+_push_failing = [False]
+
+
+def default_push(argv):
+    """Pushes to Noctalia; logs the first failure of a streak to stderr (the journal) instead of failing silently."""
+    try:
+        rc = subprocess.run(argv, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode
+        err = None if rc == 0 else f"exit {rc}"
+    except (OSError, subprocess.SubprocessError) as e:
+        err = type(e).__name__
+    if err and not _push_failing[0]:
+        print(f"ares-presence-hub: push to Noctalia failed ({err}): {argv[0]}", file=sys.stderr, flush=True)
+    elif not err and _push_failing[0]:
+        print("ares-presence-hub: push to Noctalia recovered", file=sys.stderr, flush=True)
+    _push_failing[0] = bool(err)
+
+
+class AlertSync:
+    """FEAT-lt34: Noctalia workspace alert on the workspace holding the Hermes window while a request is open.
+
+    apply(want) runs on the LatestPusher worker. hyprctl runs only on an edge; alerts this hub added are the only ones
+    it clears (never clear-all). Every failure is swallowed.
+    """
+
+    def __init__(self, run=None):
+        self._run = run or self._exec
+        self.held = set()
+
+    @staticmethod
+    def _exec(argv):
+        try:
+            return subprocess.run(argv, timeout=2, capture_output=True, text=True, check=False).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def _active(self):
+        try:
+            mons = json.loads(self._run(["hyprctl", "-j", "monitors"]) or "[]")
+            return {str(int(m["activeWorkspace"]["id"])) for m in mons if isinstance(m, dict)}
+        except (ValueError, KeyError, TypeError):
+            return set()
+
+    def __call__(self, want):
+        if want:
+            try:
+                clients = json.loads(self._run(["hyprctl", "-j", "clients"]) or "[]")
+            except ValueError:
+                clients = []
+            # Owner round 2: Noctalia clears an alert when its workspace is shown, so a workspace that is on screen
+            # is dropped from `held` and marked again once the owner leaves it while the request is still open.
+            active = self._active()
+            self.held -= active
+            for c in clients if isinstance(clients, list) else []:
+                try:
+                    if c.get("class") != HERMES_CLASS:
+                        continue
+                    ws = str(int(c["workspace"]["id"]))
+                    if ws in self.held or ws in active:
+                        continue
+                    addr = str(c["address"])
+                    self._run([MSG, "workspace-alert-add-window", addr[2:] if addr.startswith("0x") else addr])
+                    self.held.add(ws)
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
+        else:
+            for ws in sorted(self.held):
+                self._run([MSG, "workspace-alert-clear", ws])
+            self.held = set()
+
+
+class LatestPusher:
+    """Runs pushes on a worker thread, keeping only the newest pending argv."""
+
+    def __init__(self, push):
+        self._push = push
+        self._cond = threading.Condition()
+        self._pending = None
+        self._thread = None
+
+    def __call__(self, argv):
+        with self._cond:
+            self._pending = argv
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name="ares-hub-push", daemon=True)
+                self._thread.start()
+            self._cond.notify()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while self._pending is None:
+                    self._cond.wait()
+                argv, self._pending = self._pending, None
+            try:
+                self._push(argv)
+            except Exception:
+                pass
+
+
+# ------------------------------------------------------------------ FEAT-lt32: 24 h history ring
+
+RING_BUCKET_MS = 60_000
+RING_MAX = 1440                          # 24 h of 1 min buckets
+RING_NAME = "history.json"
+
+
+def default_history_path():
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(state, "ares", RING_NAME)
+
+
+class HistoryRing:
+    """Counts-only presence history for the Return Brief. One bucket per minute: act (max working/thinking
+    chats), wait (max open requests), req (new request ids first seen), tools (tool_calls delta). No titles,
+    no text. Written atomically, only when a bucket rolls or the open bucket's numbers change (<= 1 write/min
+    plus changes), so it adds no wakeup of its own."""
+
+    def __init__(self, path, clock=None):
+        self.path = path
+        self.clock = clock or (lambda: int(time.time() * 1000))
+        self.buckets = []
+        self.seen = set()
+        self.last_tools = None
+        self.dirty = False
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                d = json.load(f)
+            raw = d.get("buckets") if isinstance(d, dict) else None
+        except (OSError, ValueError):
+            raw = None
+        for b in raw or []:
+            if isinstance(b, dict) and all(isinstance(b.get(k), int) for k in ("t", "act", "wait", "req", "tools")):
+                self.buckets.append({k: b[k] for k in ("t", "act", "wait", "req", "tools")})
+        self.buckets.sort(key=lambda b: b["t"])
+        self._prune(self.clock())
+
+    def _prune(self, now_ms):
+        floor = (now_ms // RING_BUCKET_MS - RING_MAX) * RING_BUCKET_MS
+        self.buckets = [b for b in self.buckets if b["t"] > floor][-RING_MAX:]
+
+    def observe(self, out, now_ms=None):
+        now_ms = self.clock() if now_ms is None else now_ms
+        t = now_ms // RING_BUCKET_MS * RING_BUCKET_MS
+        act = sum(1 for c in out.get("chats") or [] if c.get("state") in ("working", "thinking"))
+        reqs = out.get("requests") or []
+        fresh = 0
+        for r in reqs:
+            rid = r.get("request_id") if isinstance(r, dict) else None
+            if isinstance(rid, str) and rid not in self.seen:
+                self.seen.add(rid)
+                fresh += 1
+        if len(self.seen) > 512:
+            self.seen = {r.get("request_id") for r in reqs if isinstance(r, dict)}
+        tools = int(_num(out.get("tool_calls")))
+        delta = max(0, tools - self.last_tools) if self.last_tools is not None else 0
+        self.last_tools = tools
+        if not self.buckets or self.buckets[-1]["t"] != t:
+            self.buckets.append({"t": t, "act": 0, "wait": 0, "req": 0, "tools": 0})
+            self._prune(now_ms)
+            self.dirty = True
+        b = self.buckets[-1]
+        new = {"act": max(b["act"], act), "wait": max(b["wait"], len(reqs)), "req": b["req"] + fresh,
+               "tools": b["tools"] + delta}
+        if any(new[k] != b[k] for k in new):
+            b.update(new)
+            self.dirty = True
+
+    def flush(self):
+        if not self.dirty:
+            return False
+        data = json.dumps({"v": 1, "bucket_ms": RING_BUCKET_MS, "buckets": self.buckets}, separators=(",", ":"))
+        try:
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            tmp = self.path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+            os.replace(tmp, self.path)
+        except OSError:
+            return False
+        self.dirty = False
+        return True
+
+
+class Hub:
+    def __init__(self, base, db_path, push=None, clock=None, alive=pid_alive, alert=None, ring=None):
+        self.base, self.db_path = base, db_path
+        self.ring = ring                # HistoryRing or None
+        self.push = push
+        self.alert = alert              # callable(bool want); None = no workspace alerts
+        self._want = False
+        self._alert_at = 0
+        self.clock = clock or (lambda: int(time.time() * 1000))
+        self.alive = alive
+        self.rows = []
+        self.prev = None
+        self._sent = None               # comparison key of the last emitted document
+        self._last_emit = None
+        self.dirty = False
+
+    def _sync_alert(self, want, now=None):
+        if self.alert is None:
+            return
+        if want == self._want:
+            # While a request stays open, re-check every ALERT_REFRESH_MS (Noctalia drops an alert once seen).
+            if not want or now is None or now - self._alert_at < ALERT_REFRESH_MS:
+                return
+        self._want = want
+        self._alert_at = now if now is not None else 0
+        try:
+            self.alert(want)
+        except Exception:
+            pass
+
+    def tick(self):
+        """Read, merge, and emit when changed. Returns True if presence.json was rewritten."""
+        now = self.clock()
+        self.rows = read_db(self.db_path, now / 1000.0, self.rows)
+        out = merge(now, read_procs(self.base, self.alive), self.rows, read_claude(self.base), self.prev)
+        self.prev = out
+        self._sync_alert(bool(out.get("requests")), now)
+        if self.ring is not None:
+            try:
+                self.ring.observe(out, now)
+                self.ring.flush()
+            except Exception:
+                pass
+        key = json.dumps({**out, "chats": [{k: v for k, v in c.items() if k != "age_ms"} for c in out["chats"]]},
+                         sort_keys=True, separators=(",", ":"))
+        changed = key != self._sent
+        stale = bool(out["chats"]) and self._last_emit is not None and now - self._last_emit >= REFRESH_MS
+        if not (changed or stale):
+            self.dirty = False
+            return False
+        if self._last_emit is not None and now - self._last_emit < MIN_EMIT_MS:
+            self.dirty = True           # retry soon; rate-limited
+            return False
+        data = json.dumps(out, separators=(",", ":"))
+        try:
+            write_atomic(self.base, "presence.json", data)
+        except Exception:
+            self.dirty = True
+            return False
+        self._sent, self._last_emit, self.dirty = key, now, False
+        if self.push is not None:
+            try:
+                self.push(PUSH_ARGV + [data])
+            except Exception:
+                pass
+        return True
+
+
+def bind_hub_socket(base):
+    path = os.path.join(base, "hub.sock")
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(path)
+        os.chmod(path, 0o600)
+        sock.setblocking(False)
+        return sock, path
+    except OSError:
+        return None, path
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ares-presence-hub")
+    ap.add_argument("--base", default=default_base())
+    ap.add_argument("--db", default=default_db())
+    ap.add_argument("--once", action="store_true", help="merge once, write presence.json, print it, exit")
+    args = ap.parse_args(argv)
+
+    if args.once:
+        hub = Hub(args.base, args.db)
+        hub.tick()
+        print(json.dumps(hub.prev, separators=(",", ":")))
+        return 0
+
+    ensure_dir(args.base)
+    sock, sock_path = bind_hub_socket(args.base)
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+    alerts = AlertSync()
+    alert_push = LatestPusher(lambda argv: alerts(argv[0]))
+    hub = Hub(args.base, args.db, push=LatestPusher(default_push), alert=lambda want: alert_push([want]),
+              ring=HistoryRing(os.environ.get("ARES_HISTORY") or default_history_path()))
+    try:
+        while not stop:
+            try:
+                hub.tick()
+            except Exception:
+                pass
+            timeout = 0.25 if hub.dirty else 1.0
+            if sock is None:
+                time.sleep(timeout)
+                continue
+            try:
+                ready, _, _ = select.select([sock], [], [], timeout)
+                while ready:
+                    try:
+                        sock.recv(64)
+                    except (BlockingIOError, InterruptedError):
+                        break
+            except (OSError, ValueError):
+                time.sleep(timeout)
+    finally:
+        if alerts.held:
+            alerts(False)
+        if sock is not None:
+            sock.close()
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

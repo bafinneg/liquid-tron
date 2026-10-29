@@ -1,0 +1,17 @@
+[Unit]
+Description=Ares case heartbeat — case lighting follows Ares presence by brightness only (FEAT-lt33)
+After=openrgb-server.service ares-presence-hub.service
+Wants=openrgb-server.service
+
+[Service]
+Type=simple
+# `systemctl --user stop ares-rgb` restores the base colours (SIGTERM handler + ExecStopPost). LT35 stand-down uses this.
+ExecStart=/usr/bin/uv run --quiet --offline --with openrgb-python==0.3.8 python %h/.local/bin/ares-rgb
+ExecStopPost=-/usr/bin/uv run --quiet --offline --with openrgb-python==0.3.8 python %h/.local/bin/ares-rgb --restore
+Restart=on-failure
+RestartSec=3
+Nice=10
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target

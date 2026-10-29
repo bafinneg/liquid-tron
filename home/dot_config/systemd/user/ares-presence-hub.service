@@ -1,0 +1,13 @@
+[Unit]
+Description=Ares presence hub — merges Hermes and Claude chat state for the Ares bar
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ares-presence-hub
+Restart=on-failure
+RestartSec=2
+Nice=10
+
+[Install]
+WantedBy=default.target

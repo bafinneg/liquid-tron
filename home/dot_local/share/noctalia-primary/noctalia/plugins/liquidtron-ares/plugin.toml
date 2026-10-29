@@ -1,0 +1,64 @@
+id          = "liquidtron/ares"
+name        = "Ares"
+version     = "1.0.0"
+plugin_api  = 34
+author      = "liquidtron"
+description = "Ares presence: Hermes activity instrument for the bar, with a detail panel."
+
+[[widget]]
+id    = "instrument"
+entry = "instrument.luau"
+
+# FEAT-lt32 C1: ASK button, a static fill-only bar widget after the instrument; click toggles the askchat window.
+[[widget]]
+id    = "askbutton"
+entry = "askbutton.luau"
+
+# FEAT-lt32 owner round 6: AI BRIEF glyph button on the left of the bar; click toggles the Return Brief card.
+[[widget]]
+id    = "briefbutton"
+entry = "briefbutton.luau"
+
+[[panel]]
+id             = "panel"
+entry          = "panel.luau"
+placement      = "attached"
+width          = 760   # FEAT-ares-bar-ai-clients C5-panel: approved mock size (two client columns)
+height         = 600
+keyboard_focus = "exclusive"   # Enter works right after SUPER+A (owner check 3); Esc still dismisses
+capture_keys   = ["Return"]
+open_near_click = true           # a click on the instrument opens the panel under it
+
+# FEAT-lt32: Return Brief. Opened by ares-briefd on return from a long absence and by SUPER+SHIFT+A (replay).
+# Card width (owner round 2: bar width looked bad). It retracts itself after 12 s.
+[[panel]]
+id             = "brief"
+entry          = "brief.luau"
+placement      = "attached"
+width          = 760
+height         = 360
+keyboard_focus = "exclusive"
+capture_keys   = ["Return", "space"]
+open_near_click = true           # owner round 6: a click on the AI BRIEF glyph opens the card under it (keybind/briefd: centred)
+
+# FEAT-lt32 C1: Ask Ares chat window. Floating, centred on the focused monitor; opened by the ASK button and SUPER+SPACE.
+# Tab (route) and ctrl+n (new Conversation) are the only captured keys; Enter belongs to the composer, Esc to the host.
+[[panel]]
+id             = "askchat"
+entry          = "askchat.luau"
+placement      = "floating"
+position       = "center"
+width          = 1000
+height         = 680
+keyboard_focus = "exclusive"
+capture_keys   = ["Tab", "ctrl+n"]
+
+# FEAT-lt31 C2: Ask the Grid. Live prefix is shell.launcher.provider_prefix + word = `/ask` (cloud) and `/ask >`
+# (local), OD1. No global search: nothing is sent and no routing row appears outside `/ask`.
+[[launcher_provider]]
+id          = "ask"
+entry       = "ask.luau"
+prefix      = "ask"
+glyph       = "terminal"
+debounce_ms = 0
+category    = [{ label = "ASK", glyph = "terminal" }]

@@ -1,0 +1,17 @@
+id          = "liquidtron/cpu"
+name        = "CPU detail"
+version     = "1.0.0"
+plugin_api  = 34
+author      = "liquidtron"
+description = "What is using the CPU: top processes under the bar's CPU gauge, with End process."
+
+# Native replacement for the former Quickshell companion (quickshell-cpu-detail). Opened by the CPU gauge's left
+# click (`panel-toggle liquidtron/cpu:detail`); outside-click dismissal, attached look and adaptive glass are
+# Noctalia's own.
+[[panel]]
+id              = "detail"
+entry           = "detail.luau"
+placement       = "attached"
+width           = 680
+height          = 680
+open_near_click = true   # opens under the gauge

@@ -1,0 +1,21 @@
+#!/usr/bin/python3 -IS
+# ALT+Tab fast path: send `window-switcher hold` straight to the running Noctalia IPC socket.
+# Skips the per-call binary hash and process start of noctalia-primary-msg (about 45 ms) so the
+# carousel opens on the next frame. It only talks to an already running, already verified shell;
+# if the socket is missing it falls back to the verified wrapper.
+import os
+import socket
+import sys
+
+runtime = f"/run/user/{os.getuid()}"
+path = f"{runtime}/noctalia-{os.environ.get('WAYLAND_DISPLAY') or 'wayland-1'}.sock"
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        s.connect(path)
+        s.sendall(b"window-switcher hold")
+        s.shutdown(socket.SHUT_WR)
+        s.recv(256)
+except OSError:
+    os.execv("{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg", ["noctalia-primary-msg", "window-switcher", "hold"])
+sys.exit(0)

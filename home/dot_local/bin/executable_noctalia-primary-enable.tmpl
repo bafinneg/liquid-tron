@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME={{ .chezmoi.homeDir }}
+export XDG_CONFIG_HOME={{ .chezmoi.homeDir }}/.config
+export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}
+
+uid=$(id -u)
+state_root={{ .chezmoi.homeDir }}/.local/state/noctalia-primary
+rollback_flag=$state_root/disable-noctalia
+lifecycle_lock=$state_root/lifecycle.lock
+selector_pattern='{{ .chezmoi.homeDir }}/.local/bin/desktop-shell-primary$'
+mocr_pattern='(^|/)(qs|quickshell) -c mocr -d($| )'
+
+install -d -m 700 "$state_root"
+exec 8>"$lifecycle_lock"
+chmod 600 "$lifecycle_lock"
+if ! flock -n 8; then
+  printf 'Another desktop-shell lifecycle operation is already running.\n' >&2
+  exit 1
+fi
+
+# Arm persistent fallback before changing the running shell. Any non-zero exit,
+# including an unexpected error after the marker is removed for primary launch,
+# restores the marker without attempting to create a second live shell.
+enable_committed=0
+install -m 600 /dev/null "$rollback_flag"
+restore_marker_on_failure() {
+  local rc=$?
+  if [[ $rc -ne 0 && $enable_committed -eq 0 ]]; then
+    install -m 600 /dev/null "$rollback_flag" || true
+  fi
+}
+trap restore_marker_on_failure EXIT
+
+selector_running() {
+  pgrep -u "$uid" -f "$selector_pattern" >/dev/null
+}
+
+noctalia_running() {
+  pgrep -u "$uid" -x noctalia >/dev/null
+}
+
+mocr_running() {
+  pgrep -u "$uid" -f "$mocr_pattern" >/dev/null
+}
+
+notification_has_owner() {
+  local reply reply_type value
+  reply=$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+    org.freedesktop.DBus NameHasOwner s org.freedesktop.Notifications 2>/dev/null) || return 2
+  read -r reply_type value <<<"$reply"
+  [[ $reply_type == b ]] || return 2
+  [[ $value == true ]] && return 0
+  [[ $value == false ]] && return 1
+  return 2
+}
+
+notification_owner_pid() {
+  local reply reply_type owner pid_reply pid_type pid
+  reply=$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+    org.freedesktop.DBus GetNameOwner s org.freedesktop.Notifications 2>/dev/null) || return 1
+  read -r reply_type owner <<<"$reply"
+  [[ $reply_type == s && $owner == \"*\" ]] || return 1
+  owner=${owner#\"}
+  owner=${owner%\"}
+  pid_reply=$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+    org.freedesktop.DBus GetConnectionUnixProcessID s "$owner" 2>/dev/null) || return 1
+  read -r pid_type pid <<<"$pid_reply"
+  [[ $pid_type == u && $pid =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+wait_notification_unowned() {
+  local rc
+  for _ in {1..100}; do
+    if notification_has_owner; then
+      :
+    else
+      rc=$?
+      [[ $rc -eq 1 ]] && return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_notification_owner_pid() {
+  local expected=$1 actual
+  for _ in {1..100}; do
+    actual=$(notification_owner_pid 2>/dev/null || true)
+    [[ $actual == "$expected" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+single_mocr_pid() {
+  local -a pids=()
+  mapfile -t pids < <(pgrep -u "$uid" -f "$mocr_pattern" || true)
+  [[ ${#pids[@]} -eq 1 ]] || return 1
+  printf '%s\n' "${pids[0]}"
+}
+
+wait_single_mocr_pid() {
+  local candidate
+  for _ in {1..100}; do
+    candidate=$(single_mocr_pid 2>/dev/null || true)
+    if [[ -n $candidate ]] && ! selector_running && ! noctalia_running; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+stop_selector() {
+  if selector_running; then
+    pkill -TERM -u "$uid" -f "$selector_pattern" || true
+    for _ in {1..100}; do
+      selector_running || break
+      sleep 0.1
+    done
+  fi
+  ! selector_running
+}
+
+stop_noctalia() {
+  if noctalia_running; then
+    pkill -TERM -u "$uid" -x noctalia || true
+    for _ in {1..100}; do
+      noctalia_running || break
+      sleep 0.1
+    done
+  fi
+  ! noctalia_running
+}
+
+stop_mocr() {
+  if mocr_running; then
+    # Quickshell 0.2.1 can report non-zero after removing the named instance.
+    # Process absence below is the authoritative result.
+    qs kill -c mocr || true
+    for _ in {1..100}; do
+      mocr_running || break
+      sleep 0.1
+    done
+  fi
+  ! mocr_running
+}
+
+start_persistent_mocr_fallback() {
+  install -m 600 /dev/null "$rollback_flag" || return 1
+  stop_selector || return 1
+  stop_noctalia || return 1
+  if ! mocr_running; then
+    hyprctl dispatch 'hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/desktop-shell-primary")' >/dev/null || return 1
+    for _ in {1..150}; do
+      mocr_running && break
+      sleep 0.1
+    done
+  fi
+  local mocr_pid
+  mocr_pid=$(wait_single_mocr_pid) || return 1
+  wait_notification_owner_pid "$mocr_pid" || return 1
+  [[ $(single_mocr_pid 2>/dev/null || true) == "$mocr_pid" ]] || return 1
+  ! selector_running || return 1
+  ! noctalia_running || return 1
+}
+
+fail_to_mocr() {
+  local message=$1
+  if ! start_persistent_mocr_fallback; then
+    printf '%s Persistent rollback remains armed; fallback did not satisfy singular ownership checks.\n' "$message" >&2
+  else
+    printf '%s Restored sole MOCR-Q fallback.\n' "$message" >&2
+  fi
+  exit 1
+}
+
+# Stop the selector before its Noctalia child. Otherwise the selector can race
+# this helper by restoring MOCR-Q after the helper's one-time MOCR check.
+if ! stop_selector; then
+  printf 'Existing desktop-shell selector did not exit; persistent rollback remains armed.\n' >&2
+  exit 1
+fi
+if ! stop_noctalia; then
+  printf 'Existing Noctalia process did not exit; persistent rollback remains armed.\n' >&2
+  exit 1
+fi
+if ! stop_mocr; then
+  printf 'MOCR-Q did not exit; refusing dual-shell enable with persistent rollback armed.\n' >&2
+  exit 1
+fi
+
+if ! wait_notification_unowned; then
+  fail_to_mocr 'Previous notification owner did not release the D-Bus name.'
+fi
+
+# The selector reads this marker at startup. Remove it only after all prior
+# owners are proven absent and immediately before dispatching the new primary.
+rm -f -- "$rollback_flag"
+if ! hyprctl dispatch 'hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/desktop-shell-primary")' >/dev/null; then
+  fail_to_mocr 'Noctalia primary selector dispatch failed.'
+fi
+
+for _ in {1..150}; do
+  if noctalia_running || mocr_running; then
+    break
+  fi
+  sleep 0.1
+done
+
+# Hold a short stability window so a late fallback cannot escape the verdict.
+for _ in {1..20}; do
+  if ! noctalia_running || mocr_running || ! selector_running; then
+    fail_to_mocr 'Noctalia primary activation was not singular and stable.'
+  fi
+  sleep 0.1
+done
+
+noctalia_count=$(pgrep -u "$uid" -c -x noctalia || true)
+selector_count=$(pgrep -u "$uid" -f -c "$selector_pattern" || true)
+if [[ $noctalia_count -ne 1 || $selector_count -ne 1 ]] || mocr_running; then
+  fail_to_mocr 'Noctalia primary activation failed its final ownership check.'
+fi
+noctalia_pid=$(pgrep -u "$uid" -x noctalia)
+if ! wait_notification_owner_pid "$noctalia_pid"; then
+  fail_to_mocr 'Noctalia did not acquire singular notification ownership.'
+fi
+
+enable_committed=1
+trap - EXIT
+printf 'Noctalia is active and primary startup is enabled.\n'

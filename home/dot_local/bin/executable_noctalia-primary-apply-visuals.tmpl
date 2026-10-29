@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# RETIRED by FEAT-lt26r-3 (C2, 2026-10-21).
+#
+# This script used to delete the whole [bar.main] and [widget.audio_visualizer] tables from Noctalia's GUI
+# settings.toml and then config-reload. Whole-table deletion is unsafe (it also drops owner keys such as the
+# capsule groups) and it ran Noctalia with the old private XDG_CACHE_HOME. It had no live caller.
+#
+# Use the per-key editor instead (exact-byte 0600 backup, dry run, refuses table deletion):
+#   {{ .chezmoi.homeDir }}/home-infra/machines/7800x/scripts/noctalia-gui-keyedit.py --dry-run KEY...
+# then {{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg config-reload
+set -euo pipefail
+printf 'noctalia-primary-apply-visuals is retired (FEAT-lt26r-3). Use machines/7800x/scripts/noctalia-gui-keyedit.py.\n' >&2
+exit 2

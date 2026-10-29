@@ -1,0 +1,455 @@
+-- Monitors - Alienware left 4K, ASUS center 4K, Alienware right 4K
+-- Matched by description (EDID) so layout survives cable/port swaps
+-- bitdepth 10: both panel models are 10-bit; reduces banding in blur/gradient chrome (FEAT-liquid-tron-desktop-polish-2 C7).
+hl.monitor({ output = "desc:Dell Inc. AW2725Q {{ .monitors.left.serial }}", mode = "3840x2160@144", position = "0x360", scale = "1", bitdepth = 10 })
+hl.monitor({ output = "desc:ASUSTek COMPUTER INC PG42UQ {{ .monitors.center.serial }}", mode = "3840x2160@120", position = "3840x0", scale = "1", bitdepth = 10 })
+-- FEAT-lt26r-6 OD-D 240 Hz pilot (right AW2725Q only; branch-only until Brian accepts the at-screen trial).
+hl.monitor({ output = "desc:Dell Inc. AW2725Q {{ .monitors.right.serial }}", mode = "3840x2160@239.99", position = "7680x360", scale = "1", bitdepth = 10 })
+-- NVIDIA environment variables
+hl.env("LIBVA_DRIVER_NAME", "nvidia")
+hl.env("XDG_SESSION_TYPE", "wayland")
+hl.env("GBM_BACKEND", "nvidia-drm")
+hl.env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+hl.env("NVD_BACKEND", "direct")
+hl.env("AQ_NO_WAYLAND", "1")
+hl.env("XCURSOR_THEME", "Bibata-Original-Tron")
+hl.env("XCURSOR_SIZE", "24")
+-- Qt theming via qt5ct (spec 5c) — Qt5 apps use Tokyonight color scheme
+hl.env("QT_QPA_PLATFORMTHEME", "qt5ct")
+
+
+
+-- Monitor config - ASUS PG42UQ center, Alienware AW2725Q flanking
+-- Adjust positions based on your physical layout
+-- Fallback for any monitor
+
+-- Input
+hl.config({ input = { kb_layout = "us" } })
+hl.config({ input = { follow_mouse = 1 } })
+hl.config({ input = { sensitivity = 1.0 } }) -- Maximum mouse speed (-1.0 to 1.0)
+
+-- General appearance
+hl.config({ general = { gaps_in = 4 } })
+hl.config({ general = { gaps_out = 8 } })
+hl.config({ general = { border_size = 2 } })
+hl.config({ general = { layout = "dwindle" } })
+
+-- Cursor — keep cursor put on cross-monitor focus changes.
+hl.config({ cursor = { no_warps = true } })
+
+-- Decoration - Sweet-Ambar-Blue style
+hl.config({ decoration = { rounding = 8 } })
+hl.config({ decoration = { rounding_power = 3.0 } }) -- FEAT-lt26r-5 OD-D: 8 px squircle (radius unchanged)
+hl.config({ decoration = { blur = { enabled = true } } })
+hl.config({ decoration = { blur = { size = 8 } } })
+hl.config({ decoration = { blur = { passes = 3 } } })
+hl.config({ decoration = { blur = { new_optimizations = true } } })
+hl.config({ decoration = { blur = { noise = 0.02 } } })
+hl.config({ decoration = { blur = { xray = true } } })
+hl.config({ decoration = { blur = { vibrancy = 0.15 } } })
+hl.config({ decoration = { blur = { vibrancy_darkness = 0.5 } } })
+hl.config({ decoration = { blur = { contrast = 1.1 } } })
+hl.config({ decoration = { blur = { brightness = 0.85 } } })
+hl.config({ decoration = { shadow = { enabled = true } } })
+-- FEAT-lt26r-5 OD-C depth A "tight contact": focused colour is owned by colors.lua (theme fragment, 06060c at 70 %);
+-- the old cyan line here was dead (colors.lua is required later) and is removed.
+hl.config({ decoration = { shadow = { range = 18 } } })
+hl.config({ decoration = { shadow = { render_power = 3 } } })
+hl.config({ decoration = { shadow = { offset = { 0, 4 } } } })
+hl.config({ decoration = { shadow = { color_inactive = "rgba(06060c59)" } } })
+
+-- FEAT-lt26r-5 (13): groupbar typography and geometry (colours live in colors.lua)
+hl.config({ group = { groupbar = { font_family = "IosevkaTerm Nerd Font" } } })
+hl.config({ group = { groupbar = { font_size = 11 } } })
+hl.config({ group = { groupbar = { height = 20 } } })
+hl.config({ group = { groupbar = { indicator_height = 2 } } })
+hl.config({ group = { groupbar = { gradients = true } } })
+hl.config({ group = { groupbar = { rounding = 6 } } })
+hl.config({ group = { groupbar = { gradient_rounding = 6 } } })
+hl.config({ group = { groupbar = { rounding_power = 3.0 } } })
+hl.config({ group = { groupbar = { gradient_rounding_power = 3.0 } } })
+
+-- BEGIN opacity-authority (FEAT-lt26r-3 OD-D) -- the ONLY place window opacity is set.
+-- toggle-opacity.sh (SUPER+O) and system-mode-toggle (gaming) parse this block to restore it; keep one
+-- value per line and class rows as { "regex", active, inactive }. Pilot (05 OD2): Chrome, VS Code and the
+-- Zen family opaque; the global step (separate commit) makes every window opaque with dim 0.10.
+local opacity = {
+    active = 1.0,
+    inactive = 1.0,
+    fullscreen = 1.0,
+    dim_strength = 0.10,
+    classes = {
+        -- Global step (05 OD4): every normal window is opaque, so no per-class rows remain.
+    },
+}
+-- END opacity-authority
+hl.config({ decoration = { active_opacity = opacity.active } })
+hl.config({ decoration = { inactive_opacity = opacity.inactive } })
+hl.config({ decoration = { fullscreen_opacity = opacity.fullscreen } })
+hl.config({ decoration = { dim_inactive = true } })
+hl.config({ decoration = { dim_strength = opacity.dim_strength } })
+for _, c in ipairs(opacity.classes) do
+    hl.window_rule({ match = { class = c[1] }, opacity = string.format("%s override %s override", c[2], c[3]) })
+end
+
+-- ── Animation ───────────────────────────────────────────
+-- FEAT-lt28 C2: motion.lua is the single motion authority (curves, springs, leaves); this file only applies it.
+require("./motion.lua")
+LT_MOTION.apply()
+
+-- Ecosystem — silence upstream nag popups
+hl.config({ ecosystem = { no_update_news = true } })
+hl.config({ ecosystem = { no_donation_nag = true } })
+
+-- Misc
+hl.config({ misc = { disable_splash_rendering = true } })
+hl.config({ misc = { disable_hyprland_logo = true } })
+hl.config({ misc = { background_color = "rgb(000000)" } })
+hl.config({ debug = { vfr = true } }) -- LT26-01 (ED2): misc:vfr is debug.vfr in 0.56.x (C1 §4)
+-- Allows a replacement lock client after hyprlock crashes, avoiding a stuck
+-- Hyprland session-lock state.
+hl.config({ misc = { allow_session_lock_restore = true } })
+
+-- Layout
+-- LT26-01 (ED1): dwindle:pseudotile = true omitted; removed upstream (C1 §4, §6)
+hl.config({ dwindle = { preserve_split = true } })
+
+-- LT26-01 (rule 5): unset options whose default changed 0.54.3 -> 0.56.x and that affect pixels, timing or input
+-- (machines/7800x/fixes/hyprland-0-56-lua-migration.md §6 DEFAULT-DELTAS).
+hl.config({ misc = { initial_workspace_token_timeout = 3600 } }) -- LT26-01: 0.54.3 default was 3515970402 s; 3600 is the 0.57 maximum, valid on 0.56 too
+hl.config({ render = { use_fp16 = 0 } }) -- LT26-01: pins 0.54.3 default
+hl.config({ experimental = { wp_cm_1_2 = false } }) -- LT26-01: pins 0.54.3 default
+hl.config({ input = { touchdevice = { transform = 0 } } }) -- LT26-01: 0.54.3 default was -1 (skip calibration); 0.57 minimum is 0, valid on 0.56 too (touch devices only)
+-- FEAT-lt26r-5 (13): the orange 0.54.3 group locked pins were removed; colors.lua owns them (INVARIANTS 1).
+-- LT26-01 (ED9, rule 5): render:cm_fs_passthrough was removed upstream; accepted delta, no key to pin (§6).
+
+-- Autostart
+hl.on("hyprland.start", function()
+    -- LT26-01 (ED10, rule 5): each command now gets an initial-workspace token (Delta T1, §4); order kept as written.
+    -- The selector starts Noctalia by default and falls back to MOCR-Q after a
+    -- startup failure, unexpected exit, or persistent explicit rollback.
+    -- exec-once = waybar   # archived emergency fallback
+    hl.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/desktop-shell-primary")
+    hl.exec_cmd("systemctl --user start hyprpolkitagent.service")
+    hl.exec_cmd("xhost +SI:localuser:root")
+    -- Wallpaper — wallpaper-reconcile is the single startup producer: it restores the committed
+    -- wallpaper-control mode (animated Mainframe triptych by default, or a selected still).
+    -- mainframe-static-start remains the explicit low-overhead rollback path.
+    -- exec-once = hyprpaper   # superseded by INFRA-003 (kept commented for rollback)
+    -- edid-wallpaper-resolve.sh is retained for history/manual rollback only; it no longer autostarts.
+    -- exec-once = ~/.local/bin/parallax-rotate 3600   # superseded: rotation disabled, mainframe pinned as default
+    hl.exec_cmd("~/.local/bin/wallpaper-reconcile")
+    hl.exec_cmd("hypridle")
+    hl.exec_cmd("solaar --window=hide") -- tray-only; manages battery/haptic/scroll (DPI+buttons owned by logid)
+    hl.exec_cmd("systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR DISPLAY HYPRLAND_INSTANCE_SIGNATURE && systemctl --user start openrgb-server.service")
+    -- Reconcile hyprpm state at startup. split-monitor-workspaces is loaded at
+    -- parse time below because static binds reference split-* dispatchers; this
+    -- exec-once remains useful for plugins without dispatcher parse-order needs.
+    -- See machines/7800x/fixes/hyprpm-plugins-not-loaded-on-reboot.md.
+    hl.exec_cmd("hyprpm reload -n")
+end)
+
+-- ── Plugin: dynamic-cursors ──────────────────────────────────────────
+-- hypr-dynamic-cursors — tilt mode for liquid-tron cursor feedback
+if hl.plugin.dynamic_cursors then
+    hl.config({ plugin = { dynamic_cursors = { mode = "tilt" } } })
+
+    hl.config({ plugin = { dynamic_cursors = { tilt = { limit = 1200 } } } })
+    hl.config({ plugin = { dynamic_cursors = { tilt = { activation = "negative_quadratic" } } } }) -- LT26-01 (ED11): tilt:function renamed tilt:activation (DC@5a22428:src/config/ConfigManager.cpp:50)
+    hl.config({ plugin = { dynamic_cursors = { tilt = { window = 150 } } } })
+
+    -- FEAT-lt26r-5 OD-E shake-to-find: a quick shake grows the 24 px cursor to at most 96 px (the largest native
+    -- Bibata size) for 1 s after the shake stops; tilt pauses while magnified. Invisible at rest; also active in gaming.
+    hl.config({ plugin = { dynamic_cursors = { shake = { enabled = true } } } })
+    hl.config({ plugin = { dynamic_cursors = { shake = { limit = 4.0 } } } })
+    hl.config({ plugin = { dynamic_cursors = { shake = { timeout = 1000 } } } })
+    hl.config({ plugin = { dynamic_cursors = { shake = { effects = false } } } })
+    -- LT26-01: shake:nearest dropped; no such option at dynamic-cursors b736d617 or 5a224284, so it was a no-op (C0 "no such option")
+
+    -- Bibata-Original-Tron now ships a vector hyprcursor build beside its XCursor files
+    -- (shared/themes/sources/bibata-tron/build-hyprcursor.py), so let the plugin re-render
+    -- the SVG at the magnified shake size instead of stretching a 96 px bitmap.
+    hl.config({ plugin = { dynamic_cursors = { hyprcursor = { enabled = true } } } })
+end
+
+-- hyprexpo removed with its hyprland-plugins repository via hyprpm remove (LT26-01)
+
+-- ── Plugin: split-monitor-workspaces ─────────────────────────────────
+-- Loaded at parse time because workspace binds below reference split-* dispatchers.
+-- Pin: machines/7800x/hyprpm-plugins.yaml records the Hyprland/plugin commits.
+-- LT26-01 (ED12, rule 7): `plugin = /var/cache/hyprpm/{{ .login }}/split-monitor-workspaces/split-monitor-workspaces.so` omitted; the .so is mapped only by hyprpm reload -n in the hyprland.start handler
+
+if hl.plugin.split_monitor_workspaces then
+    hl.config({ plugin = { split_monitor_workspaces = { count = 6 } } })
+    hl.config({ plugin = { split_monitor_workspaces = { keep_focused = 1 } } })
+    hl.config({ plugin = { split_monitor_workspaces = { enable_notifications = 0 } } })
+    hl.config({ plugin = { split_monitor_workspaces = { enable_persistent_workspaces = 1 } } })
+    hl.config({ plugin = { split_monitor_workspaces = { enable_wrapping = 1 } } })
+    hl.config({ plugin = { split_monitor_workspaces = { link_monitors = 0 } } })
+    hl.plugin.split_monitor_workspaces.monitor_priority({ "DP-2", "DP-3", "DP-4" }) -- carried verbatim (LT26-00 I5)
+end
+
+-- Theme colors (managed by apply-theme.sh)
+require("./colors.lua")
+require("./overview-tools-binds.lua")
+require("./conf.d/*.lua")
+
+-- ── Layer rules ───────────────────────────────────────────────────────
+-- Quickshell surfaces (bar, toasts, popovers) — frosted-glass backdrop blur
+hl.layer_rule({ match = { namespace = "quickshell" }, blur = true })
+hl.layer_rule({ match = { namespace = "quickshell" }, ignore_alpha = 0.15 })
+
+-- Noctalia Liquid Tron material plane. Hyprland remains the sole blur owner;
+-- Noctalia supplies bounded alpha and semantic content for these namespaces.
+hl.layer_rule({ match = { namespace = "^noctalia-(bar-main|panel|attached-panel|notification|osd)$" }, blur = true })
+hl.layer_rule({ match = { namespace = "^noctalia-(bar-main|panel|attached-panel|notification|osd)$" }, ignore_alpha = 0.12 })
+-- The former Quickshell bar dropdowns (CPU detail, compact wallpaper picker) are native Noctalia plugin panels now
+-- (noctalia-attached-panel above), so no liquid-tron-* dropdown rule remains.
+
+-- FEAT-lt26r-3 C1 (OD-E): Noctalia animates these surfaces itself (shell.animation), so Hyprland must not
+-- add a second slide/fade. Upstream guide set (docs/user/compositor-settings/hyprland.mdx:101-115). The System
+-- Map (Quickshell `liquid-tron-system-map`) owns its own motion and is deliberately not listed.
+hl.layer_rule({ match = { namespace = "^noctalia-(bar-.+|panel|attached-panel|notification|osd|window-switcher|dock)$" }, no_anim = true })
+
+-- ── Window rules ──────────────────────────────────────────────────────
+-- Tiled by default (hyprland standard). Super+Shift+F to float individual windows.
+
+-- Per-class opacity lives in the opacity-authority block above (FEAT-lt26r-3 OD-D).
+
+-- ── Keybinds ──────────────────────────────────────────────────────────
+local mainMod = "SUPER"
+
+-- ── Launch ────────────────────────────────────────────────────────────
+hl.bind(mainMod .. " + RETURN", hl.dsp.exec_cmd("kitty"), { description = "Launch: Terminal kitty" })
+-- Liquid Tron launcher theme: dotfiles/rofi/.config/rofi/
+hl.bind(mainMod .. " + D", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg panel-toggle launcher"), { description = "Launch: Noctalia app palette" })
+hl.bind(mainMod .. " + SHIFT + D", hl.dsp.exec_cmd("~/.config/rofi/scripts/liquid-tron-palette"), { description = "Launch: Rofi app palette fallback" })
+hl.bind(mainMod .. " + B", hl.dsp.exec_cmd("gtk-launch google-chrome"), { description = "Launch: Browser Chrome (new window)" })
+hl.bind(mainMod .. " + E", hl.dsp.exec_cmd("thunar"), { description = "Launch: File manager Thunar" })
+hl.bind(mainMod .. " + W", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg panel-toggle liquidtron/wallpaper:picker"), { description = "Launch: Wallpaper picker" })
+hl.bind(mainMod .. " + C", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/repo-grid"), { description = "Overlay: Repo Grid dropdown (centre bar)" })
+
+-- ── Session ───────────────────────────────────────────────────────────
+hl.bind(mainMod .. " + Q", hl.dsp.window.close(), { description = "Session: Kill active window" })
+hl.bind(mainMod .. " + SHIFT + Q", hl.dsp.exit(), { description = "Session: Exit Hyprland" })
+hl.bind(mainMod .. " + L", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/ares-lock"), { description = "Session: Lock screen" })
+hl.bind(mainMod .. " + ALT + G", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/hand-gesture toggle"), { description = "Session: hand-gesture toggle (webcam)" })
+
+-- ── Window State ──────────────────────────────────────────────────────
+hl.bind(mainMod .. " + F", hl.dsp.window.fullscreen({ mode = "fullscreen" }), { description = "Window: Fullscreen" })
+hl.bind(mainMod .. " + SHIFT + F", hl.dsp.window.float({ action = "toggle" }), { description = "Window: Toggle floating" })
+hl.bind(mainMod .. " + P", hl.dsp.window.pseudo(), { description = "Window: Pseudotile" })
+hl.bind(mainMod .. " + T", hl.dsp.exec_cmd("kitty"), { description = "Launch: Terminal kitty" })
+hl.bind(mainMod .. " + S", hl.dsp.window.pin(), { description = "Window: Pin" })
+-- SUPER+M → maximize within tiling (fullscreen mode 1).
+-- Target of MX Master 4 middle-click button (cid 0x52) via logid.
+hl.bind(mainMod .. " + M", hl.dsp.window.fullscreen({ mode = "maximized" }), { description = "Window: Maximize tiled" })
+hl.bind(mainMod .. " + O", hl.dsp.exec_cmd("~/.config/hypr/scripts/toggle-opacity.sh"), { description = "Window: Toggle opacity" })
+-- Super+I — toggle wvkbd-mobintl on-screen keyboard (backup when physical kbd unavailable).
+hl.bind(mainMod .. " + I", hl.dsp.exec_cmd("~/.config/hypr/scripts/toggle-vkbd.sh"), { description = "Launch: On-screen keyboard" })
+-- Super+| — toggle floating defaults (1920x1080) vs tiled/dwindle.
+-- Keychron Q3 Pro emits `backslash` (no Shift) for the physical | key, so
+-- bind on Super+backslash to match the actual event stream (verified via wev).
+hl.bind(mainMod .. " + backslash", hl.dsp.exec_cmd("~/.config/hypr/scripts/toggle-window-mode.sh"), { description = "Window: Toggle floating mode" })
+-- Super+Alt+| — toggle every window on the active workspace between floating and tiled.
+hl.bind(mainMod .. " + ALT + backslash", hl.dsp.exec_cmd("~/.config/hypr/scripts/workspace-float-toggle.sh"), { description = "Window: Toggle workspace floating" })
+
+-- ── Focus (arrow keys + vim keys) ────────────────────────────────────
+-- SUPER+Left/Right intentionally unbound (FEAT-workspace-ux-overhaul
+-- Phase 4 redesign — Session 9): the cross-monitor workspace shift was
+-- retired after physical testing showed Hyprland's per-monitor slide
+-- direction can't be coordinated without a custom plugin. Vim-style
+-- left focus via SUPER+H stays available; right focus via SUPER+L
+-- stays unbound while SUPER+L is the lock alias.
+hl.bind(mainMod .. " + up", hl.dsp.focus({ direction = "u" }), { description = "Focus: Move up" })
+hl.bind(mainMod .. " + down", hl.dsp.focus({ direction = "d" }), { description = "Focus: Move down" })
+hl.bind(mainMod .. " + H", hl.dsp.focus({ direction = "l" }), { description = "Focus: Move left" })
+-- Super+J — Nostromo Console, a MOCR-Q surface. FEAT-lt26r-5 (09 OD1 = A keep-for-fallback): the action is
+-- unchanged and only works under the MOCR-Q emergency fallback; with Noctalia primary it does nothing.
+hl.bind(mainMod .. " + J", hl.dsp.exec_cmd("qs -c mocr ipc call console toggle"), { description = "Fallback: Nostromo console (MOCR-Q only)" })
+hl.bind(mainMod .. " + K", hl.dsp.focus({ direction = "u" }), { description = "Focus: Move up" })
+-- NOTE: $mainMod+L is lock screen — use arrows or HJKL minus L for right
+-- If you prefer vim purity, swap L/lock:
+--   bind = $mainMod, L, movefocus, r
+--   bind = $mainMod SHIFT, L, exec, hyprlock
+
+-- ── Move Windows ──────────────────────────────────────────────────────
+hl.bind(mainMod .. " + SHIFT + left", hl.dsp.window.move({ direction = "l" }), { description = "Move: Window left" })
+hl.bind(mainMod .. " + SHIFT + right", hl.dsp.window.move({ direction = "r" }), { description = "Move: Window right" })
+hl.bind(mainMod .. " + SHIFT + up", hl.dsp.window.move({ direction = "u" }), { description = "Move: Window up" })
+hl.bind(mainMod .. " + SHIFT + down", hl.dsp.window.move({ direction = "d" }), { description = "Move: Window down" })
+hl.bind(mainMod .. " + SHIFT + H", hl.dsp.window.move({ direction = "l" }), { description = "Move: Window left" })
+hl.bind(mainMod .. " + SHIFT + J", hl.dsp.window.move({ direction = "d" }), { description = "Move: Window down" })
+hl.bind(mainMod .. " + SHIFT + K", hl.dsp.window.move({ direction = "u" }), { description = "Move: Window up" })
+hl.bind(mainMod .. " + SHIFT + L", hl.dsp.window.move({ direction = "r" }), { description = "Move: Window right" })
+
+-- ── Resize Windows ────────────────────────────────────────────────────
+hl.bind(mainMod .. " + CTRL + left", hl.dsp.window.resize({ x = -40, y = 0, relative = true }), { repeating = true, description = "Resize: Shrink width" })
+hl.bind(mainMod .. " + CTRL + right", hl.dsp.window.resize({ x = 40, y = 0, relative = true }), { repeating = true, description = "Resize: Grow width" })
+hl.bind(mainMod .. " + CTRL + up", hl.dsp.window.resize({ x = 0, y = -40, relative = true }), { repeating = true, description = "Resize: Shrink height" })
+hl.bind(mainMod .. " + CTRL + down", hl.dsp.window.resize({ x = 0, y = 40, relative = true }), { repeating = true, description = "Resize: Grow height" })
+hl.bind(mainMod .. " + CTRL + H", hl.dsp.window.resize({ x = -40, y = 0, relative = true }), { repeating = true, description = "Resize: Shrink width" })
+hl.bind(mainMod .. " + CTRL + J", hl.dsp.window.resize({ x = 0, y = 40, relative = true }), { repeating = true, description = "Resize: Grow height" })
+hl.bind(mainMod .. " + CTRL + K", hl.dsp.window.resize({ x = 0, y = -40, relative = true }), { repeating = true, description = "Resize: Shrink height" })
+hl.bind(mainMod .. " + CTRL + L", hl.dsp.window.resize({ x = 40, y = 0, relative = true }), { repeating = true, description = "Resize: Grow width" })
+
+-- ── Workspaces ────────────────────────────────────────────────────────
+-- FEAT-workspace-split-monitor: no named workspaces, no summon scripts, and no
+-- number-key direct jumps. Focus a monitor, then cycle within that monitor's
+-- local 1..6 workspace stack.
+--
+-- FEAT-lt26r-5 OD-F: one direction policy for every local-cycle route. Slot 1 is the top of the stack;
+-- "+1" (next, down) always slides the new slot in from below and "-1" from above, including the 6 -> 1 and
+-- 1 -> 6 wraps. Hyprland derives slidevert direction from workspace IDs, so only a wrap is flipped
+-- (slidevert -100%), and the configured style is restored straight after the dispatch: bar clicks and
+-- System Map picks never inherit a reversed slide. The global is also the target of
+-- scripts/workspace-cycle-vertical (hyprctl dispatch) for callers outside this config.
+LT26R_SLOTS_PER_MONITOR = 6
+function LT26R_CYCLE_LOCAL(delta)
+    local ws = hl.get_active_workspace()
+    local wrap = false
+    if ws and ws.id and ws.id > 0 then
+        local slot = ((ws.id - 1) % LT26R_SLOTS_PER_MONITOR) + 1
+        wrap = (delta == "+1" and slot == LT26R_SLOTS_PER_MONITOR) or (delta == "-1" and slot == 1)
+    end
+    if wrap then
+        LT_MOTION.with_style("workspaces", "slidevert -100%")
+    end
+    local result = hl.plugin.split_monitor_workspaces.cycle_workspaces(delta)
+    if wrap then
+        LT_MOTION.leaf("workspaces")
+    end
+    return result
+end
+hl.bind(mainMod .. " + bracketleft", function() return LT26R_CYCLE_LOCAL("-1") end, { description = "Workspace: Cycle stack up" })
+hl.bind(mainMod .. " + bracketright", function() return LT26R_CYCLE_LOCAL("+1") end, { description = "Workspace: Cycle stack down" })
+-- Vertical workspace stack — SUPER+ALT+Up/Down cycles the focused monitor's
+-- local 1..6 stack. Workspace 1 is the top of the stack.
+hl.bind(mainMod .. " + ALT + up", function() return LT26R_CYCLE_LOCAL("-1") end, { description = "Workspace: Cycle stack up" })
+hl.bind(mainMod .. " + ALT + down", function() return LT26R_CYCLE_LOCAL("+1") end, { description = "Workspace: Cycle stack down" })
+
+-- SUPER+scroll: on this setup `mouse_up` fires on physical scroll-DOWN and
+-- `mouse_down` on physical scroll-UP, on v0.54.3 and still on v0.56.2. The
+-- 2026-10-18 swap (D-C8-3, 544e74d) was based on uinput events and inverted the
+-- real wheel; Brian's at-screen check on 2026-10-19 restored this mapping.
+-- FEAT-lt26r-5 OD-F: the wheel uses the same in-process direction policy as the keys (no helper fork).
+hl.bind(mainMod .. " + mouse_up", function() return LT26R_CYCLE_LOCAL("+1") end, { description = "Workspace: Cycle stack down" })
+hl.bind(mainMod .. " + mouse_down", function() return LT26R_CYCLE_LOCAL("-1") end, { description = "Workspace: Cycle stack up" })
+
+-- MX Master 4 gesture targets (logid → /etc/logid.cfg)
+-- These binds exist for the thumb gesture button on the MX Master 4.
+-- logid emits KEY_PROG1/2/3/4 (evdev 148/149/202/203) for the four
+-- directional gestures.
+--
+-- Using Hyprland's `code:N` syntax rather than keysym names because the
+-- current XKB layout doesn't map KEY_PROG1-4 to XF86Launch1-4 keysyms,
+-- so bind = , XF86Launch1, ... never fires. code:N bypasses keysym
+-- resolution and matches on the raw XKB keycode (evdev + 8).
+--
+-- Evdev 148 KEY_PROG1 → XKB 156 (Up gesture)
+-- Evdev 149 KEY_PROG2 → XKB 157 (Down gesture)
+-- Evdev 202 KEY_PROG3 → XKB 210 (Left gesture)
+-- Evdev 203 KEY_PROG4 → XKB 211 (Right gesture)
+--
+-- See machines/7800x/fixes/mx-master-4-logid-solaar-split.md.
+-- FEAT-lt26r-5 OD-F: up/down use the shared direction policy (local stack, wrapping, physical slide).
+hl.bind("code:156", function() return LT26R_CYCLE_LOCAL("+1") end, { description = "Gesture: Next workspace slot" })
+hl.bind("code:157", function() return LT26R_CYCLE_LOCAL("-1") end, { description = "Gesture: Previous workspace slot" })
+hl.bind("code:210", hl.dsp.window.move({ workspace = "m-1" }), { description = "Gesture: Move window to previous workspace" })
+hl.bind("code:211", hl.dsp.window.move({ workspace = "m+1" }), { description = "Gesture: Move window to next workspace" })
+
+-- ── Macro Keys (M1-M4 → F13-F16) ────────────────────────────────────
+-- M1 mirrors Super+| window-mode toggles: plain = per-window, Shift = whole workspace.
+hl.bind("XF86Tools", hl.dsp.exec_cmd("~/.config/hypr/scripts/toggle-window-mode.sh"), { description = "Window: Toggle floating mode" })
+hl.bind(mainMod .. " + SHIFT + XF86Tools", hl.dsp.exec_cmd("~/.config/hypr/scripts/workspace-float-toggle.sh"), { description = "Window: Toggle floating mode" })
+hl.bind("XF86Launch5", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg panel-toggle launcher"), { description = "Launch: Noctalia app palette" })
+hl.bind("XF86Launch6", hl.dsp.workspace.toggle_special("scratch"), { description = "Workspace: Toggle scratchpad" })
+hl.bind("XF86Launch7", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/ares-lock"), { description = "Session: Lock screen" })
+
+-- ── Overlay Tools ─────────────────────────────────────────────────────
+-- FEAT-lt26r-5 OD-A: native read-only shortcut reference (Noctalia launcher via `noctalia dmenu`; rows never execute).
+hl.bind(mainMod .. " + slash", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/shortcut-reference"), { description = "Overlay: Shortcut reference" })
+hl.bind(mainMod .. " + A", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg panel-toggle liquidtron/ares:panel"), { description = "Overlay: Ares presence panel" })
+hl.bind(mainMod .. " + SPACE", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg panel-toggle liquidtron/ares:askchat"), { description = "Overlay: Ask Ares" })
+-- FEAT-lt32 C2: push-to-talk. Press opens the chat window listening; release stops the recorder (transcribe + send).
+hl.bind(mainMod .. " + SHIFT + SPACE", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/ares-listen ptt-down"), { description = "Overlay: Ask Ares (hold to talk)" })
+hl.bind(mainMod .. " + SHIFT + SPACE", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/ares-listen ptt-up"), { release = true, description = "Overlay: Ask Ares (release to send)" })
+-- FEAT-lt32 C3 (D10): the release bind above stays silent when SHIFT or SUPER goes up before SPACE (Hyprland matches
+-- no release bind once a modifier left). This hook arms on a SPACE press made with SUPER and SHIFT held and sends
+-- ptt-up on that SPACE's release in any key order. xkb keycodes = evdev + 8. A second ptt-up is harmless.
+local pttMods, pttArmed = {}, false
+hl.on("input.keyboard.key", function(keycode, _timeMs, state)
+    if keycode == 133 or keycode == 134 or keycode == 50 or keycode == 62 then -- LEFT/RIGHT META, LEFT/RIGHT SHIFT
+        pttMods[keycode] = state == 1
+    elseif keycode == 65 then -- SPACE
+        if state == 1 then -- pressed (2 = repeat: keep the armed state)
+            pttArmed = (pttMods[133] or pttMods[134]) and (pttMods[50] or pttMods[62]) or false
+        elseif state == 0 and pttArmed then
+            pttArmed = false
+            hl.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/ares-listen ptt-up")
+        end
+    end
+end)
+hl.bind(mainMod .. " + SHIFT + A", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg panel-toggle liquidtron/ares:brief replay"), { description = "Overlay: Return Brief replay" })
+
+-- ── Scratchpad / Special Workspaces ──────────────────────────────────
+hl.bind(mainMod .. " + grave", hl.dsp.workspace.toggle_special("scratch"), { description = "Workspace: Toggle scratchpad" })
+hl.bind(mainMod .. " + SHIFT + grave", hl.dsp.window.move({ workspace = "special:scratch" }), { description = "Workspace: Move to scratchpad" })
+-- SUPER+U — dashboard deck (wtfutil). Mirrors the scratch special-workspace
+-- pattern; deck summons on whichever monitor has focus.
+hl.bind(mainMod .. " + U", hl.dsp.workspace.toggle_special("deck"), { description = "Workspace: Toggle dashboard deck" })
+
+-- ── Monitor Focus ─────────────────────────────────────────────────────
+hl.bind(mainMod .. " + comma", hl.dsp.focus({ monitor = "l" }), { description = "Monitor: Focus left" })
+hl.bind(mainMod .. " + period", hl.dsp.focus({ monitor = "r" }), { description = "Monitor: Focus right" })
+hl.bind(mainMod .. " + SHIFT + comma", hl.dsp.window.move({ monitor = "l" }), { description = "Monitor: Move window left" })
+hl.bind(mainMod .. " + SHIFT + period", hl.dsp.window.move({ monitor = "r" }), { description = "Monitor: Move window right" })
+
+-- ── Tabbed/Grouped Windows ───────────────────────────────────────────
+hl.bind(mainMod .. " + G", hl.dsp.group.toggle(), { description = "Group: Toggle group" })
+-- SUPER+SHIFT+G — system-mode toggle (intelligent ↔ gaming).  The `p` flag
+-- bypasses a game's shortcut-inhibition request, making this an escape hotkey
+-- from gaming mode.  Use explicit desktop paths so the canonical state file is
+-- never redirected by a caller's XDG_STATE_HOME or PATH.
+-- SUPER+G is taken by togglegroup; the SHIFT variant is free.
+hl.bind(mainMod .. " + SHIFT + G", hl.dsp.exec_cmd("env HOME={{ .chezmoi.homeDir }} XDG_STATE_HOME={{ .chezmoi.homeDir }}/.local/state {{ .chezmoi.homeDir }}/.local/bin/system-mode-toggle"), { dont_inhibit = true, description = "Session: System mode toggle" })
+-- Group cycling lives on SUPER+CTRL+TAB — SUPER+TAB is the Quickshell
+-- workspace overview toggle (see overview-tools-binds.conf).
+hl.bind(mainMod .. " + CTRL + TAB", hl.dsp.group.next(), { description = "Group: Cycle active" })
+hl.bind(mainMod .. " + CTRL + SHIFT + TAB", hl.dsp.group.prev(), { description = "Group: Cycle active backward" })
+-- FEAT-lt26r-5 OD-B: ALT+Tab — Noctalia's live-window carousel (hold Alt, Tab/Shift+Tab to move, release to switch,
+-- quick tap = previous window, Escape cancels; the chosen window is pulled to the focused monitor). Distinct from SUPER+Tab (System Map) and SUPER+CTRL+Tab (groups).
+hl.bind("ALT + Tab", hl.dsp.exec_cmd("{{ .chezmoi.homeDir }}/.local/bin/noctalia-switcher-hold"), { description = "Window: Switcher carousel" })
+
+-- ── Mouse ─────────────────────────────────────────────────────────────
+hl.bind(mainMod .. " + mouse:272", hl.dsp.window.drag(), { description = "Mouse: Drag window" })
+hl.bind(mainMod .. " + mouse:273", hl.dsp.window.resize(), { description = "Mouse: Resize window" })
+hl.bind(mainMod .. " + mouse:275", hl.dsp.window.move({ monitor = "l" }), { description = "Move: Window to left monitor" }) -- Meta + Mouse Back  → send to left monitor
+hl.bind(mainMod .. " + mouse:276", hl.dsp.window.move({ monitor = "r" }), { description = "Move: Window to right monitor" }) -- Meta + Mouse Forward → send to right monitor
+
+-- ── Screenshots ───────────────────────────────────────────────────────
+-- Print family — image bytes on clipboard (paste into Claude CLI, Discord, GIMP)
+hl.bind(mainMod .. " + Print", hl.dsp.exec_cmd("sh -c 'f=~/Pictures/Screenshots/shot-$(date +%Y%m%d-%H%M%S).png; g=$(slurp) && grim -g \"$g\" \"$f\" && wl-copy -t image/png < \"$f\" && notify-send -u low -i camera-photo \"Screenshot\" \"$f\"'"), { description = "Capture: Region to clipboard" })
+hl.bind("Print", hl.dsp.exec_cmd("sh -c 'f=~/Pictures/Screenshots/shot-$(date +%Y%m%d-%H%M%S).png; grim \"$f\" && wl-copy -t image/png < \"$f\" && notify-send -u low -i camera-photo \"Screenshot\" \"$f\"'"), { description = "Capture: Screen to clipboard" })
+-- SHIFT variants — file URI on clipboard (paste into Thunar, terminal, file dialogs)
+hl.bind("SHIFT + Print", hl.dsp.exec_cmd("sh -c 'f=~/Pictures/Screenshots/shot-$(date +%Y%m%d-%H%M%S).png; g=$(slurp) && grim -g \"$g\" \"$f\" && printf \"file://%s\" \"$f\" | wl-copy -t text/uri-list && notify-send -u low -i camera-photo \"Screenshot\" \"$f\"'"), { description = "Capture: Region as file link" })
+hl.bind(mainMod .. " + SHIFT + Print", hl.dsp.exec_cmd("sh -c 'f=~/Pictures/Screenshots/shot-$(date +%Y%m%d-%H%M%S).png; grim \"$f\" && printf \"file://%s\" \"$f\" | wl-copy -t text/uri-list && notify-send -u low -i camera-photo \"Screenshot\" \"$f\"'"), { description = "Capture: Screen as file link" })
+-- SUPER+CTRL+Print — region capture → satty annotate. Ctrl+C in satty copies the annotated image; Ctrl+S saves to the output file.
+hl.bind(mainMod .. " + CTRL + Print", hl.dsp.exec_cmd("sh -c 'g=$(slurp) && grim -g \"$g\" - | satty --filename - --output-filename ~/Pictures/Screenshots/annotated-$(date +%Y%m%d-%H%M%S).png --early-exit --copy-command wl-copy'"), { description = "Capture: Region annotate satty" })
+
+-- ── Clipboard History ─────────────────────────────────────────────────
+hl.bind(mainMod .. " + V", hl.dsp.exec_cmd("~/.local/bin/clip-pick pick"), { description = "Clipboard: History picker" })
+hl.bind(mainMod .. " + SHIFT + V", hl.dsp.exec_cmd("~/.local/bin/clip-pick wipe"), { description = "Clipboard: Wipe history" })
+
+-- ── Screen Recording ─────────────────────────────────────────────────
+hl.bind(mainMod .. " + ALT + R", hl.dsp.exec_cmd("~/.local/bin/rec-region"), { description = "Capture: Screen recording" })
+hl.bind(mainMod .. " + ALT + SHIFT + R", hl.dsp.exec_cmd("~/.local/bin/rec-stop"), { description = "Capture: Stop recording" })
+hl.bind(mainMod .. " + ALT + C", hl.dsp.exec_cmd("~/.local/bin/rec-center"), { description = "Capture: Record center monitor (toggle)" })
+
+-- ── Media / Volume ────────────────────────────────────────────────────
+hl.bind("XF86AudioRaiseVolume", hl.dsp.exec_cmd("~/.config/hypr/scripts/liquid-tron-audio-feedback up"), { repeating = true, description = "Media: Volume up" })
+hl.bind("XF86AudioLowerVolume", hl.dsp.exec_cmd("~/.config/hypr/scripts/liquid-tron-audio-feedback down"), { repeating = true, description = "Media: Volume down" })
+hl.bind("XF86AudioMute", hl.dsp.exec_cmd("~/.config/hypr/scripts/liquid-tron-audio-feedback mute"), { description = "Media: Toggle mute" })
+hl.bind("XF86AudioPlay", hl.dsp.exec_cmd("playerctl play-pause"), { description = "Media: Play pause" })
+hl.bind("XF86AudioNext", hl.dsp.exec_cmd("playerctl next"), { description = "Media: Next track" })
+hl.bind("XF86AudioPrev", hl.dsp.exec_cmd("playerctl previous"), { description = "Media: Previous track" })

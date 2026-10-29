@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Library picker for the Noctalia bar media widget (MPD).
+
+Left-click on the media widget runs this. It lists, in the native Noctalia launcher
+(`noctalia dmenu`, pinned binary, hash-checked; fuzzel fallback):
+
+  * CLEAR      stop MPD and empty the queue (the widget then shows nothing)
+  * LIBRARY    open the full rmpc library browser
+  * SHUFFLE    replace the queue with the whole library, shuffled
+  * PLAYLIST   saved MPD playlists
+  * ARTIST     every song by an album artist
+  * ALBUM      one album
+
+Picking an artist, album, playlist or shuffle REPLACES the queue and starts playback.
+`music-pick clear` clears without opening the menu.
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+PIN_FILE = Path.home() / ".local/bin/noctalia-primary-msg"
+PROMPT = "MUSIC // "
+SEP = " — "
+
+
+def mpc(*args: str) -> str:
+    r = subprocess.run(["mpc", *args], capture_output=True, text=True)
+    return r.stdout
+
+
+def pinned_binary() -> str | None:
+    try:
+        text = PIN_FILE.read_text()
+    except OSError:
+        return None
+    binary = re.findall(r"^binary=(/\S+)$", text, re.M)
+    sha = re.findall(r"^expected_sha=([0-9a-f]{64})$", text, re.M)
+    if len(binary) != 1 or len(sha) != 1:
+        return None
+    try:
+        digest = hashlib.sha256(Path(binary[0]).read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return binary[0] if digest == sha[0] else None
+
+
+def rows() -> list[str]:
+    out = ["CLEAR      Stop and clear the queue",
+           "LIBRARY    Open full library (rmpc)",
+           "SHUFFLE    Shuffle entire library"]
+    for name in sorted(p for p in mpc("lsplaylists").splitlines() if p.strip()):
+        out.append(f"PLAYLIST   {name}")
+    artist = None
+    artists: list[str] = []
+    albums: list[str] = []
+    for line in mpc("list", "album", "group", "albumartist").splitlines():
+        if not line.strip():
+            continue
+        if line.startswith((" ", "\t")):
+            if artist:
+                albums.append(f"ALBUM      {artist}{SEP}{line.strip()}")
+        else:
+            artist = line.strip()
+            artists.append(f"ARTIST     {artist}")
+    return out + artists + albums
+
+
+def pick(payload: str) -> str:
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    display = os.environ.get("WAYLAND_DISPLAY") or "wayland-1"
+    env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY=display)
+    binary = pinned_binary()
+    if binary and (runtime / f"noctalia-dmenu-{display}.sock").exists():
+        cmd = [binary, "dmenu", "--prompt", PROMPT]
+    else:
+        cmd = ["fuzzel", "--dmenu", "--prompt", PROMPT, "--width", "88", "--lines", "18"]
+    r = subprocess.run(cmd, input=payload, text=True, env=env, capture_output=True)
+    return r.stdout.strip()
+
+
+def clear(reset_mpris: bool = True) -> None:
+    mpc("-q", "stop")
+    mpc("-q", "clear")
+    if reset_mpris:
+        # mpd-mpris keeps publishing the last track's metadata after the queue empties, so the bar
+        # would keep showing it. A restart republishes an empty NoTrack player and the widget hides.
+        subprocess.run(["systemctl", "--user", "restart", "mpd-mpris.service"], capture_output=True)
+
+
+def replace_and_play(*add_cmd: str, shuffle: bool = False) -> None:
+    clear(reset_mpris=False)
+    mpc("-q", *add_cmd)
+    if shuffle:
+        mpc("-q", "shuffle")
+    mpc("-q", "play")
+
+
+def act(choice: str) -> None:
+    kind, _, rest = choice.partition(" ")
+    rest = rest.strip()
+    if kind == "CLEAR":
+        clear()
+    elif kind == "LIBRARY":
+        subprocess.Popen(["gtk-launch", "rmpc-liquid-tron"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif kind == "SHUFFLE":
+        replace_and_play("add", "/", shuffle=True)
+    elif kind == "PLAYLIST":
+        replace_and_play("load", rest)
+    elif kind == "ARTIST":
+        replace_and_play("findadd", "albumartist", rest)
+    elif kind == "ALBUM":
+        artist, _, album = rest.partition(SEP)
+        replace_and_play("findadd", "albumartist", artist, "album", album)
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] == ["clear"]:
+        clear()
+        return 0
+    if argv[:1] == ["--rows"]:
+        print("\n".join(rows()))
+        return 0
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    lock = open(runtime / "music-pick.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Second click while the picker is open closes it.
+        subprocess.run([str(PIN_FILE), "panel-close", "launcher"], capture_output=True)
+        return 0
+    choice = pick("\n".join(rows()))
+    if choice:
+        act(choice)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

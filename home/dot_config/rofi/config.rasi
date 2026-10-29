@@ -1,0 +1,27 @@
+configuration {
+    modi: "combi,drun,run,window";
+    combi-modes: "drun,run,window";
+    show-icons: true;
+    icon-theme: "Nordzy-cyan-dark";
+    font: "IosevkaTerm Nerd Font SemiBold 13";
+    display-combi: "SYSTEM";
+    display-drun: "APPS";
+    display-run: "RUN";
+    display-window: "WINDOWS";
+    combi-display-format: "{text}";
+    drun-display-format: "{name}";
+    matching: "fuzzy";
+    sorting-method: "fzf";
+    sort: true;
+    drun-match-fields: "name,generic,exec,categories,keywords,comment";
+    drun-show-actions: true;
+}
+
+@theme "theme"
+
+/*
+ * Widget rules live in the generated theme.rasi fragment. Rofi 2.0.0 on this
+ * host loads the config values here, but the hotkey path must pass
+ * `-theme ~/.config/rofi/theme.rasi` explicitly to avoid the default horizontal
+ * bar rendering.
+ */

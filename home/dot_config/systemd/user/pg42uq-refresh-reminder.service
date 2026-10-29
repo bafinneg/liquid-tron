@@ -1,0 +1,9 @@
+[Unit]
+Description=PG42UQ weekly pixel refresh reminder (OLED burn-in mitigation)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+# notify-send -t 0 = never auto-expire; user must explicitly dismiss.
+# -u critical triggers Quickshell urgency=critical styling (red #ff003c per radius spec).
+ExecStart=/usr/bin/notify-send -u critical -t 0 "PG42UQ pixel refresh" "Run manual pixel refresh: Settings > OLED Care > Pixel Cleaning. Display will be unusable for ~10 minutes."

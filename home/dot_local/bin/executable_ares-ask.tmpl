@@ -1,0 +1,496 @@
+#!/usr/bin/python3 -I
+"""ares-ask (FEAT-lt31 C1): send one launcher line to the local model or to Hermes, and stream the result.
+
+    ares-ask --local [--no-watch] -- TEXT    qwen2.5:7b-instruct on zgx-02 Ollama (127.0.0.1:11436 via zgx02-vllm-tunnel); stays on the LAN
+    ares-ask --cloud [--no-watch] -- TEXT    Hermes fullpower, restricted toolset, listed as a desktop Conversation
+    ares-ask --cloud --resume SID -- TEXT    FEAT-lt32: continue Hermes Conversation SID (follow-up turn; cloud only)
+    ares-ask --route TEXT                    print the routing row the launcher shows for TEXT (reference for ask.luau)
+
+The Noctalia launcher provider (ask.luau) runs this through `noctalia.runStream` (`/bin/sh -c`), with TEXT
+single-quoted after `--` (C0 F8). Every stdout line is one JSON event:
+
+    {"t": "status"|"partial"|"answer"|"yield"|"error"|"cancelled", "title": str, "lines": [str, str], "full": str}
+
+`title` and every entry of `lines` are uppercase and at most 48 characters; `lines` has at most two entries;
+`full` (answer only) is the untruncated reply for COPY.
+
+FEAT-lt32 (chat window): a successful cloud turn is followed by one extra event, `{"t": "session", "id": SID, ...}`,
+the Hermes session id (newest `cli` session of the fullpower profile started since this turn began, read-only from
+state.db) so the window can pass it back as `--resume SID`. Older consumers ignore unknown `t` values.
+
+Cancel (C0 F7): the launcher has no close callback, so while this runs it polls `hyprctl -j layers` at 5 Hz and
+exits after two consecutive polls with no launcher layer. Local: exiting closes the HTTP connection and Ollama
+stops generating. Cloud: the hermes child runs in its own session and is never killed, because the request is
+already a desktop Conversation. A second request on the same route SIGTERMs the previous ares-ask through
+$XDG_RUNTIME_DIR/ares/ask-<route>.pid.
+
+Presence: the cloud route gets THINKING from the ares-bar-state Hermes plugin (C0 F5) and writes no presence.
+The local route pushes the instrument only (never presence.json) and re-pushes the current presence.json when done.
+
+Writes: $XDG_RUNTIME_DIR/ares/ask-last.json (0600; top level = newest question + answer as before, plus `recent`:
+the newest three entries, newest first) and the ask-<route>.pid files.
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+MAX_LEN = 48
+MAX_LINES = 2
+MAX_TEXT = 4000
+POLL_S = 0.2                 # 5 Hz launcher-layer watch (C0 F7)
+MISSES_TO_CANCEL = 2
+LAUNCHER_LAYERS = ("noctalia-attached-panel", "noctalia-panel")   # live namespace confirmed in C1: attached
+LOCAL_MODEL = "qwen2.5:7b-instruct"
+LOCAL_SYSTEM = "Answer in at most two lines, uppercase."
+LOCAL_NUM_PREDICT = 160
+LOCAL_KEEP_ALIVE = "30m"
+LOCAL_TIMEOUT_S = 60
+CLOUD_TOOLSETS = "web,session_search,todo"     # C0 F1: read-only web, read-only history, in-turn list
+CLOUD_WAIT_S = 900
+PARTIAL_EVERY_S = 0.1
+RECENT_KEEP = 3                                # ask-last.json ring (FEAT-lt32 D6)
+SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")  # first char alphanumeric: never read as a flag
+
+TITLE_LOCAL = "ASK // ZGX // QWEN 7B"
+TITLE_CLOUD = "ASK // CLOUD // OPUS 5.5"
+YIELD_GAMING = "LOCAL MODEL YIELDED // GAMING"
+WORKING_CLOUD = "HERMES IS WORKING"
+
+HOME = "{{ .chezmoi.homeDir }}"
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+ARES_DIR = os.path.join(RUNTIME, "ares")
+OLLAMA_URL = os.environ.get("ARES_ASK_OLLAMA_URL", "http://127.0.0.1:11436")
+HERMES = os.environ.get("ARES_ASK_HERMES", f"{HOME}/.local/bin/hermes")
+PUSH = os.environ.get("ARES_ASK_PUSH", f"{HOME}/.local/bin/noctalia-primary-msg")
+STATE_DB = os.environ.get("ARES_ASK_STATE_DB", f"{HOME}/.hermes/profiles/fullpower/state.db")
+SYSTEM_MODE = os.environ.get("ARES_SYSTEM_MODE_FILE", f"{HOME}/.local/state/system-mode")
+PUSH_PREFIX = ["plugin", "liquidtron/ares:instrument", "all", "state"]
+
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_out_lock = threading.RLock()            # re-entrant: the SIGTERM handler may emit while main holds it
+_EXIT_SIGNALS = {signal.SIGTERM, signal.SIGINT}
+
+
+# ---------------------------------------------------------------------------------------------------- pure helpers
+
+def route(text):
+    """(route, query, title) for the launcher sub-query after `/ask`: ZGX (local, zgx-02) is the default (HQ-0062
+    owner ask 2026-10-26); a leading `>` sends it to the cloud instead."""
+    s = text.lstrip()
+    if s.startswith(">"):
+        return "cloud", s[1:].strip(), TITLE_CLOUD
+    return "local", s.strip(), TITLE_LOCAL
+
+
+def clean(text):
+    """One uppercase line: control characters and runs of whitespace become single spaces."""
+    return " ".join(_CTRL.sub(" ", str(text)).split()).upper()
+
+
+def wrap(text, width=MAX_LEN, max_lines=MAX_LINES):
+    """Uppercase lines of at most `width` characters; the last line ends in `…` when text was cut."""
+    words = clean(text).split(" ")
+    lines, cur = [], ""
+    for w in words:
+        if not w:
+            continue
+        while len(w) > width:                       # a single over-long token is hard-split
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(w[:width])
+            w = w[width:]
+        if not cur:
+            cur = w
+        elif len(cur) + 1 + len(w) <= width:
+            cur += " " + w
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
+        lines[-1] = (last[: width - 1] if len(last) >= width else last) + "…"
+    return lines
+
+
+def sh_quote(text):
+    """POSIX single quoting, the exact rule ask.luau applies before runStream (C0 F8)."""
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def local_body(text):
+    """The complete Ollama request: the typed text and the fixed system prompt, nothing else."""
+    return {
+        "model": LOCAL_MODEL,
+        "prompt": text,
+        "system": LOCAL_SYSTEM,
+        "stream": True,
+        "keep_alive": LOCAL_KEEP_ALIVE,
+        "options": {"num_predict": LOCAL_NUM_PREDICT},
+    }
+
+
+def cloud_argv(text, resume=None):
+    """C0 F4: `--oneshot=` survives text that starts with `-`; `chat --source cli` lists it in the desktop app.
+    `resume` (FEAT-lt32 D8) continues an existing Conversation: `chat ... --resume SID`."""
+    argv = [HERMES, "--profile", "fullpower", "--oneshot=" + text, "chat", "--source", "cli", "-t", CLOUD_TOOLSETS]
+    if resume:
+        argv += ["--resume", resume]
+    return argv
+
+
+SESSION_SOURCES = ("cli", "local")   # `chat --source cli` is stored as source 'local', id `local-<sha256>` (live 2026-10-25)
+
+
+def newest_session(since, text=None):
+    """Id of the newest cli/local session started at or after `since` (epoch s) in the fullpower state.db, else None.
+    With `text`, a session whose first user message is exactly that text wins (another Conversation started in the
+    same second cannot be picked). Read-only; any failure is None (the turn itself already succeeded)."""
+    marks = ",".join("?" * len(SESSION_SOURCES))
+    try:
+        db = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=1)
+        try:
+            row = None
+            if text is not None:
+                try:
+                    row = db.execute(
+                        f"SELECT s.id FROM sessions s WHERE s.source IN ({marks}) AND s.started_at >= ? AND "
+                        "(SELECT m.content FROM messages m WHERE m.session_id = s.id AND m.role = 'user' "
+                        "ORDER BY m.id LIMIT 1) = ? ORDER BY s.started_at DESC LIMIT 1",
+                        (*SESSION_SOURCES, since, text)).fetchone()
+                except sqlite3.OperationalError:   # no messages table (older schema / test db): fall back
+                    row = None
+            if row is None:
+                row = db.execute(f"SELECT id FROM sessions WHERE source IN ({marks}) AND started_at >= ? "
+                                 "ORDER BY started_at DESC LIMIT 1", (*SESSION_SOURCES, since)).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        print(f"ares-ask: session lookup failed: {exc}", file=sys.stderr)  # follow-ups then start a new Conversation
+        return None
+    return row[0] if row and SID_RE.match(str(row[0])) else None
+
+
+def elapsed_title(prefix, secs):
+    s = int(secs)
+    return f"{prefix} // {s // 60:02d}:{s % 60:02d}"
+
+
+def gaming():
+    try:
+        with open(SYSTEM_MODE, encoding="utf-8") as f:
+            return f.read().strip() == "gaming"
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------------------------------------------- output
+
+def emit(t, title="", lines=(), full=None, sid=None):
+    ev = {"t": t, "title": clean(title)[:MAX_LEN], "lines": [l[:MAX_LEN] for l in list(lines)[:MAX_LINES]]}
+    if full is not None:
+        ev["full"] = full
+    if sid is not None:
+        ev["id"] = sid
+    data = json.dumps(ev, ensure_ascii=False) + "\n"
+    with _out_lock:
+        # A SIGTERM handled inside flush() would re-enter the stdout buffer ("reentrant call"), surface as an error
+        # in the interrupted route and print error + answer instead of cancelled. Hold the signals until the line is out.
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, _EXIT_SIGNALS)
+        try:
+            sys.stdout.write(data)
+            sys.stdout.flush()
+        except (BrokenPipeError, ValueError):
+            os._exit(0)                              # the launcher host went away; nothing left to tell
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
+def write_last(route_name, question, answer):
+    os.makedirs(ARES_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(ARES_DIR, "ask-last.json")
+    tmp = path + f".{os.getpid()}.tmp"
+    entry = {"route": route_name, "question": question, "answer": answer, "at_ms": int(time.time() * 1000)}
+    try:
+        with open(path, encoding="utf-8") as f:
+            old = json.load(f)
+        prior = old.get("recent") if isinstance(old.get("recent"), list) else [
+            {k: old[k] for k in ("route", "question", "answer", "at_ms") if k in old}]
+    except (OSError, ValueError, AttributeError):
+        prior = []
+    recent = ([entry] + [e for e in prior if isinstance(e, dict) and e.get("question") is not None])[:RECENT_KEEP]
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({**entry, "recent": recent}, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------------------------------- presence
+
+def _push(payload):
+    """Fire and forget: the push must survive this process exiting (cancel path)."""
+    try:
+        subprocess.Popen([PUSH] + PUSH_PREFIX + [payload], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError:
+        pass
+
+
+def push_thinking():
+    _push(json.dumps({"v": 1, "state": "thinking", "since_ms": int(time.time() * 1000)}))
+
+
+def push_restore():
+    """Hand the instrument back to the plugin's own view: re-push presence.json as it is (read only)."""
+    try:
+        with open(os.path.join(ARES_DIR, "presence.json"), encoding="utf-8") as f:
+            payload = f.read().strip()
+        json.loads(payload)
+    except (OSError, ValueError):
+        payload = json.dumps({"v": 1, "state": "idle", "since_ms": int(time.time() * 1000)})
+    _push(payload)
+
+
+# ---------------------------------------------------------------------------------------------------- lifecycle
+
+class Run:
+    def __init__(self, route_name):
+        self.route = route_name
+        self.pidfile = os.path.join(ARES_DIR, f"ask-{route_name}.pid")
+        self.cleanup = []                            # callables run once on any exit
+        self._exiting = threading.Lock()
+
+    def finish(self, rc=0, event=None):
+        """Single exit path for normal end, cancel and SIGTERM: cleanup, optional event, hard exit."""
+        if not self._exiting.acquire(blocking=False):
+            return
+        for fn in self.cleanup:
+            try:
+                fn()
+            except Exception:
+                pass
+        if event:
+            emit(*event)
+        try:
+            with open(self.pidfile, encoding="ascii") as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.unlink(self.pidfile)
+        except OSError:
+            pass
+        os._exit(rc)
+
+    def claim(self):
+        """Replace a pending request on the same route (one in flight per route)."""
+        os.makedirs(ARES_DIR, mode=0o700, exist_ok=True)
+        try:
+            with open(self.pidfile, encoding="ascii") as f:
+                old = int(f.read().strip())
+            if old != os.getpid() and _is_ares_ask(old):
+                os.kill(old, signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+        tmp = self.pidfile + f".{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.close(fd)
+        os.replace(tmp, self.pidfile)
+
+    def on_sigterm(self, _sig, _frm):
+        self.finish(0, ("cancelled", "CANCELLED"))
+
+
+def _is_ares_ask(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"ares-ask" in f.read()
+    except OSError:
+        return False
+
+
+def _hypr_env():
+    env = dict(os.environ)
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        base = os.path.join(RUNTIME, "hypr")
+        try:
+            sigs = sorted((e for e in os.scandir(base) if e.is_dir()), key=lambda e: e.stat().st_mtime)
+            if sigs:
+                env["HYPRLAND_INSTANCE_SIGNATURE"] = sigs[-1].name
+        except OSError:
+            pass
+    return env
+
+
+def launcher_open(env):
+    """True/False when the layer list was read, None when hyprctl failed (never treated as closed)."""
+    try:
+        r = subprocess.run(["hyprctl", "-j", "layers"], capture_output=True, timeout=1, env=env, check=False)
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    for mon in data.values() if isinstance(data, dict) else []:
+        for level in (mon.get("levels") or {}).values():
+            for layer in level or []:
+                if layer.get("namespace") in LAUNCHER_LAYERS:
+                    return True
+    return False
+
+
+def watch_launcher(run):
+    env = _hypr_env()
+    misses = 0
+    while True:
+        state = launcher_open(env)
+        misses = misses + 1 if state is False else 0
+        if misses >= MISSES_TO_CANCEL:
+            run.finish(0, ("cancelled", "CANCELLED"))
+        time.sleep(POLL_S)
+
+
+# ---------------------------------------------------------------------------------------------------- routes
+
+def ask_local(run, text):
+    if gaming():
+        emit("yield", YIELD_GAMING, [])
+        run.finish(3)
+    push_thinking()
+    run.cleanup.append(push_restore)
+    start = time.monotonic()
+    emit("status", elapsed_title("SENT", 0), wrap(text))
+    req = urllib.request.Request(OLLAMA_URL.rstrip("/") + "/api/generate",
+                                 data=json.dumps(local_body(text)).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    answer, last = "", 0.0
+    try:
+        with urllib.request.urlopen(req, timeout=LOCAL_TIMEOUT_S) as resp:
+            for raw in resp:
+                try:
+                    chunk = json.loads(raw)
+                except ValueError:
+                    continue
+                if chunk.get("error"):
+                    raise RuntimeError(str(chunk["error"]))
+                answer += chunk.get("response") or ""
+                now = time.monotonic()
+                if answer.strip() and now - last >= PARTIAL_EVERY_S:
+                    last = now
+                    emit("partial", elapsed_title("ANSWERING", now - start), wrap(answer))
+                if chunk.get("done"):
+                    break
+    except (OSError, urllib.error.URLError, RuntimeError, ValueError) as exc:
+        emit("error", "ZGX MODEL UNAVAILABLE", wrap(type(exc).__name__))
+        run.finish(1)
+    answer = answer.strip()
+    write_last("local", text, answer)
+    emit("answer", elapsed_title("ZGX", time.monotonic() - start), wrap(answer) or ["(NO ANSWER)"], full=answer)
+    run.finish(0)
+
+
+def ask_cloud(run, text, resume=None):
+    start = time.monotonic()
+    began = time.time() - 1
+    emit("status", WORKING_CLOUD, wrap(text))
+    out_fd = os.memfd_create("ares-ask-out")         # nothing touches disk; the child keeps writing after a cancel
+    err_fd = os.memfd_create("ares-ask-err")
+    cwd = ARES_DIR
+    os.makedirs(cwd, mode=0o700, exist_ok=True)
+    try:
+        child = subprocess.Popen(cloud_argv(text, resume), cwd=cwd, stdin=subprocess.DEVNULL, stdout=out_fd, stderr=err_fd,
+                                 start_new_session=True, close_fds=True)
+    except OSError as exc:
+        emit("error", "HERMES UNAVAILABLE", wrap(type(exc).__name__))
+        run.finish(1)
+    deadline = start + CLOUD_WAIT_S
+    next_tick = start + 1
+    while child.poll() is None:
+        now = time.monotonic()
+        if now >= deadline:
+            emit("status", "STILL WORKING // OPEN SESSION", wrap(text))
+            run.finish(0)                            # hermes keeps running; the Conversation holds the answer
+        if now >= next_tick:
+            emit("status", elapsed_title("SENT", now - start), [WORKING_CLOUD])
+            next_tick += 1
+        time.sleep(0.05)
+    answer = os.pread(out_fd, 1 << 20, 0).decode("utf-8", "replace").strip()
+    if child.returncode != 0:
+        emit("error", f"HERMES FAILED // RC {child.returncode}",
+             wrap(os.pread(err_fd, 4096, 0).decode("utf-8", "replace")) or ["SEE THE CONVERSATION"])
+        run.finish(1)
+    write_last("cloud", text, answer)
+    emit("answer", elapsed_title("CLOUD", time.monotonic() - start), wrap(answer) or ["(NO REPLY)"], full=answer)
+    sid = resume or newest_session(began, text)
+    if sid:
+        emit("session", "SESSION", [], sid=sid)
+    run.finish(0)
+
+
+# ---------------------------------------------------------------------------------------------------- main
+
+USAGE = "usage: ares-ask --local|--cloud [--no-watch] [--resume SID] -- TEXT | ares-ask --route TEXT"
+
+
+def main(argv):
+    if len(argv) == 2 and argv[0] == "--route":
+        r, q, title = route(argv[1])
+        print(json.dumps({"route": r, "query": q, "title": title, "lines": wrap(q)}, ensure_ascii=False))
+        return 0
+    opts, text, resume = [], None, None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            if len(argv) != i + 2:
+                print(USAGE, file=sys.stderr)
+                return 2
+            text = argv[i + 1]
+            break
+        if a == "--resume":
+            if resume is not None or i + 1 >= len(argv) or not SID_RE.match(argv[i + 1]):
+                print(USAGE, file=sys.stderr)
+                return 2
+            resume = argv[i + 1]
+            i += 2
+            continue
+        opts.append(a)
+        i += 1
+    routes = [o for o in opts if o in ("--local", "--cloud")]
+    if (text is None or len(routes) != 1 or any(o not in ("--local", "--cloud", "--no-watch") for o in opts)
+            or (resume is not None and routes[0] != "--cloud")):
+        print(USAGE, file=sys.stderr)
+        return 2
+    text = text.strip()
+    route_name = routes[0][2:]
+    if not text:
+        emit("error", "EMPTY QUESTION", [])
+        return 2
+    if len(text) > MAX_TEXT:
+        emit("error", "QUESTION TOO LONG", [f"MAX {MAX_TEXT} CHARACTERS"])
+        return 2
+    run = Run(route_name)
+    signal.signal(signal.SIGTERM, run.on_sigterm)
+    signal.signal(signal.SIGINT, run.on_sigterm)
+    run.claim()
+    if "--no-watch" not in opts:
+        threading.Thread(target=watch_launcher, args=(run,), name="ares-ask-watch", daemon=True).start()
+    if route_name == "local":
+        ask_local(run, text)
+    else:
+        ask_cloud(run, text, resume)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

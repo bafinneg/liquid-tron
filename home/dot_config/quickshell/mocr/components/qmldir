@@ -1,0 +1,10 @@
+module components
+LogomarkWidget 1.0 LogomarkWidget.qml
+ModuleContainer 1.0 ModuleContainer.qml
+NotificationToast 1.0 NotificationToast.qml
+NotificationToastStack 1.0 NotificationToastStack.qml
+Popover 1.0 Popover.qml
+PopoverChrome 1.0 PopoverChrome.qml
+PopoverShelf 1.0 PopoverShelf.qml
+Sparkline 1.0 Sparkline.qml
+TweenedNumber 1.0 TweenedNumber.qml

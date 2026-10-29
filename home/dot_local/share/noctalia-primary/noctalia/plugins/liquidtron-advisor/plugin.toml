@@ -1,0 +1,16 @@
+id          = "liquidtron/advisor"
+name        = "ARES signals"
+version     = "1.0.0"
+plugin_api  = 34
+author      = "liquidtron"
+description = "Active and recent ARES advisor signals under the centre meter, with allowlisted Open and Dismiss actions."
+
+# Opened by the meter's right click while a signal shows (`panel-toggle liquidtron/advisor:panel`). Outside-click
+# dismissal, the attached look and adaptive glass are Noctalia's own.
+[[panel]]
+id              = "panel"
+entry           = "panel.luau"
+placement       = "attached"
+width           = 640
+height          = 480
+open_near_click = true   # opens under the meter

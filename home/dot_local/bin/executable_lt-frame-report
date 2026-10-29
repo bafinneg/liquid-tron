@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""lt-frame-report [seconds]: measure Liquid Tron shell frame pacing while you work (FEAT-lt27 AC4).
+
+Resets Noctalia's `frame-stats`, samples process/GPU load for N seconds (default 30), then writes
+~/.local/state/lt-frame-report/<timestamp>.md. No window titles, app ids or pixels are recorded.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+MSG = os.path.expanduser("~/.local/bin/noctalia-primary-msg")
+OUT_DIR = Path(os.path.expanduser("~/.local/state/lt-frame-report"))
+HZ_BY_CONNECTOR: dict[str, float] = {}
+
+
+def run(cmd: list[str], timeout: float = 10.0) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def frame_stats(reset: bool = False) -> dict:
+    raw = run([MSG, "frame-stats"] + (["reset"] if reset else []))
+    try:
+        return json.loads(raw.strip().splitlines()[0]) if raw.strip() else {}
+    except (json.JSONDecodeError, IndexError):
+        return {}
+
+
+def pids(pattern: str) -> list[int]:
+    out = run(["pgrep", "-f", pattern])
+    return [int(p) for p in out.split() if p.isdigit() and int(p) != os.getpid()]
+
+
+def pss_mb(pid: int) -> float:
+    try:
+        for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return 0.0
+
+
+def cpu_ticks(pid: int) -> int:
+    try:
+        f = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(f[11]) + int(f[12])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def gpu_sample() -> tuple[float, float] | None:
+    out = run(["nvidia-smi", "--query-gpu=utilization.gpu,power.draw", "--format=csv,noheader,nounits"])
+    try:
+        u, p = out.strip().splitlines()[0].split(",")
+        return float(u), float(p)
+    except (ValueError, IndexError):
+        return None
+
+
+def monitors() -> dict[str, float]:
+    try:
+        return {m["name"]: float(m["refreshRate"]) for m in json.loads(run(["hyprctl", "monitors", "-j"]) or "[]")}
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return {}
+
+
+def summarize_load(samples: list[dict]) -> dict:
+    def avg(key: str) -> float:
+        vals = [s[key] for s in samples if s.get(key) is not None]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    def peak(key: str) -> float:
+        vals = [s[key] for s in samples if s.get(key) is not None]
+        return max(vals) if vals else 0.0
+
+    return {k: (avg(k), peak(k)) for k in ("gpu_util", "gpu_w")}
+
+
+def format_report(stats: dict, load: dict, procs: dict, hz: dict[str, float], seconds: int, when: str) -> str:
+    lines = [f"# Liquid Tron frame report — {when}", "", f"Window: {seconds} s of normal use.", "",
+             "## Shell frame pacing (Noctalia, frames inside animation bursts)", ""]
+    outputs = (stats or {}).get("outputs", {})
+    if not outputs:
+        lines += ["No animated frames were recorded. Open a panel, change volume or switch workspace while it runs.", ""]
+    else:
+        lines += ["| Output | Hz | Frames | p50 ms | p95 ms | p99 ms | Late (>1.5x) | Render avg / max ms | Verdict |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+        for name in sorted(outputs):
+            o = outputs[name]
+            period = o.get("period_ms") or (1000.0 / hz[name] if hz.get(name) else 0.0)
+            hzv = hz.get(name) or (1000.0 / period if period else 0.0)
+            late_pct = float(o.get("late_pct", 0.0))
+            p95 = float(o.get("p95_ms", 0.0))
+            verdict = "smooth"
+            if period and (late_pct > 5.0 or p95 > 2.0 * period):
+                verdict = "JITTER"
+            elif period and (late_pct > 1.0 or p95 > 1.5 * period):
+                verdict = "minor"
+            lines.append(
+                f"| {name} | {hzv:.0f} | {o.get('frames', 0)} | {float(o.get('p50_ms', 0)):.2f} | {p95:.2f} | "
+                f"{float(o.get('p99_ms', 0)):.2f} | {o.get('late', 0)} ({late_pct:.1f} %) | "
+                f"{float(o.get('render_avg_ms', 0)):.2f} / {float(o.get('render_max_ms', 0)):.2f} | {verdict} |")
+        lines.append("")
+    lines += ["## Load", "", "| Item | Value |", "|---|---|"]
+    for label, value in procs.items():
+        lines.append(f"| {label} | {value} |")
+    gu, gw = load.get("gpu_util", (0, 0)), load.get("gpu_w", (0, 0))
+    lines += [f"| GPU utilization avg / peak | {gu[0]:.0f} % / {gu[1]:.0f} % |",
+              f"| GPU power avg / peak | {gw[0]:.0f} W / {gw[1]:.0f} W |", ""]
+    return "\n".join(lines)
+
+
+def main(argv: list[str]) -> int:
+    seconds = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 30
+    hz = monitors()
+    noct = pids(r"noctalia-pilot/.*/bin/noctalia$")
+    if not noct:
+        print("Noctalia is not running.", file=sys.stderr)
+        return 1
+    if not frame_stats(reset=True) and not Path(MSG).exists():
+        print("noctalia-primary-msg is unavailable.", file=sys.stderr)
+        return 1
+    print(f"Measuring for {seconds} s. Use the desktop normally (open panels, switch workspaces, change volume).")
+    t0, c0 = time.monotonic(), cpu_ticks(noct[0])
+    samples = []
+    while time.monotonic() - t0 < seconds:
+        g = gpu_sample()
+        samples.append({"gpu_util": g[0] if g else None, "gpu_w": g[1] if g else None})
+        time.sleep(1.0)
+    elapsed = time.monotonic() - t0
+    cpu_pct = (cpu_ticks(noct[0]) - c0) / os.sysconf("SC_CLK_TCK") / elapsed * 100
+    stats = frame_stats()
+    procs = {"Noctalia CPU avg": f"{cpu_pct:.1f} % of one core", "Noctalia PSS": f"{pss_mb(noct[0]):.0f} MB"}
+    for name in ("noctalia-map", "wallpaper-studio"):
+        p = pids(f"qs -c {name}")
+        procs[f"qs {name} PSS"] = f"{pss_mb(p[0]):.0f} MB" if p else "not running"
+    procs["mpvpaper processes"] = str(len(pids("^/usr/(s)?bin/mpvpaper")))
+    when = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report = format_report(stats, summarize_load(samples), procs, hz, seconds, when)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUT_DIR / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+    path.write_text(report + "\n")
+    print(report)
+    print(f"\nReport: {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

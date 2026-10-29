@@ -1,0 +1,34 @@
+# Tron Compute — lazygit theme
+# Managed via Stow — do not edit ~/.config/lazygit/config.yml directly
+
+gui:
+  nerdFontsVersion: "3"
+  showIcons: true
+  border: rounded
+  theme:
+    activeBorderColor:
+      - "#0abdc6" # cyan — active panel border
+      - bold
+    inactiveBorderColor:
+      - "#0072ff" # blue — inactive panel border
+    selectedLineBgColor:
+      - "#0072ff" # blue — selection background
+    selectedRangeBgColor:
+      - "#0072ff" # blue — range selection
+    cherryPickedCommitBgColor:
+      - "#ff8c00" # amber — cherry-picked
+    cherryPickedCommitFgColor:
+      - "#0a0a14" # bg — contrast text on amber
+    markedBaseCommitBgColor:
+      - "#ff8c00" # amber — marked base
+    markedBaseCommitFgColor:
+      - "#0a0a14" # bg
+    unstagedChangesColor:
+      - "#ff8c00" # amber — modified/unstaged
+    defaultFgColor:
+      - "#c0c0d0" # fg — body text
+    searchingActiveBorderColor:
+      - "#ff8c00" # amber — search active
+git:
+  pagers:
+    - useConfig: true

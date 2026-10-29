@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# repo-grid (SUPER+C): toggle the Repo Grid dropdown attached under the centre PG42UQ bar (FEAT-lt36 owner round 1).
+# The toggle goes to the REPO GRID bar glyph, which lives only on the centre bar, so the panel anchors there whichever
+# monitor has focus. An open grid always closes (even in gaming mode); opening passes the admission gates below.
+set -euo pipefail
+
+export HOME={{ .chezmoi.homeDir }}
+export XDG_RUNTIME_DIR=/run/user/1000
+
+msg=${NOCTALIA_MSG:-{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg}
+panel_state=${REPO_GRID_PANEL_STATE:-$XDG_RUNTIME_DIR/repo-grid/panel}
+[[ -x $msg ]] || exit 1
+
+toggle() {
+  "$msg" plugin liquidtron/repogrid:button all toggle >/dev/null 2>&1 || true
+}
+
+grid_status=closed
+[[ -r $panel_state ]] && grid_status=$(<"$panel_state")
+grid_status=${grid_status//[[:space:]]/}
+if [[ $grid_status == open ]]; then
+  "$msg" panel-close liquidtron/repogrid:grid >/dev/null 2>&1 || true
+  # A shell restart while open leaves the marker behind; clear it so the next press opens.
+  printf 'closed\n' >"$panel_state" 2>/dev/null || true
+  exit 0
+fi
+
+mode_file={{ .chezmoi.homeDir }}/.local/state/system-mode
+[[ -r $mode_file ]] || exit 0
+system_mode=$(<"$mode_file")
+case "$system_mode" in
+  intelligent) ;;
+  gaming) exit 0 ;;
+  *) exit 0 ;;
+esac
+
+# Logind owns lock state. A retained hyprlock process can survive unlock and
+# must not permanently suppress the grid. Fail closed if state is unavailable.
+session_id=${XDG_SESSION_ID:-}
+if [[ -z $session_id ]]; then
+  session_id=$(loginctl show-user {{ .login }} -p Display --value 2>/dev/null || true)
+fi
+[[ -n $session_id ]] || exit 0
+locked_hint=$(loginctl show-session "$session_id" -p LockedHint --value 2>/dev/null || true)
+[[ $locked_hint == no ]] || exit 0
+
+# FEAT-lt36: only a fullscreen window on the centre PG42UQ blocks the grid, because the grid opens under that
+# bar. A fullscreen terminal on a side monitor, or one parked on a hidden workspace (the special:deck dashboard
+# is permanently fullscreen), must not. Visible = the centre monitor's active workspace plus its open special
+# workspace; the monitor is matched by EDID. Fail closed on malformed state or a missing centre monitor.
+if ! workspaces=$(hyprctl workspaces -j 2>/dev/null) || ! monitors=$(hyprctl monitors -j 2>/dev/null); then
+  exit 0
+fi
+fullscreen_state=$(/usr/bin/python -c \
+  'import json,sys
+rows=json.loads(sys.argv[1]); mons=json.loads(sys.argv[2])
+valid=isinstance(rows,list) and bool(rows) and all(isinstance(w,dict) and type(w.get("id")) is int and type(w.get("hasfullscreen")) is bool for w in rows)
+valid=valid and isinstance(mons,list) and bool(mons) and all(isinstance(m,dict) and isinstance(m.get("activeWorkspace"),dict) and type(m["activeWorkspace"].get("id")) is int for m in mons)
+if not valid:
+    print("unknown"); sys.exit()
+centre=[m for m in mons if "PG42UQ {{ .monitors.center.serial }}" in str(m.get("description",""))]
+if len(centre)!=1:
+    print("unknown"); sys.exit()
+shown={centre[0]["activeWorkspace"]["id"]}
+special=centre[0].get("specialWorkspace")
+if isinstance(special,dict) and type(special.get("id")) is int and special["id"]:
+    shown.add(special["id"])
+print("blocked" if any(w["hasfullscreen"] and w["id"] in shown for w in rows) else "clear")' \
+  "$workspaces" "$monitors" 2>/dev/null || true)
+[[ $fullscreen_state == clear ]] || exit 0
+
+if ! power_profile=$(busctl --system get-property \
+  net.hadess.PowerProfiles \
+  /net/hadess/PowerProfiles \
+  net.hadess.PowerProfiles \
+  ActiveProfile 2>/dev/null); then
+  exit 0
+fi
+case "$power_profile" in
+  's "balanced"'|'s "performance"') ;;
+  's "power-saver"') exit 0 ;;
+  *) exit 0 ;;
+esac
+
+toggle

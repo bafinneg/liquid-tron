@@ -1,0 +1,395 @@
+// Ares lock state machine (FEAT-ares-sentinel-lock).
+// One instance is shared by every lock surface. It owns the credential buffer, PAM, the failure count,
+// the global pointer position, and the telemetry line Ares is "speaking".
+//
+// States: watch | dormant | typing | checking | denied | granted
+// Safety: in real mode (preview=false) the only path to unlockRequested() is PamResult.Success.
+// A singleton, so no lock surface depends on resolving an id across the WlSessionLock component boundary
+// (that lookup came back undefined in the real lock on 2026-10-23 and left the surfaces without input).
+pragma Singleton
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import Quickshell.Services.Pam
+
+Singleton {
+    id: ctx
+
+    property bool preview: false
+    property string previewPassword: "ares"
+
+    // Credential buffer. Never logged, never written, never sent anywhere except PAM.
+    property string buffer: ""
+    property string state: "watch"
+    property int failures: 0
+    // Red alert: every wrong password holds Ares red for 2 minutes (restarted by each denial). Only a correct
+    // password (or the hold running out) ends it; the office lights follow it via ares-hue-alert.
+    property bool redAlert: false
+    property bool caps: false
+
+    // Activity clocks (ms since epoch)
+    property real lockedAt: Date.now()
+    property real lastInput: Date.now()
+    property real lastPointer: 0
+    property real lastKey: 0
+    property int keyCount: 0          // keystrokes since the buffer was last empty
+
+    // Global pointer (compositor logical coordinates)
+    property real pointerX: 0
+    property real pointerY: 0
+    property bool pointerValid: false
+    property real pointerSpeed: 0     // px/s, smoothed
+
+    // Spoken telemetry
+    property string message: ""
+    property string messageKey: ""
+    property int messageSerial: 0
+    property string voiceSource: "builtin"
+
+    // Optical presence: the ares-presence webcam helper streams one JSON line per frame (numbers only).
+    // It steers the helm; it has no part in authentication. Without a camera Ares follows the pointer as before.
+    property bool cameraEnabled: true
+    property bool camSimulated: false   // preview IPC drives presence; real helper lines are ignored
+    property string camState: "off"     // off | start | ok | nocam | lost | disabled | nomodel
+    property int camN: 0                // people in view this frame
+    property real camYaw: 0             // main subject as a helm yaw (-1 viewer-left .. +1 viewer-right)
+    property real camPitch: 0
+    property real camNear: 0            // -1 far .. 0 usual seat .. +1 close
+    property var camOthers: []          // yaws of up to three other people
+    property real camMotion: 0          // fraction of the scene that moved
+    property real camMotionYaw: 0
+    property real camMotionAt: 0
+    property real camSeenAt: 0          // ms of the last frame with a face
+    property real camTrackStart: 0      // ms when the current subject arrived (reset on departure)
+    property bool _camDeparted: true
+    // Concealment: after the face is lost, Ares keeps acting locked (bracket, count, bearing) for a randomised
+    // 5 to 9 s, so someone stepping out of view cannot tell the moment they are lost. A face that returns within
+    // the hold is re-locked silently; only a real arrival plays the acquisition.
+    property real camHoldMs: 7000
+    property real _lastMultiSay: 0
+    property real _lastPresenceSay: 0
+
+    // Ares's focus point: where the helm is looking, in global compositor coordinates. Written every frame by the
+    // primary Helm; every surface draws the tracking bracket here, so the bracket and the head always agree.
+    property real gazeX: 0
+    property real gazeY: 0
+    property bool gazeOn: false         // head up and watching (not reading, dormant or granted)
+    property real gazeLock: 0           // 0 = scanning, 1 = locked on a subject
+    property real gazeYaw: 0            // the helm's shown yaw (the readout bearing follows it, never a frozen value)
+
+    signal keystroke(bool erase)
+    signal denied(int count)
+    signal granted()
+    signal unlockRequested()
+    signal arrived()
+
+    readonly property bool dormant: state === "dormant"
+
+    // ---------- Voice ----------
+    property var lines: ({
+        greet:   ["SENTINEL ONLINE. SUBJECT DETECTED.", "CONSOLE SEALED. IDENTITY UNVERIFIED.", "ARES ACTIVE. YOU ARE OBSERVED."],
+        watch:   ["MOVEMENT REGISTERED.", "TRACKING SUBJECT.", "MOTION LOGGED. GAZE LOCKED."],
+        arrive:  ["SUBJECT ACQUIRED.", "PRESENCE DETECTED. OBSERVING.", "YOU HAVE RETURNED."],
+        // Never admits a loss: these read the same whether Ares still sees you or not.
+        depart:  ["YOU REMAIN OBSERVED.", "WATCH MAINTAINED.", "POSITION LOGGED. STILL WATCHING."],
+        multiple: ["SECOND SUBJECT DETECTED.", "MULTIPLE SUBJECTS IN FIELD.", "ADDITIONAL PRESENCE LOGGED."],
+        dormant: ["SUBJECT INACTIVE. WATCH MAINTAINED.", "LOW POWER. STILL OBSERVING.", "NO INPUT. PERIMETER HELD."],
+        typing:  ["CREDENTIAL STREAM OPEN.", "INPUT DETECTED. READING.", "AWAITING VERIFICATION."],
+        deny1:   ["CREDENTIAL REJECTED.", "MISMATCH. ACCESS DENIED.", "IDENTITY NOT CONFIRMED."],
+        deny2:   ["SECOND FAILURE. ESCALATING.", "REPEATED MISMATCH. WARNING.", "ACCESS DENIED. PATTERN NOTED."],
+        deny3:   ["HOSTILE ATTEMPT LOGGED.", "SUBJECT FLAGGED. LOCKDOWN HELD.", "INTRUSION PATTERN RECORDED."],
+        grant:   ["IDENTITY CONFIRMED. STAND DOWN.", "ACCESS GRANTED. WELCOME BACK.", "OWNER VERIFIED. RELEASING CONSOLE."]
+    })
+    property var _lastPick: ({})
+
+    function say(key) {
+        const pool = lines[key] || [];
+        if (pool.length === 0) return;
+        let i = Math.floor(Math.random() * pool.length);
+        if (pool.length > 1 && pool[i] === _lastPick[key]) i = (i + 1) % pool.length;
+        _lastPick[key] = pool[i];
+        message = pool[i];
+        messageKey = key;
+        messageSerial++;
+    }
+
+    FileView {
+        id: voiceFile
+        path: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/ares-lock/voice.json"
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: {
+            try {
+                const d = JSON.parse(text());
+                const merged = Object.assign({}, ctx.lines);
+                for (const k in d.lines)
+                    if (Array.isArray(d.lines[k]) && d.lines[k].length > 0) merged[k] = d.lines[k];
+                ctx.lines = merged;
+                ctx.voiceSource = d.source || "builtin";
+            } catch (e) {
+                // Malformed cache: keep the built-in lines.
+            }
+        }
+    }
+
+    // ---------- Optical presence ----------
+    function faceSeen(now) { return camSeenAt > 0 && now - camSeenAt < 900; }
+
+    function _num(v, lo, hi) {
+        return (typeof v === "number" && isFinite(v)) ? Math.max(lo, Math.min(hi, v)) : 0;
+    }
+
+    // One line from ares-presence (or the preview IPC). Malformed lines are ignored.
+    function presenceLine(line, simulated) {
+        if (camSimulated !== !!simulated) return;
+        let d;
+        try { d = JSON.parse(line); } catch (e) { return; }
+        if (!d || typeof d !== "object" || typeof d.st !== "string") return;
+        if (d.st !== "ok") {
+            camState = ["start", "nocam", "lost", "disabled", "nomodel"].indexOf(d.st) >= 0 ? d.st : "off";
+            camN = 0;
+            return;
+        }
+        camState = "ok";
+        const now = Date.now();
+        const n = Math.round(_num(d.n, 0, 9));
+        if (n > 0) {
+            camYaw = _num(d.yaw, -1.2, 1.2);
+            camPitch = _num(d.pitch, -1, 1);
+            camNear = _num(d.near, -1, 1);
+            camOthers = Array.isArray(d.others)
+                ? d.others.filter(v => typeof v === "number" && isFinite(v)).slice(0, 3).map(v => _num(v, -1.2, 1.2))
+                : [];
+            if (_camDeparted) _arrive(now);
+            if (n >= 2 && camN < 2 && now - _lastMultiSay > 20000 && (state === "watch" || state === "dormant")) {
+                _lastMultiSay = now;
+                say("multiple");
+            }
+            camSeenAt = now;
+        } else {
+            camOthers = [];
+        }
+        camN = n;
+        camMotion = _num(d.motion, 0, 1);
+        if (typeof d.myaw === "number" && isFinite(d.myaw)) {
+            camMotionYaw = _num(d.myaw, -1.2, 1.2);
+            camMotionAt = now;
+        }
+    }
+
+    function _arrive(now) {
+        _camDeparted = false;
+        camTrackStart = now;
+        camHoldMs = 5000 + Math.random() * 4000;
+        if (state === "dormant") state = "watch";
+        if (state === "watch" && now - _lastPresenceSay > 4000) { _lastPresenceSay = now; say("arrive"); }
+        arrived();
+    }
+
+    function cameraStart() {
+        if (cameraEnabled && state !== "granted" && !presence.running) presence.running = true;
+    }
+
+    Process {
+        id: presence
+        command: [(Quickshell.env("HOME") || "{{ .chezmoi.homeDir }}") + "/.local/bin/ares-presence"]
+        stdinEnabled: true          // a pipe: the helper exits when this client goes away
+        stdout: SplitParser { onRead: data => ctx.presenceLine(data, false) }
+        onExited: (code, status) => {
+            if (ctx.camState !== "disabled" && ctx.camState !== "nomodel" && ctx.state !== "granted") {
+                if (ctx.camState !== "nocam") ctx.camState = "off";
+                camRetry.restart();
+            }
+        }
+    }
+    // Retry: a crashed helper or a camera plugged in after the lock started.
+    Timer { id: camRetry; interval: 20000; onTriggered: ctx.cameraStart() }
+
+    // ---------- Input ----------
+    function pointerMoved(gx, gy) {
+        const now = Date.now();
+        if (pointerValid) {
+            const dt = Math.max(1, now - lastPointer);
+            const v = Math.hypot(gx - pointerX, gy - pointerY) / dt * 1000;
+            pointerSpeed = pointerSpeed * 0.8 + v * 0.2;
+        }
+        const wasStill = now - lastInput > 8000;
+        pointerX = gx; pointerY = gy; pointerValid = true;
+        lastPointer = now;
+        lastInput = now;
+        if (state === "dormant") { state = "watch"; say("watch"); }
+        else if (state === "watch" && wasStill) say("watch");
+    }
+
+    function _updateCaps(text, shift) {
+        if (/^[a-zA-Z]$/.test(text)) {
+            const upper = text === text.toUpperCase();
+            caps = upper !== shift;
+        }
+    }
+
+    function handleKey(event) {
+        if (state === "checking" || state === "granted") { event.accepted = true; return; }
+        const now = Date.now();
+        lastInput = now;
+        const k = event.key;
+        if (k === Qt.Key_Return || k === Qt.Key_Enter) {
+            submit();
+        } else if (k === Qt.Key_Escape) {
+            buffer = ""; keyCount = 0;
+            keystroke(true);
+        } else if (k === Qt.Key_Backspace) {
+            if (buffer.length > 0) buffer = buffer.slice(0, -1);
+            lastKey = now;
+            keystroke(true);
+        } else if (k === Qt.Key_CapsLock) {
+            caps = !caps;
+        } else if (event.text.length > 0 && event.text.charCodeAt(0) >= 32) {
+            _updateCaps(event.text, (event.modifiers & Qt.ShiftModifier) !== 0);
+            const wasTyping = state === "typing";
+            buffer += event.text;
+            keyCount++;
+            lastKey = now;
+            if (state !== "denied") state = "typing";
+            if (!wasTyping && state === "typing") say("typing");
+            keystroke(false);
+        }
+        event.accepted = true;
+    }
+
+    // Preview IPC path (preview.qml only); identical effect to a printable keystroke.
+    function feedChar(ch) {
+        if (!preview || state === "checking" || state === "granted") return;
+        const wasTyping = state === "typing";
+        buffer += ch; keyCount++;
+        lastKey = Date.now(); lastInput = lastKey;
+        if (state !== "denied") state = "typing";
+        if (!wasTyping && state === "typing") say("typing");
+        keystroke(false);
+    }
+
+    function submit() {
+        if (buffer.length === 0 || state === "checking" || state === "granted") return;
+        state = "checking";
+        if (preview) {
+            fakeAuth.start();
+        } else if (!pam.start()) {
+            _deny();
+        }
+    }
+
+    // ---------- Office lights ----------
+    // ares-hue-alert tells Home Assistant to turn the office Hue lights red on each denial and sends clear on
+    // the correct password; HA keeps them red until that clear arrives (8 h safety restore). Fire-and-forget: it gets only the word deny/clear, never the buffer, and nothing in
+    // authentication waits on it. The launcher also sends clear when its hyprlock fallback unlocks.
+    // Off in the preview unless ARES_HUE_PREVIEW=1, so harness runs do not flash the room.
+    readonly property bool hueAlert: !preview || Quickshell.env("ARES_HUE_PREVIEW") === "1"
+    function _hue(ev) {
+        if (!hueAlert) return;
+        Quickshell.execDetached([(Quickshell.env("HOME") || "{{ .chezmoi.homeDir }}") + "/.local/bin/ares-hue-alert", ev]);
+        // USW Pro HD 24 Etherlighting follows the office lights: blood red until the correct password.
+        Quickshell.execDetached([(Quickshell.env("HOME") || "{{ .chezmoi.homeDir }}") + "/.local/bin/ares-switch-alert", ev]);
+    }
+    // Case RGB follows Ares itself: red while redAlert holds (2 min after the last denial), restored when it ends
+    // (hold expiry or the correct password). ares-rgb-alert saves and restores the exact OpenRGB colours.
+    function _rgb(ev) {
+        if (!hueAlert) return;
+        Quickshell.execDetached([(Quickshell.env("HOME") || "{{ .chezmoi.homeDir }}") + "/.local/bin/ares-rgb-alert", ev]);
+    }
+    onRedAlertChanged: _rgb(redAlert ? "deny" : "clear")
+    onStateChanged: {
+        if (state === "granted" && presence.running) presence.running = false;   // camera off on grant
+    }
+
+    function _deny() {
+        _hue("deny");
+        failures++;
+        buffer = ""; keyCount = 0;
+        state = "denied";
+        say(failures >= 3 ? "deny3" : failures === 2 ? "deny2" : "deny1");
+        denied(failures);
+        denyHold.restart();
+        redAlert = true;
+        alertHold.restart();
+    }
+
+    function _grant() {
+        _hue("clear");                       // a valid login overrides the red: HA restores the lights at once
+        redAlert = false;
+        alertHold.stop();
+        buffer = "";
+        state = "granted";
+        say("grant");
+        granted();
+        grantHold.start();
+    }
+
+    PamContext {
+        id: pam
+        config: "hyprlock"          // reuse /etc/pam.d/hyprlock (auth include login)
+        onPamMessage: {
+            if (responseRequired) respond(ctx.buffer);
+        }
+        onCompleted: result => {
+            if (result === PamResult.Success) ctx._grant();
+            else ctx._deny();
+        }
+        onError: err => ctx._deny()
+    }
+
+    // Preview-only authenticator. Never active in the real lock (preview is a literal false in shell.qml).
+    Timer {
+        id: fakeAuth
+        interval: 650
+        onTriggered: {
+            if (!ctx.preview) { ctx._deny(); return; }
+            if (ctx.buffer === ctx.previewPassword) ctx._grant(); else ctx._deny();
+        }
+    }
+
+    Timer {
+        id: denyHold
+        interval: 1700
+        onTriggered: if (ctx.state === "denied") ctx.state = "watch"
+    }
+    Timer {
+        id: alertHold
+        interval: 120000
+        onTriggered: ctx.redAlert = false
+    }
+
+    Timer {
+        id: grantHold
+        interval: 950
+        onTriggered: {
+            if (ctx.preview) { resetPreview.start(); return; }
+            ctx.unlockRequested();
+        }
+    }
+    Timer {
+        id: resetPreview
+        interval: 2600
+        onTriggered: { ctx.state = "watch"; ctx.failures = 0; ctx.redAlert = false; ctx.say("greet"); }
+    }
+
+    // Typing lapses back to watching; long stillness becomes dormant (dimmer, OLED-friendly).
+    Timer {
+        interval: 1000; running: true; repeat: true
+        onTriggered: {
+            const now = Date.now();
+            ctx.pointerSpeed *= 0.5;
+            if (ctx.state === "typing" && ctx.buffer.length === 0 && now - ctx.lastKey > 5000) ctx.state = "watch";
+            // Someone in view keeps Ares awake; dormancy needs no input and nobody seen for a minute.
+            const seenRecently = ctx.camSeenAt > 0 && now - ctx.camSeenAt < 60000;
+            if (ctx.state === "watch" && now - ctx.lastInput > 60000 && !seenRecently) { ctx.state = "dormant"; ctx.say("dormant"); }
+            // Departure: nobody seen for the whole (randomised) concealment hold.
+            if (!ctx._camDeparted && ctx.camSeenAt > 0 && now - ctx.camSeenAt > ctx.camHoldMs) {
+                ctx._camDeparted = true;
+                if (ctx.state === "watch" && now - ctx._lastPresenceSay > 4000) { ctx._lastPresenceSay = now; ctx.say("depart"); }
+            }
+        }
+    }
+
+    Component.onCompleted: { say("greet"); cameraStart(); }
+}

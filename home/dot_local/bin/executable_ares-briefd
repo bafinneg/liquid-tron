@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+"""ares-briefd: the Return Brief daemon (FEAT-lt32).
+
+Detects an absence (the Ares lock, a logind LockedHint, or the `gaming` system mode), and when Brian returns after
+at least ARES_BRIEFD_MIN_AWAY_S (default 1200 s) it counts what happened in the window, writes
+$XDG_RUNTIME_DIR/ares/brief.json and opens the `liquidtron/ares:brief` panel.
+
+Sources:
+  - ~/.local/state/ares/history.json   24 h ring written by ares-presence-hub (waiting requests, activity; counts only)
+  - ~/.hermes/tasks/*/state.json       finished / blocked / partial, their timestamps, titles and Conversation ids
+  - Noctalia notification_history.json entries received in the window (time, summary, app)
+  - $XDG_RUNTIME_DIR/ares/presence.json requests still open at the return (and their chat titles). WAITING ON YOU
+                                       counts only these; requests closed during the absence become a plain
+                                       note, and a later presence change drops answered ones from brief.json
+  - nvidia-smi                         GPU temperature, sampled once a minute only while an absence is open
+
+Each row carries up to MAX_ITEMS detail items (owner round 3: a click expands the row and offers a way to go there).
+The items stay in brief.json (0600, tmpfs). The one-line sentence comes from a local Ollama model asked with integers
+only (10 s timeout; no title, summary or id ever reaches the prompt), with a fixed template as fallback.
+Nothing here touches hypridle, hyprlock or the Ares lock: it only watches their files.
+
+Idle behaviour: blocked in select() on an inotify fd and a `gdbus monitor` pipe; no timer unless an absence is open.
+"""
+import argparse
+import ctypes
+import datetime
+import glob
+import json
+import os
+import re
+import select
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+MIN_AWAY_S = 1200
+WINDOW_POINTS = 60
+SAMPLE_S = 60
+OLLAMA_TIMEOUT_S = 10
+OLLAMA_MODEL = "qwen2.5:7b-instruct"
+MAX_SENTENCE = 120
+PROMPT_KEYS = ("minutes_away", "done", "waiting_on_you", "failed", "notifications")
+MAX_ITEMS = 6
+MAX_TEXT = 90
+MAX_DETAIL = 240
+MAX_CODE = 160
+_SESSION_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+SYSTEM_PROMPT = (
+    "You write one short status sentence for a desktop dashboard from integer counts. Reply with a single line in "
+    "plain English, at most 100 characters, no quotes, no markdown. Use only the numbers given. Do not invent "
+    "details."
+)
+
+
+def env(name, default):
+    return os.environ.get(name) or default
+
+
+def paths():
+    runtime = env("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    state = env("XDG_STATE_HOME", os.path.join(HOME, ".local/state"))
+    return {
+        "runtime": env("ARES_BRIEFD_RUNTIME", os.path.join(runtime, "ares")),
+        "lockdir": env("ARES_BRIEFD_LOCKDIR", os.path.join(runtime, "ares-lock")),
+        "modefile": env("ARES_BRIEFD_MODEFILE", os.path.join(state, "system-mode")),
+        "history": env("ARES_HISTORY", os.path.join(state, "ares", "history.json")),
+        "tasks": env("ARES_BRIEFD_TASKS", os.path.join(HOME, ".hermes/tasks")),
+        "notifs": env("ARES_BRIEFD_NOTIFS", os.path.join(state, "noctalia-primary/noctalia/notification_history.json")),
+        "state": env("ARES_BRIEFD_STATE", os.path.join(state, "ares", "briefd.json")),
+        "msg": env("ARES_BRIEFD_MSG", os.path.join(HOME, ".local/bin/noctalia-primary-msg")),
+        "summon": env("ARES_BRIEFD_SUMMON", os.path.join(HOME, ".local/bin/ares-summon")),
+        "ollama": env("ARES_BRIEFD_OLLAMA_URL", "http://127.0.0.1:11436/api/chat"),
+    }
+
+
+# ------------------------------------------------------------------ pure computation
+
+def _int(v, default=0):
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+
+
+def fmt_away(minutes):
+    h, m = divmod(max(0, int(minutes)), 60)
+    return "%d H %d MIN" % (h, m) if h else "%d MIN" % m
+
+
+def parse_local_ts(text):
+    """'2026-10-19T16:35:19' (task-state local time) -> epoch ms, or None."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return int(datetime.datetime.fromisoformat(text[:19]).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def bin_series(times_ms, start_ms, end_ms, weights=None, points=WINDOW_POINTS):
+    """Counts per window slice, normalised to 0..1 (all zero stays zero)."""
+    span = max(1, end_ms - start_ms)
+    raw = [0.0] * points
+    for i, t in enumerate(times_ms):
+        if start_ms <= t <= end_ms:
+            idx = min(points - 1, int((t - start_ms) * points / span))
+            raw[idx] += weights[i] if weights else 1
+    top = max(raw) or 1
+    return [round(x / top, 3) for x in raw]
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def clip(text, n):
+    """One display line: whitespace collapsed, at most n characters."""
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= n else t[:n - 1].rstrip() + "\u2026"
+
+
+
+# Owner round 7: item text is shown as rich prose (a proportional face, title over body), never as a raw log line.
+# These helpers turn notification/summary text into clean sentences; only a command body stays verbatim (code).
+_SLUG = re.compile(r"^[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+$")
+_ACRONYMS = {"ai", "ha", "gpu", "cpu", "vlan", "ui", "ux", "hq", "nas", "rgb", "ups", "ssh", "stt", "tts"}
+_CODE = re.compile(r"^(cd|sudo|docker|git|ssh|scp|rsync|curl|python3?|bash|sh|nmcli|\./)(\s|$)")
+_NOTE_KINDS = (  # summary prefix -> (eyebrow, tone, glyph); None eyebrow = the matched prefix in upper case
+    (r"done", "DONE", "done", "circle-check"),
+    (r"started", "STARTED", "info", "player-play"),
+    (r"resumed", "RESUMED", "info", "player-play"),
+    (r"budget \d+%", None, "info", "gauge"),
+    (r"approve|approval needed", "APPROVAL NEEDED", "amber", "hand-stop"),
+    (r"input needed", "INPUT NEEDED", "amber", "hand-stop"),
+    (r"blocked|failed|error", "FAILED", "error", "alert-triangle"),
+)
+
+
+def sentence_start(t):
+    return t[:1].upper() + t[1:] if t else t
+
+
+def is_code(text):
+    t = str(text or "").strip()
+    return bool(t) and (bool(_CODE.match(t)) or (t.count(";") >= 2 and "$" in t))
+
+
+def prose(text, n=MAX_DETAIL):
+    """Readable prose: markdown markers, tables, headings and bullets removed, ASCII arrows typeset, cut at a
+    sentence end (a word end plus an ellipsis only when one sentence is longer than n)."""
+    lines = []
+    for ln in str(text or "").splitlines():
+        s = ln.strip()
+        if not s or s.startswith("|") or s.startswith("```") or re.match(r"^[-=*_]{3,}$", s):
+            continue
+        s = re.sub(r"^#{1,6}\s+", "", s)
+        s = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", s)
+        lines.append(s)
+    t = " ".join(" ".join(lines).split())
+    t = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: m.group(1) or m.group(2), t)
+    t = re.sub(r"`([^`]*)`", r"\1", t).replace("`", "").replace("**", "")
+    t = re.sub(r"\[([^\]]+)\]\([^)\s]+\)", r"\1", t)
+    t = t.replace(" -> ", " \u2192 ").replace(" <- ", " \u2190 ").replace(" => ", " \u2192 ")
+    if len(t) <= n:
+        return t
+    cut = t[:n]
+    end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+    if end >= n // 3:
+        return cut[:end + 1]
+    sp = cut.rfind(" ")
+    return (cut[:sp] if sp > 0 else cut[:n - 1]).rstrip(",;:") + "\u2026"
+
+
+def detail_fields(body):
+    """{'detail'[, 'code']} for a body: a command stays verbatim and is shown as code; anything else is prose."""
+    if is_code(body):
+        t = " ".join(str(body).split())
+        return {"detail": t if len(t) <= MAX_CODE else t[:MAX_CODE - 1] + "\u2026", "code": True}
+    p = prose(body)
+    return {"detail": p} if p else {}
+
+
+def note_head(summary, app):
+    """(title, eyebrow, tone, glyph) for a notification summary such as 'done: camera VLAN correction'."""
+    s = " ".join(str(summary or "").split())
+    for pat, eyebrow, tone, glyph in _NOTE_KINDS:
+        m = re.match(r"^(%s)\s*(?::|\u2014|\u2013| - )\s*(.+)$" % pat, s, re.I)
+        if m:
+            return sentence_start(m.group(2)), (eyebrow or m.group(1).upper()), tone, glyph
+    if re.search(r"\b(done|complete|finished)$", s, re.I):
+        return s, (app or "NOTICE").upper(), "done", "circle-check"
+    return sentence_start(s), (app or "NOTICE").upper(), "info", "message-chatbot" if app == "Hermes" else "bell"
+
+
+def spec_title(spec):
+    """The human half of a spec H1 ('# FEAT-lt32: Return Brief, ...' -> 'Return Brief, ...')."""
+    if not isinstance(spec, str) or spec in ("", "None"):
+        return None
+    root = os.path.join(HOME, "home-infra")
+    cands = [spec if os.path.isabs(spec) else os.path.join(root, spec)]
+    cands += glob.glob(os.path.join(root, "specs", "*", os.path.basename(spec)))
+    for path in cands:
+        try:
+            with open(path, encoding="utf-8") as f:
+                for ln in f:
+                    if ln.startswith("# "):
+                        h = ln[2:].strip()
+                        return h.split(": ", 1)[1] if ": " in h else h
+        except OSError:
+            continue
+    return None
+
+
+def human_title(d):
+    """A task's title as a phrase: the spec heading, or a slug ('FEAT-lt34-map-and-carousel') spelt out."""
+    t = " ".join(str(d.get("title") or d.get("id") or "untitled task").split())
+    st = spec_title(d.get("spec"))
+    if st:
+        return st
+    head, _sp, rest = t.partition(" ")
+    if rest and _SLUG.match(head) and re.match(r"^(FEAT|INFRA|FIX|SPEC)-", head, re.I):
+        return human_title({"title": head}) + " " + rest   # 'FEAT-ares-bar-ai-clients C5 ...' -> 'Ares bar ai clients C5 ...'
+    if not _SLUG.match(t):
+        return t
+    words = []
+    for w in re.split(r"[-_]", t):
+        if w.upper() in ("FEAT", "INFRA", "FIX", "SPEC") or re.match(r"^lt\d+$", w, re.I):
+            continue
+        keep = (w.isupper() and len(w) <= 4) or any(c.isdigit() for c in w)
+        if w.lower() in _ACRONYMS:
+            words.append(w.upper())
+        else:
+            words.append(w if keep else w.lower())
+    return sentence_start(" ".join(words)) if words else t
+
+
+def task_tag(d):
+    ref = d.get("ref")
+    if isinstance(ref, str) and re.match(r"^HQ-\d+$", ref):
+        return ref
+    m = re.search(r"\b(lt\d+)\b", str(d.get("title") or ""), re.I)
+    return m.group(1).upper() if m else "TASK"
+
+
+def hhmm(ms):
+    return time.strftime("%H:%M", time.localtime(ms / 1000))
+
+
+def session_of(d):
+    """The task's newest Conversation id when it is safe to hand to `ares-summon --hermes`, else None."""
+    ids = d.get("session_ids") if isinstance(d.get("session_ids"), list) else []
+    for sid in reversed(ids):
+        if isinstance(sid, str) and _SESSION_ID.match(sid):
+            return sid
+    return None
+
+
+def task_items(tasks_dir, start_ms, end_ms):
+    """(done, failed): [(epoch ms, item)] of tasks finished / blocked-or-partial inside the window, oldest first."""
+    done, failed = [], []
+    for f in glob.glob(os.path.join(tasks_dir, "*", "state.json")):
+        try:
+            mtime = int(os.stat(f).st_mtime * 1000)
+        except OSError:
+            continue
+        if mtime < start_ms - 3600_000:
+            continue                                    # untouched long before the window: cannot be in it
+        d = read_json(f)
+        if not isinstance(d, dict):
+            continue
+        status = d.get("status")
+        fin = parse_local_ts(d.get("finished"))
+        title = clip(human_title(d), MAX_TEXT)
+        if status == "done" and fin is not None and start_ms <= fin <= end_ms:
+            item = {"text": title, "meta": hhmm(fin), "session": session_of(d), "source": task_tag(d),
+                    "tone": "done", "icon": "circle-check"}
+            item.update(detail_fields(d.get("last_validate_summary")))
+            done.append((fin, item))
+        elif status in ("blocked", "partial") and start_ms <= mtime <= end_ms:
+            item = {"text": title, "meta": hhmm(mtime), "session": session_of(d),
+                    "source": "%s \u00b7 %s" % (status.upper(), task_tag(d)), "tone": "error", "icon": "alert-triangle"}
+            item.update(detail_fields(d.get("blocked_reason")))
+            failed.append((mtime, item))
+    return sorted(done, key=lambda x: x[0]), sorted(failed, key=lambda x: x[0])
+
+
+def task_events(tasks_dir, start_ms, end_ms):
+    """(finished_times, failed_times): epoch ms of tasks finished / blocked-or-partial inside the window."""
+    done, failed = task_items(tasks_dir, start_ms, end_ms)
+    return [t for t, _i in done], [t for t, _i in failed]
+
+
+def notification_items(path, start_ms, end_ms):
+    """[(epoch ms, item)] of notifications received inside the window, oldest first."""
+    d = read_json(path)
+    out = []
+    for e in (d or {}).get("entries") or []:
+        n = e.get("notification") if isinstance(e, dict) else None
+        t = _int(n.get("received_wall_ms")) if isinstance(n, dict) else 0
+        if start_ms <= t <= end_ms:
+            app = clip(n.get("app_name"), 24)
+            app = "" if app == "notify-send" else app
+            title, eyebrow, tone, glyph = note_head(n.get("summary") or app or "Notification", app)
+            item = {"text": clip(title, MAX_TEXT), "meta": hhmm(t), "source": eyebrow, "tone": tone, "icon": glyph}
+            item.update(detail_fields(n.get("body")))
+            out.append((t, item))
+    return sorted(out, key=lambda x: x[0])
+
+
+def notification_times(path, start_ms, end_ms):
+    return [t for t, _i in notification_items(path, start_ms, end_ms)]
+
+
+def open_request_items(presence):
+    """Requests still open at the return, each with its chat title and Conversation id."""
+    if not isinstance(presence, dict):
+        return []
+    titles = {c.get("id"): c.get("title") for c in presence.get("chats") or [] if isinstance(c, dict)}
+    out = []
+    for r in presence.get("requests") or []:
+        if not isinstance(r, dict):
+            continue
+        sid = r.get("session_id") if isinstance(r.get("session_id"), str) else ""
+        opened = _int(r.get("opened_ms"))
+        rid = r.get("request_id") if isinstance(r.get("request_id"), str) else ""
+        kind = clip(r.get("kind") or "request", 24)
+        out.append({"text": clip(titles.get(sid) or "Hermes Conversation " + sid[-6:], MAX_TEXT),
+                    "meta": hhmm(opened) if opened else "", "source": kind.upper(), "tone": "amber", "icon": "hand-stop",
+                    "detail": "Hermes is waiting for your %s." % ("approval" if "approv" in kind.lower() else "answer"),
+                    "session": sid if _SESSION_ID.match(sid) else None, "rid": rid})
+    return out
+
+
+def answered_item(n):
+    """The plain line for requests that opened and closed during the absence: history, not a call to action."""
+    return {"text": "Nothing is waiting on you",
+            "detail": "%d request%s opened and closed while you were away." % (n, "" if n == 1 else "s"),
+            "meta": "", "source": "ANSWERED", "tone": "info", "icon": "checks"}
+
+
+def waiting_row(open_items, answered, series):
+    """WAITING ON YOU counts only requests still open; amber (and the panel's NEEDS YOU chip) only then.
+
+    Owner send-back: the row used to add up every request seen in the window, so two requests answered before the
+    return showed 'WAITING ON YOU 2 / NEEDS YOU' over an empty list. Closed ones are now a non-amber note."""
+    n = len(open_items)
+    items = open_items[:MAX_ITEMS]
+    if answered > 0 and len(items) < MAX_ITEMS:
+        items = items + [answered_item(answered)]
+    return {"id": "waiting", "label": "WAITING ON YOU", "n": n, "amber": n > 0, "series": series,
+            "items": items, "more": max(0, n - MAX_ITEMS), "answered": answered}
+
+
+def open_rids_of(brief):
+    """Request ids a brief's WAITING ON YOU row lists as still open."""
+    out = set()
+    for r in brief.get("rows") or []:
+        if isinstance(r, dict) and r.get("id") == "waiting":
+            out |= {i["rid"] for i in r.get("items") or [] if isinstance(i, dict) and i.get("rid")}
+    return out
+
+
+def newest(items, cap=MAX_ITEMS):
+    """[(t, item)] -> (newest-first items capped at `cap`, how many more were left out)."""
+    picked = [i for _t, i in sorted(items, key=lambda x: x[0], reverse=True)]
+    return picked[:cap], max(0, len(picked) - cap)
+
+
+def ring_window(history_path, start_ms, end_ms):
+    d = read_json(history_path)
+    out = []
+    for b in (d or {}).get("buckets") or []:
+        if isinstance(b, dict) and start_ms - 60_000 < _int(b.get("t")) <= end_ms:
+            out.append({k: _int(b.get(k)) for k in ("t", "act", "wait", "req", "tools")})
+    return out
+
+
+def compute_brief(start_ms, end_ms, reason, p, gpu_samples, open_requests=0, presence=None):
+    """The brief document: counts, 60-point series and, per row, up to MAX_ITEMS detail items (newest first)."""
+    done_i, failed_i = task_items(p["tasks"], start_ms, end_ms)
+    done_t, failed_t = [t for t, _i in done_i], [t for t, _i in failed_i]
+    notif_i = notification_items(p["notifs"], start_ms, end_ms)
+    notif_t = [t for t, _i in notif_i]
+    ring = ring_window(p["history"], start_ms, end_ms)
+    req_items = open_request_items(presence)
+    opened_in_window = sum(b["req"] for b in ring)
+    waiting = len(req_items)                                  # still open at the return: the only thing to act on
+    answered = max(0, opened_in_window - waiting)
+    wait_series = bin_series([b["t"] for b in ring], start_ms, end_ms, [b["req"] or (1 if b["wait"] else 0) for b in ring])
+    gpu_t = [t for t, _c in gpu_samples]
+    gpu_max = max([c for _t, c in gpu_samples], default=None)
+    sys_series = bin_series(gpu_t, start_ms, end_ms, [max(0, c) for _t, c in gpu_samples]) if gpu_samples else [0.0] * WINDOW_POINTS
+    minutes = max(0, int((end_ms - start_ms) // 60_000))
+    counts = {"done": len(done_t), "waiting": waiting, "failed": len(failed_t), "notifications": len(notif_t)}
+    done_items, done_more = newest(done_i)
+    failed_items, failed_more = newest(failed_i)
+    notif_items, notif_more = newest(notif_i)
+    rows = [
+        {"id": "done", "label": "DONE", "n": counts["done"], "series": bin_series(done_t, start_ms, end_ms),
+         "items": done_items, "more": done_more},
+        waiting_row(req_items, answered, wait_series),
+        {"id": "failed", "label": "FAILED", "n": counts["failed"], "series": bin_series(failed_t, start_ms, end_ms),
+         "items": failed_items, "more": failed_more},
+        {"id": "notifications", "label": "NOTIFICATIONS", "n": counts["notifications"],
+         "series": bin_series(notif_t, start_ms, end_ms), "items": notif_items, "more": notif_more},
+    ]
+    if gpu_max is not None:
+        peak_t = max(gpu_samples, key=lambda s: s[1])[0]
+        avg = round(sum(c for _t, c in gpu_samples) / len(gpu_samples))
+        rows.append({"id": "system", "label": "SYSTEM // GPU MAX %d C" % gpu_max, "n": None, "series": sys_series,
+                     "items": [{"text": "GPU peaked at %d \u00b0C" % gpu_max, "meta": hhmm(peak_t), "source": "GPU PEAK",
+                                "tone": "info", "icon": "temperature"},
+                               {"text": "GPU averaged %d \u00b0C" % avg, "meta": "", "source": "GPU AVERAGE",
+                                "tone": "info", "icon": "gauge",
+                                "detail": "Across %d sample%s while you were away." % (len(gpu_samples),
+                                                                                      "" if len(gpu_samples) == 1 else "s")}],
+                     "more": 0})
+    return {"v": 2, "start_ms": start_ms, "end_ms": end_ms, "minutes": minutes, "reason": reason,
+            "title": "WHILE YOU WERE AWAY // " + fmt_away(minutes), "counts": counts, "gpu_max_c": gpu_max,
+            "rows": rows, "sentence": template_sentence(counts), "sentence_src": "template"}
+
+
+# ------------------------------------------------------------------ phrasing
+
+def template_sentence(counts):
+    parts = []
+    parts.append("%d DONE" % counts["done"] if counts["done"] else "NOTHING DONE")
+    if counts["waiting"]:
+        parts.append("%d WAITING ON YOU" % counts["waiting"])
+    parts.append("%d FAILED" % counts["failed"] if counts["failed"] else "NOTHING FAILED")
+    return ", ".join(parts) + "."
+
+
+def prompt_payload(brief):
+    """Integers only. This is the single place the model prompt is built: no title, summary, body, path or id."""
+    c = brief["counts"]
+    return {"minutes_away": _int(brief["minutes"]), "done": _int(c["done"]), "waiting_on_you": _int(c["waiting"]),
+            "failed": _int(c["failed"]), "notifications": _int(c["notifications"])}
+
+
+def build_request(brief):
+    payload = prompt_payload(brief)
+    assert tuple(payload) == PROMPT_KEYS and all(isinstance(v, int) for v in payload.values())
+    return {"model": OLLAMA_MODEL, "stream": False, "think": False,
+            "options": {"temperature": 0.2, "num_predict": 48},
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                         {"role": "user", "content": json.dumps(payload, separators=(",", ":"))}]}
+
+
+_OK_CHARS = re.compile(r"^[A-Z0-9 ,.'/:;!?-]+$")
+
+
+def clean_reply(text, brief):
+    """The sentence uppercased, or None when it does not meet the contract."""
+    if not isinstance(text, str):
+        return None
+    line = text.strip()
+    if not line or "\n" in line:
+        return None
+    line = line.strip("\"' ").upper()
+    if len(line) > MAX_SENTENCE or not _OK_CHARS.match(line):
+        return None
+    allowed = {str(v) for v in prompt_payload(brief).values()}
+    allowed |= {str(brief["minutes"] // 60), str(brief["minutes"] % 60)}
+    if any(n not in allowed for n in re.findall(r"\d+", line)):
+        return None
+    if re.search(r"\b(GPUS?|TEMP\w*|CAPACITY|C)\b", line):          # the SYSTEM row owns temperatures
+        return None
+    return line
+
+
+def ollama_sentence(brief, url, timeout=OLLAMA_TIMEOUT_S, opener=None):
+    body = json.dumps(build_request(brief)).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=timeout) as r:
+            content = json.loads(r.read())["message"]["content"]
+    except Exception:
+        return None
+    return clean_reply(content, brief)
+
+
+# ------------------------------------------------------------------ file output
+
+def write_atomic(path, data):
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".brief-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ------------------------------------------------------------------ lock / mode detection
+
+LOCK_LINE = re.compile(r"ares: start")
+UNLOCK_LINE = re.compile(r"ares: unlocked by PAM|hyprlock fallback: exited rc=0")
+
+
+def lock_log_state(lockdir):
+    """True when the newest relevant lock.log line is a start, False when it is an unlock, None if no signal."""
+    try:
+        with open(os.path.join(lockdir, "lock.log"), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 8192))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if UNLOCK_LINE.search(line):
+            return False
+        if LOCK_LINE.search(line):
+            return True
+    return None
+
+
+def lock_started_ms(lockdir):
+    """Epoch ms of the newest 'ares: start' line in lock.log (local time stamp), or None."""
+    try:
+        with open(os.path.join(lockdir, "lock.log"), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 8192))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if UNLOCK_LINE.search(line):
+            return None
+        if LOCK_LINE.search(line):
+            try:
+                return int(datetime.datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+            except ValueError:
+                return None
+    return None
+
+
+def locker_alive(proc="/proc"):
+    """True while hyprlock or the Ares Quickshell locker is running (a crash must not leave 'locked' forever)."""
+    for d in glob.glob(proc + "/[0-9]*/cmdline"):
+        try:
+            with open(d, "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if not argv or not argv[0]:
+            continue
+        exe = os.path.basename(argv[0].decode("utf-8", "replace"))
+        if exe == "hyprlock":
+            return True
+        if exe in ("qs", "quickshell") and b"ares-lock" in argv:
+            return True
+    return False
+
+
+def read_mode(modefile):
+    try:
+        with open(modefile) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# ------------------------------------------------------------------ the daemon
+
+class Briefd:
+    def __init__(self, p, min_away_s=MIN_AWAY_S, clock=None, gpu=None, sentence=None, deliver=None, alive=locker_alive):
+        self.p = p
+        self.min_away_ms = int(min_away_s * 1000)
+        self.clock = clock or (lambda: int(time.time() * 1000))
+        self.gpu = gpu or read_gpu_temp
+        self.sentence = sentence or (lambda brief: ollama_sentence(brief, p["ollama"]))
+        self.deliver = deliver or self._open_panel
+        self.alive = alive
+        self.file_locked = False
+        self.hint_locked = False
+        self.gaming = False
+        self.away_start = None
+        self.reason = ""
+        self.gpu_samples = []
+        self.shown = []                       # briefs delivered (tests and logs)
+        self.open_rids = self._brief_open_rids()   # request ids the last brief lists as still open
+        self._load()
+
+    # state persisted so a restart mid-absence keeps the window
+    def _load(self):
+        d = read_json(self.p["state"])
+        if isinstance(d, dict) and isinstance(d.get("away_start"), int):
+            self.away_start = d["away_start"]
+            self.reason = str(d.get("reason") or "lock")
+            self.gpu_samples = [(int(t), int(c)) for t, c in d.get("gpu") or []][-120:]
+        self.gaming = read_mode(self.p["modefile"]) == "gaming"
+        self.file_locked = bool(lock_log_state(self.p["lockdir"])) and self.alive()
+        if self.away_start is None:
+            self._maybe_start()
+        elif not self.is_away():
+            self.finish()
+
+    def _save(self):
+        try:
+            write_atomic(self.p["state"], json.dumps({"away_start": self.away_start, "reason": self.reason,
+                                                       "gpu": self.gpu_samples[-120:]}))
+        except OSError:
+            pass
+
+    def is_away(self):
+        return self.file_locked or self.hint_locked or self.gaming
+
+    def _maybe_start(self):
+        if self.away_start is None and self.is_away():
+            now = self.clock()
+            self.away_start = now
+            if self.file_locked:                                     # the lock may predate this daemon (restart)
+                started = lock_started_ms(self.p["lockdir"])
+                if started is not None and started <= now:
+                    self.away_start = started
+            self.reason = "gaming" if self.gaming and not (self.file_locked or self.hint_locked) else "lock"
+            self.gpu_samples = []
+            self.sample()
+            self._save()
+
+    # events
+    def rescan_lock(self):
+        self.file_locked = bool(lock_log_state(self.p["lockdir"]))   # the process may not exist yet at 'start'
+        self._after_change()
+
+    def on_logind(self, kind, value=None):
+        if kind == "locked_hint":
+            self.hint_locked = bool(value)
+        elif kind == "unlock":
+            self.hint_locked = False
+        self.rescan_lock()
+
+    def rescan_mode(self):
+        self.gaming = read_mode(self.p["modefile"]) == "gaming"
+        self._after_change()
+
+    def _after_change(self):
+        if self.is_away():
+            self._maybe_start()
+        elif self.away_start is not None:
+            self.finish()
+
+    def sample(self):
+        c = self.gpu()
+        if isinstance(c, int):
+            self.gpu_samples.append((self.clock(), c))
+
+    def tick(self):
+        """Once a minute while an absence is open."""
+        if self.away_start is not None:
+            if (self.file_locked or self.hint_locked) and not self.alive():   # locker gone without a log line
+                self.file_locked = self.hint_locked = False
+                self._after_change()
+                return
+            self.sample()
+            self._save()
+
+    # the return
+    def finish(self):
+        start, reason = self.away_start, self.reason
+        self.away_start, self.reason = None, ""
+        end = self.clock()
+        self.sample()
+        samples, self.gpu_samples = self.gpu_samples, []
+        self._save()
+        if start is None or end - start < self.min_away_ms:
+            return None
+        presence = read_json(os.path.join(self.p["runtime"], "presence.json"))
+        brief = compute_brief(start, end, reason, self.p, samples, self._open_requests(presence), presence)
+        self.write(brief)
+        self.deliver(brief)
+        text = self.sentence(brief)                      # up to 10 s; the panel already shows the template
+        if text:
+            brief["sentence"], brief["sentence_src"] = text, "model"
+            self.write(brief)
+        self.shown.append(brief)
+        return brief
+
+    def _open_requests(self, d=None):
+        if d is None:
+            d = read_json(os.path.join(self.p["runtime"], "presence.json"))
+        reqs = d.get("requests") if isinstance(d, dict) else None
+        return len(reqs) if isinstance(reqs, list) else 0
+
+    def _brief_open_rids(self):
+        d = read_json(os.path.join(self.p["runtime"], "brief.json"))
+        return open_rids_of(d) if isinstance(d, dict) else set()
+
+    def refresh_waiting(self):
+        """presence.json changed: drop requests answered since the brief was written, so a SUPER+SHIFT+A replay never
+        says NEEDS YOU for something already handled. No file read while the last brief lists nothing open."""
+        if not self.open_rids:
+            return None
+        brief = read_json(os.path.join(self.p["runtime"], "brief.json"))
+        if not isinstance(brief, dict):
+            self.open_rids = set()
+            return None
+        presence = read_json(os.path.join(self.p["runtime"], "presence.json"))
+        if not isinstance(presence, dict):
+            return None                                        # mid-write or hub down: keep the brief as it is
+        still = {r.get("request_id") for r in presence.get("requests") or [] if isinstance(r, dict)}
+        rows = brief.get("rows") or []
+        for i, row in enumerate(rows):
+            if not (isinstance(row, dict) and row.get("id") == "waiting"):
+                continue
+            listed = [it for it in row.get("items") or [] if isinstance(it, dict) and it.get("rid")]
+            keep = [it for it in listed if it["rid"] in still]
+            if len(keep) == len(listed):
+                return None
+            answered = _int(row.get("answered")) + len(listed) - len(keep)
+            rows[i] = waiting_row(keep, answered, row.get("series") or [0.0] * WINDOW_POINTS)
+            if isinstance(brief.get("counts"), dict):
+                brief["counts"]["waiting"] = len(keep)
+                brief["sentence"], brief["sentence_src"] = template_sentence(brief["counts"]), "template"
+            self.write(brief)
+            return brief
+        return None
+
+    def write(self, brief):
+        data = json.dumps(brief, separators=(",", ":"))
+        self.open_rids = open_rids_of(brief)
+        write_atomic(os.path.join(self.p["runtime"], "brief.json"), data)
+        write_atomic(os.path.join(self.p["runtime"], "last-brief.json"), data)
+
+    def _open_panel(self, _brief):
+        """Guard (lock teardown races the unlock marker), then open the panel."""
+        deadline = time.monotonic() + 5.0
+        while True:
+            rc = subprocess.run([self.p["summon"], "--guard"], timeout=3, check=False,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            if rc == 0:
+                break
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.4)
+        subprocess.run([self.p["msg"], "panel-open", "liquidtron/ares:brief"], timeout=3, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def read_gpu_temp():
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=3, check=False).stdout.split()
+        return int(out[0]) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+# ------------------------------------------------------------------ event sources
+
+IN_MODIFY, IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE = 0x2, 0x8, 0x80, 0x100
+IN_MASK = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE
+
+
+class Inotify:
+    def __init__(self):
+        self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            raise OSError("inotify_init1 failed")
+        self.names = {}
+
+    def add(self, path):
+        wd = self.libc.inotify_add_watch(self.fd, path.encode(), IN_MASK)
+        if wd >= 0:
+            self.names[wd] = path
+        return wd >= 0
+
+    def read(self):
+        """[(watched dir, file name)] pending events."""
+        try:
+            buf = os.read(self.fd, 8192)
+        except (BlockingIOError, InterruptedError):
+            return []
+        out, i = [], 0
+        while i + 16 <= len(buf):
+            wd, _mask, _cookie, ln = struct.unpack_from("iIII", buf, i)
+            name = buf[i + 16:i + 16 + ln].split(b"\0")[0].decode("utf-8", "replace")
+            out.append((self.names.get(wd, ""), name))
+            i += 16 + ln
+        return out
+
+
+LOGIND_LINE = re.compile(r"org\.freedesktop\.login1\.Session\.(Lock|Unlock)\b|LockedHint['\"]?:\s*<(true|false)>")
+
+
+def parse_logind(line):
+    """('unlock', None) | ('locked_hint', bool) | ('lock', None) | None for a gdbus-monitor line."""
+    m = LOGIND_LINE.search(line)
+    if not m:
+        return None
+    if m.group(2):
+        return ("locked_hint", m.group(2) == "true")
+    return ("unlock", None) if m.group(1) == "Unlock" else ("lock", None)
+
+
+def start_gdbus():
+    try:
+        return subprocess.Popen(["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    except OSError:
+        return None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ares-briefd")
+    ap.add_argument("--min-away", type=float, default=float(env("ARES_BRIEFD_MIN_AWAY_S", MIN_AWAY_S)),
+                    help="seconds of absence before a brief is shown (test flag; default 1200)")
+    ap.add_argument("--no-dbus", action="store_true", help="do not start gdbus monitor (tests)")
+    args = ap.parse_args(argv)
+
+    p = paths()
+    os.makedirs(p["lockdir"], mode=0o700, exist_ok=True)
+    os.makedirs(os.path.dirname(p["modefile"]), exist_ok=True)
+    daemon = Briefd(p, args.min_away)
+    ino = Inotify()
+    ino.add(p["lockdir"])
+    ino.add(os.path.dirname(p["modefile"]))
+    os.makedirs(p["runtime"], mode=0o700, exist_ok=True)
+    ino.add(p["runtime"])                                   # presence.json: drop answered requests from the brief
+    gd = None if args.no_dbus else start_gdbus()
+    stop, buf = [], b""
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+    mode_name = os.path.basename(p["modefile"])
+    while not stop:
+        fds = [ino.fd] + ([gd.stdout.fileno()] if gd else [])
+        timeout = SAMPLE_S if daemon.away_start is not None else None
+        try:
+            ready, _, _ = select.select(fds, [], [], timeout)
+        except (InterruptedError, OSError):
+            continue
+        if not ready:
+            daemon.tick()
+            continue
+        try:
+            if ino.fd in ready:
+                evs = ino.read()
+                if any(d == p["lockdir"] for d, _n in evs):
+                    daemon.rescan_lock()
+                if any(n == mode_name for _d, n in evs):
+                    daemon.rescan_mode()
+                if any(d == p["runtime"] and n == "presence.json" for d, n in evs):
+                    daemon.refresh_waiting()
+            if gd and gd.stdout.fileno() in ready:
+                chunk = os.read(gd.stdout.fileno(), 65536)
+                if not chunk:
+                    gd = None                       # inotify triggers keep working
+                    continue
+                buf += chunk
+                *lines, buf = buf.split(b"\n")
+                for ln in lines:
+                    ev = parse_logind(ln.decode("utf-8", "replace"))
+                    if ev and ev[0] != "lock":
+                        daemon.on_logind(*ev)
+                    elif ev:
+                        daemon.rescan_lock()
+        except Exception as e:                      # one bad event must not kill the daemon
+            print("ares-briefd: %r" % (e,), file=sys.stderr)
+    if gd:
+        gd.terminate()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

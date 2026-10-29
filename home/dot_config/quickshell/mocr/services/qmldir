@@ -1,0 +1,12 @@
+module services
+SystemStats 1.0 SystemStats.qml
+singleton NotificationService 1.0 NotificationService.qml
+singleton GpuStats 1.0 GpuStats.qml
+singleton JournalInterpreter 1.0 JournalInterpreter.qml
+singleton NotificationInterpreter 1.0 NotificationInterpreter.qml
+singleton PresenceState 1.0 PresenceState.qml
+singleton AnchalMode 1.0 AnchalMode.qml
+singleton DigestService 1.0 DigestService.qml
+singleton SystemMode 1.0 SystemMode.qml
+singleton PowerProfile 1.0 PowerProfile.qml
+singleton WorkspacesService 1.0 WorkspacesService.qml

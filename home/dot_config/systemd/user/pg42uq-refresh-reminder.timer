@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly PG42UQ pixel refresh reminder
+
+[Timer]
+OnCalendar=Sun 10:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# ares-hue-alert deny|clear
+# Tells Home Assistant that the Ares lock rejected a password (deny) or left its red denied state (clear).
+# HA automation "Ares lock: office lights red on wrong password" turns the office Hue lights red and
+# restores them. Webhook URLs live in ~/.config/ares-lock/hue-alert.json (mode 600, not in git):
+#   {"enabled": true, "deny_url": "https://.../api/webhook/<id>-deny", "clear_url": "https://.../api/webhook/<id>-clear"}
+# Fire-and-forget: called detached by the lock client; never reads or sees the credential buffer.
+# Exits 0 when disabled or unconfigured. Never prints the URLs.
+set -u
+event="${1:-}"
+case "$event" in deny|clear) ;; *) echo "usage: ares-hue-alert deny|clear" >&2; exit 2 ;; esac
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/ares-lock/hue-alert.json"
+[ -r "$cfg" ] || exit 0
+command -v jq >/dev/null && command -v curl >/dev/null || exit 0
+[ "$(jq -r '.enabled // false' "$cfg" 2>/dev/null)" = "true" ] || exit 0
+url="$(jq -r --arg k "${event}_url" '.[$k] // empty' "$cfg" 2>/dev/null)"
+[ -n "$url" ] || exit 0
+curl -fsS -o /dev/null -m 4 -X POST -H 'Content-Type: application/json' -d '{}' "$url" 2>/dev/null

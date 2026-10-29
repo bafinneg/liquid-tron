@@ -1,0 +1,17 @@
+# Tron Compute — lazydocker theme
+# Managed via Stow — do not edit ~/.config/lazydocker/config.yml directly
+
+gui:
+  border: rounded
+  theme:
+    activeBorderColor:
+      - "#0abdc6"       # cyan — active panel border
+      - bold
+    inactiveBorderColor:
+      - "#0072ff"       # blue — inactive panel border
+    selectedLineBgColor:
+      - "#0072ff"       # blue — selection background
+    selectedRangeBgColor:
+      - "#0072ff"       # blue — range selection
+    defaultFgColor:
+      - "#c0c0d0"       # fg — body text

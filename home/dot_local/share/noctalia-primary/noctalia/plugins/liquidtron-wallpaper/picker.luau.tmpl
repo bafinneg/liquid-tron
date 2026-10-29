@@ -1,0 +1,395 @@
+-- Wallpaper picker panel: one click sets a wallpaper (or a preset triptych) on all three monitors at once.
+--
+-- Native replacement for the compact Quickshell picker. State and renderers belong to wallpaper-control: `library`
+-- and `status` are read on every open (about 60 ms each, async); a click runs `apply-scene` at once (no apply button).
+-- Clicks during an apply are serialized: the latest one waits as NEXT and runs when the current apply finishes.
+-- FULL STUDIO (or E) closes this panel and opens the per-monitor Wallpaper Studio (Quickshell overlay).
+-- Esc, a click anywhere else and a second widget click close it (Noctalia's attached-panel behaviour).
+--
+-- Smooth open: plugin images decode synchronously on Noctalia's UI thread, and the host rebuilds the last rendered
+-- tree into a fresh surface on every open. The grid therefore shows `tile` images, which wallpaper-control cuts to
+-- the tile face (256x144, about a quarter of the 480 px thumb's decode cost), and every tile is in the panel's first
+-- frame, so nothing pops in after the panel has dropped. The 480 px `thumb` is the fallback when a tile is missing.
+--
+-- Colour literal (everything else is a palette role):
+--   #ff8c00  amber (setting / queued)
+
+local CTL = "{{ .chezmoi.homeDir }}/.local/bin/wallpaper-control"
+local STUDIO = "{{ .chezmoi.homeDir }}/.local/bin/wallpaper-studio"
+local COLS = 4
+local TILE_W = 250 -- 4 columns + gaps + the scrollbar fit the 1084 px content width
+local THUMB_H = 136 -- about 16:9 at the image width (TILE_W - 8)
+local GAP = 10
+
+local AMBER = "#ff8c00"
+local RED = "error"
+local GREEN = "#3ddc84"
+local DIM = "on_surface_variant"
+
+local isOpen = false
+local gen = 0 -- bumped on every open/close; stale async results are dropped
+local items = {}
+local itemByPath = {}
+local presets = {}
+local libRaw = nil
+local current = { left = "", center = "", right = "" }
+local filter = "all"
+local hovered = nil
+local message = ""
+local messageIsError = false
+local applying = nil -- scene being applied { left, center, right, label }
+local pending = nil -- next scene (latest click wins)
+
+local render -- forward
+
+local function setMessage(text, isError)
+  message = text
+  messageIsError = isError == true
+end
+
+local function nameOf(label)
+  if label == nil or label == "" then
+    return ""
+  end
+  if string.sub(label, 1, 7) == "preset:" then
+    for _, p in ipairs(presets) do
+      if "preset:" .. p.id == label then
+        return p.name
+      end
+    end
+    return "Preset"
+  end
+  local it = itemByPath[label]
+  if it ~= nil then
+    return it.name
+  end
+  local base = string.match(label, "([^/]+)$") or label
+  return (string.gsub(base, "%.[^.]+$", ""))
+end
+
+local function sameScene(s)
+  return s.left == current.left and s.center == current.center and s.right == current.right
+end
+
+local function uniformPath()
+  if current.left ~= "" and current.left == current.center and current.center == current.right then
+    return current.left
+  end
+  return ""
+end
+
+local function filtered()
+  if filter == "all" then
+    return items
+  end
+  local out = {}
+  for _, it in ipairs(items) do
+    if it.kind == filter then
+      table.insert(out, it)
+    end
+  end
+  return out
+end
+
+-- ------------------------------------------------------------------ data
+
+local function loadLibrary(myGen)
+  noctalia.runAsync({ CTL, "library" }, function(result)
+    if myGen ~= gen and myGen ~= -1 then
+      return
+    end
+    if result.exitCode ~= 0 then
+      if #items == 0 then
+        setMessage("Could not read the wallpaper library.", true)
+        render()
+      end
+      return
+    end
+    local raw = result.stdout or ""
+    if raw == libRaw then
+      return
+    end
+    local ok, d = pcall(noctalia.json.decode, raw)
+    if not ok or type(d) ~= "table" or type(d.items) ~= "table" then
+      setMessage("Could not read the wallpaper library.", true)
+      render()
+      return
+    end
+    libRaw = raw
+    items = d.items
+    presets = type(d.presets) == "table" and d.presets or {}
+    itemByPath = {}
+    for _, it in ipairs(items) do
+      itemByPath[it.path] = it
+    end
+    if isOpen then
+      render()
+    end
+  end)
+end
+
+local function loadStatus(myGen)
+  noctalia.runAsync({ CTL, "status" }, function(result)
+    if myGen ~= gen then
+      return
+    end
+    local ok, d = pcall(noctalia.json.decode, result.stdout or "")
+    local lay = ok and type(d) == "table" and d.layout or nil
+    if type(lay) == "table" and lay.left and lay.center and lay.right then
+      current = { left = lay.left.path or "", center = lay.center.path or "", right = lay.right.path or "" }
+    else
+      current = { left = "", center = "", right = "" }
+    end
+    render()
+  end)
+end
+
+local request -- forward
+
+local function runApply(scene)
+  applying = scene
+  setMessage("Setting " .. nameOf(scene.label) .. " on all monitors…")
+  noctalia.runAsync({ CTL, "apply-scene", "--left", scene.left, "--center", scene.center, "--right", scene.right },
+    function(result)
+      -- Not gen-gated: an apply that finishes after the panel closed still updates state and runs the queued scene.
+      applying = nil
+      if result.exitCode == 0 then
+        current = { left = scene.left, center = scene.center, right = scene.right }
+        setMessage("Set: " .. nameOf(scene.label))
+      else
+        local err = string.gsub(result.stderr or "", "%s+$", "")
+        local last = string.match(err, "([^\n]*)$") or ""
+        last = string.gsub(last, "^wallpaper%-control:%s*", "")
+        setMessage("Not set — the previous wallpaper was kept. " .. last, true)
+        loadStatus(gen)
+      end
+      if pending ~= nil then
+        local nextScene = pending
+        pending = nil
+        request(nextScene)
+      end
+      render()
+    end)
+end
+
+request = function(scene)
+  if applying ~= nil then
+    if scene.label == applying.label then
+      return
+    end
+    pending = scene
+    setMessage("Next: " .. nameOf(scene.label))
+    render()
+    return
+  end
+  if sameScene(scene) then
+    setMessage(nameOf(scene.label) .. " is already on every monitor.")
+    render()
+    return
+  end
+  runApply(scene)
+  render()
+end
+
+local function setAll(path)
+  request({ left = path, center = path, right = path, label = path })
+end
+
+local function setPreset(p)
+  request({ left = p.layout.left, center = p.layout.center, right = p.layout.right, label = "preset:" .. p.id })
+end
+
+local function openStudio()
+  panel.close()
+  noctalia.runAsync({ STUDIO, "--full" })
+end
+
+-- ------------------------------------------------------------------ view
+
+local function onTileHover(state, key)
+  local nextKey = (state == "true") and key or nil
+  if nextKey ~= hovered then
+    hovered = nextKey
+    render()
+  end
+end
+
+local function presetIsCurrent(p)
+  return sameScene(p.layout)
+end
+
+local function tile(it, uniform)
+  local path = it.path
+  local isCurrent = path == uniform
+  local partial = not isCurrent and (path == current.left or path == current.center or path == current.right)
+  local busy = applying ~= nil and applying.label == path
+  local queued = pending ~= nil and pending.label == path
+  local hot = hovered == path
+
+  local border = "outline/0.45"
+  local borderWidth = 1
+  if busy or queued then
+    border, borderWidth = AMBER, 2
+  elseif isCurrent then
+    border, borderWidth = "primary", 2
+  elseif hot then
+    border = "primary"
+  elseif partial then
+    border, borderWidth = "secondary", 2
+  end
+
+  local tag, tagColor = "", DIM
+  if busy then
+    tag, tagColor = "SETTING…", AMBER
+  elseif queued then
+    tag, tagColor = "NEXT", AMBER
+  elseif isCurrent then
+    tag, tagColor = "● ON ALL", "primary"
+  elseif partial then
+    tag, tagColor = "● ON ONE", "secondary"
+  elseif it.kind == "video" then
+    tag = it.depth and "◉ DEPTH" or "◉ MOTION"
+  end
+
+  local face
+  local src = (it.tile ~= nil and it.tile ~= "") and it.tile or it.thumb
+  if src ~= nil and src ~= "" then
+    face = ui.image({ path = src, width = TILE_W - 8, height = THUMB_H, radius = 6, fit = "cover" })
+  else
+    face = ui.box({ width = TILE_W - 8, height = THUMB_H, radius = 6, fill = "surface" })
+  end
+
+  return ui.column({
+    key = path,
+    width = TILE_W,
+    gap = 6,
+    padding = 4,
+    radius = 10,
+    fill = hot and "surface_variant/0.55" or "surface_variant/0.22",
+    border = border,
+    borderWidth = borderWidth,
+    onHover = onTileHover,
+    onClick = function()
+      setAll(path)
+    end,
+  }, {
+    face,
+    ui.row({ gap = 6, align = "center", paddingH = 4 }, {
+      ui.label({ text = it.name or "", fontSize = 14, maxLines = 1, color = isCurrent and "primary" or "on_surface",
+        flexGrow = 1 }),
+      ui.label({ text = tag, fontSize = 11, color = tagColor, fontWeight = "semibold" }),
+    }),
+  })
+end
+
+local function chip(key, text, selected, onClick)
+  return ui.button({
+    key = key,
+    text = text,
+    variant = selected and "primary" or "outline",
+    controlSize = "sm",
+    selected = selected,
+    onClick = onClick,
+  })
+end
+
+render = function()
+  if not isOpen then
+    return
+  end
+  local head = {
+    ui.glyph({ name = "photo", size = 22, color = "primary" }),
+    ui.label({ text = "WALLPAPER", fontSize = 16, fontWeight = "bold", color = "primary" }),
+    ui.spacer({ width = 6 }),
+    chip("f-all", "ALL", filter == "all", function() filter = "all"; render() end),
+    chip("f-video", "ANIMATED", filter == "video", function() filter = "video"; render() end),
+    chip("f-image", "STILLS", filter == "image", function() filter = "image"; render() end),
+  }
+  for _, p in ipairs(presets) do
+    local busy = applying ~= nil and applying.label == "preset:" .. p.id
+    table.insert(head, ui.button({
+      key = "p-" .. tostring(p.id),
+      text = (busy and "◌ " or "★ ") .. string.upper(p.name or ""),
+      variant = presetIsCurrent(p) and "primary" or "outline",
+      controlSize = "sm",
+      onClick = function()
+        setPreset(p)
+      end,
+    }))
+  end
+  table.insert(head, ui.spacer({ flexGrow = 1 }))
+  table.insert(head, ui.button({ key = "studio", text = "FULL STUDIO", glyph = "arrows-maximize", variant = "outline",
+    controlSize = "sm", tooltip = "Per-monitor wallpapers (E)", onClick = openStudio }))
+
+  -- Owner: no idle help line; the status row appears only for an apply, a queued scene or an error.
+  local statusText = message
+  local statusColor = DIM
+  if messageIsError then
+    statusColor = RED
+  elseif applying ~= nil then
+    statusColor = AMBER
+  elseif message ~= "" then
+    statusColor = GREEN
+  end
+
+  local list = filtered()
+  local uniform = uniformPath()
+  local rows = {}
+  local row = {}
+  local count = #list
+  for i = 1, count do
+    table.insert(row, tile(list[i], uniform))
+    if #row == COLS or i == count then
+      table.insert(rows, ui.row({ key = "r" .. tostring(#rows + 1), gap = GAP }, row))
+      row = {}
+    end
+  end
+  local body
+  if #items == 0 then
+    body = ui.column({ key = "empty", flexGrow = 1, align = "center", justify = "center" }, {
+      ui.label({ text = messageIsError and "" or "INDEXING LIBRARY…", fontSize = 16, color = DIM }),
+    })
+  else
+    body = ui.scroll({ key = "grid", gap = GAP, flexGrow = 1 }, rows)
+  end
+
+  local children = { ui.row({ key = "head", gap = 8, align = "center" }, head) }
+  if statusText ~= "" then
+    table.insert(children, ui.label({ key = "status", text = string.upper(statusText), fontSize = 14, color = statusColor, maxLines = 1 }))
+  end
+  table.insert(children, body)
+  panel.render(ui.column({ padding = 18, gap = 10, flexGrow = 1 }, children))
+end
+
+-- ------------------------------------------------------------- lifecycle
+
+function onOpen(_context)
+  gen += 1
+  isOpen = true
+  hovered = nil
+  if applying == nil then
+    message = ""
+    messageIsError = false
+  end
+  render()
+  local myGen = gen
+  loadLibrary(myGen)
+  if applying == nil then
+    loadStatus(myGen)
+  end
+end
+
+function onClose()
+  gen += 1
+  isOpen = false
+  hovered = nil
+end
+
+function onKey(chord, pressed)
+  if chord == "e" and pressed then
+    openStudio()
+  end
+end
+
+-- Read the library once at load, so even the first open has its tiles ready.
+loadLibrary(-1)

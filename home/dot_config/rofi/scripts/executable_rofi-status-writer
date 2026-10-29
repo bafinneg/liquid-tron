@@ -1,0 +1,40 @@
+#!/usr/bin/env sh
+set -eu
+
+runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+status_file=$runtime_dir/rofi-mocr-status
+tmp_file=$status_file.$$
+host=$(hostname 2>/dev/null || printf '7800X')
+workspace='UNKNOWN'
+
+if command -v hyprctl >/dev/null 2>&1; then
+    workspace=$(
+        hyprctl activeworkspace -j 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("UNKNOWN")
+    raise SystemExit(0)
+name = data.get("name")
+wid = data.get("id")
+if name and str(name) != str(wid):
+    print(name)
+elif wid is not None:
+    print(wid)
+else:
+    print("UNKNOWN")
+' 2>/dev/null || printf 'UNKNOWN'
+    )
+fi
+
+case $workspace in
+    *[!A-Za-z0-9_.:-]*|'') workspace='UNKNOWN' ;;
+esac
+case $host in
+    *[!A-Za-z0-9_.-]*|'') host='7800X' ;;
+esac
+
+umask 077
+printf 'MOCR-Q // %s // WORKSPACE %s // FUZZY MATCH ACTIVE\n' "$host" "$workspace" > "$tmp_file"
+mv "$tmp_file" "$status_file"

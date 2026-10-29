@@ -1,0 +1,142 @@
+{
+    "Effects": [
+        {
+            "AllowOnlyFirst": false,
+            "AutoStart": true,
+            "Brightness": 100,
+            "ControllerZones": [
+                {
+                    "description": "Corsair Commander Core Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw6",
+                    "name": "Corsair Commander Core XT",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "v1.4.62",
+                    "zone_idx": 0
+                },
+                {
+                    "description": "Corsair Commander Core Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw6",
+                    "name": "Corsair Commander Core XT",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "v1.4.62",
+                    "zone_idx": 1
+                },
+                {
+                    "description": "Corsair Commander Core Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw6",
+                    "name": "Corsair Commander Core XT",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "v1.4.62",
+                    "zone_idx": 2
+                },
+                {
+                    "description": "Corsair Commander Core Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw6",
+                    "name": "Corsair Commander Core XT",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "v1.4.62",
+                    "zone_idx": 3
+                },
+                {
+                    "description": "Corsair Commander Core Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw6",
+                    "name": "Corsair Commander Core XT",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "v1.4.62",
+                    "zone_idx": 4
+                },
+                {
+                    "description": "Corsair Commander Core Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw6",
+                    "name": "Corsair Commander Core XT",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "v1.4.62",
+                    "zone_idx": 5
+                },
+                {
+                    "description": "Corsair Commander Core Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw6",
+                    "name": "Corsair Commander Core XT",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "v1.4.62",
+                    "zone_idx": 6
+                },
+                {
+                    "description": "ASUS Aura USB Mainboard Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw9",
+                    "name": "ASUS ROG STRIX X670E-E GAMING WIFI",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "9876543210",
+                    "vendor": "ASUS",
+                    "version": "AULA3-AR32-0309",
+                    "zone_idx": 1
+                },
+                {
+                    "description": "ASUS Aura USB Mainboard Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw9",
+                    "name": "ASUS ROG STRIX X670E-E GAMING WIFI",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "9876543210",
+                    "vendor": "ASUS",
+                    "version": "AULA3-AR32-0309",
+                    "zone_idx": 3
+                }
+            ],
+            "CustomName": "",
+            "EffectClassName": "GradientWave",
+            "FPS": 30,
+            "RandomColors": false,
+            "SelectAll": false,
+            "Slider2Val": 1,
+            "Speed": 5,
+            "Temperature": 0,
+            "Tint": 0,
+            "UserColors": [
+                13024522,
+                16722688
+            ]
+        }
+    ],
+    "version": 2
+}

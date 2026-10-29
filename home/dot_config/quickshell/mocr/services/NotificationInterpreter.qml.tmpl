@@ -1,0 +1,337 @@
+// NotificationInterpreter — singleton DATA-TNG-voice rewrite of every
+// accepted desktop notification (FEAT-notification-interpreter).
+//
+// Mirrors JournalInterpreter's ollama-call scaffolding deliberately so a
+// future maintainer reading both files sees one shape:
+//   * curl via bash + base64-encoded body (same _runOllama pattern)
+//   * single-flight on the ollama Process; FIFO queue of pending jobs
+//   * 8s wall-clock per call; double-JSON.parse of HTTP body and inner
+//     `.response`
+//   * two consecutive failures trip rawMode; healthCheck Timer polls
+//     /api/tags every 60s; first 2xx flips rawMode back off
+//
+// Async-with-passthrough contract: caller invokes
+//   interpret(notifId, summary, body, urgency, appName, cb)
+// and the callback fires later with cb(rewrittenSummary, rewrittenBody)
+// on success or cb(null, null) on failure / rawMode / queue overflow.
+// The caller is expected to admit the toast immediately with the
+// original text and only mutate-in-place when the rewrite arrives.
+//
+// Model choice: the same ollamaModel JournalInterpreter is currently
+// running (qwen2.5:14b-instruct) — single-tier residency on this box
+// per Brian (2026-04-25). INFRA-006's ambient/digest tier split is
+// deferred to its own spec; until then this interpreter shares
+// JournalInterpreter's model so we do not duplicate residency cost.
+
+pragma Singleton
+
+import QtQuick
+import Quickshell.Io
+
+Item {
+    id: service
+    visible: false
+    width: 0; height: 0
+
+    // ── Tunables ─────────────────────────────────────────────────
+    readonly property string ollamaUrl: "http://localhost:11434/api/generate"
+    readonly property string ollamaTagsUrl: "http://localhost:11434/api/tags"
+    // Same model as JournalInterpreter — single-tier residency until
+    // INFRA-006 lands the ambient/digest split. Bumped here in lockstep
+    // with that spec when it does.
+    readonly property string ollamaModel: "qwen2.5:14b-instruct"
+    // 30s ceiling matches JournalInterpreter — accommodates 14b cold-load
+    // on the 4090 if the warmup probe is somehow late. Steady-state
+    // inference on this prompt is ~1-2s.
+    readonly property int requestTimeoutSec: 30
+    // Pin model resident between calls. 1800s = 30 min, comfortably
+    // longer than any realistic notification gap.
+    readonly property int ollamaKeepAliveSec: 1800
+    readonly property int healthCheckMs: 60000
+    // Hard cap on pending rewrites. Burst beyond this drops with
+    // cb(null, null) — caller's original text remains visible.
+    readonly property int queueCap: 50
+
+    // ── Internal state ───────────────────────────────────────────
+    property bool rawMode: false
+    // notifId map for toasts whose DATA-TNG rewrite is in flight.
+    property var pendingRewriteIds: ({})
+    property int _consecutiveFailures: 0
+    // FIFO of pending jobs: { notifId, summary, body, urgency, appName, cb }.
+    property var _queue: []
+    // ollama stdout accumulator. Cleared at the start of each call.
+    property string _ollamaBuf: ""
+    // The job currently in flight; its cb is invoked on Process exit.
+    property var _activeJob: null
+
+    // ── Public API ───────────────────────────────────────────────
+    function interpret(notifId, summary, body, urgency, appName, cb) {
+        if (!cb) return
+        // Fast-path while rawMode: skip the queue entirely so the caller
+        // can fall through to the original-text path without delay.
+        if (rawMode) { cb(null, null); return }
+        // Hard cap: drop on the floor when overloaded — original text
+        // remains, no functional regression.
+        if (_queue.length >= queueCap) { cb(null, null); return }
+        _queue.push({
+            notifId: notifId,
+            summary: summary || "",
+            body: body || "",
+            urgency: urgency,
+            appName: appName || "",
+            cb: cb
+        })
+        _markPendingRewrite(notifId)
+        _drainQueue()
+    }
+
+    function _clonePendingMap() {
+        var p = ({})
+        for (var k in pendingRewriteIds) p[k] = pendingRewriteIds[k]
+        return p
+    }
+
+    function _markPendingRewrite(notifId) {
+        var p = _clonePendingMap()
+        p[notifId] = true
+        pendingRewriteIds = p
+    }
+
+    function _clearPendingRewrite(notifId) {
+        var p = _clonePendingMap()
+        delete p[notifId]
+        pendingRewriteIds = p
+    }
+
+    // ── Queue drain (single-flight) ──────────────────────────────
+    function _drainQueue() {
+        if (ollamaCall.running) return
+        if (_activeJob !== null) return
+        if (_queue.length === 0) return
+        var job = _queue.shift()
+        _activeJob = job
+        _runOllama(_buildOllamaBody(job))
+    }
+
+    function _onOllamaResult(ok, parsed) {
+        var job = _activeJob
+        _activeJob = null
+        if (ok && _validateRewrite(parsed)) {
+            _consecutiveFailures = 0
+            if (job && job.cb) job.cb(parsed.summary, parsed.body || "")
+            if (job) _clearPendingRewrite(job.notifId)
+        } else {
+            _consecutiveFailures += 1
+            if (job && job.cb) job.cb(null, null)
+            if (job) _clearPendingRewrite(job.notifId)
+            if (_consecutiveFailures >= 2 && !rawMode) {
+                rawMode = true
+                healthCheck.running = true
+                // Drain any queued jobs as failures so callers do not
+                // wait forever on rawMode entry.
+                var pending = _queue
+                _queue = []
+                for (var i = 0; i < pending.length; i++) {
+                    if (pending[i].cb) pending[i].cb(null, null)
+                    _clearPendingRewrite(pending[i].notifId)
+                }
+            }
+        }
+        _drainQueue()
+    }
+
+    function _validateRewrite(parsed) {
+        if (!parsed || typeof parsed !== "object") return false
+        // Some ollama returns wrap a single object in an array; normalise.
+        if (Array.isArray(parsed)) {
+            if (parsed.length === 0) return false
+            parsed = parsed[0]
+            if (!parsed || typeof parsed !== "object") return false
+        }
+        if (typeof parsed.summary !== "string") return false
+        if (parsed.summary.length === 0) return false
+        // body may be empty string but must be a string.
+        if (typeof parsed.body !== "string") return false
+        return true
+    }
+
+    // ── Ollama call (curl via bash, body via base64) ─────────────
+    // Why base64: the user-message body packs raw notification text
+    // which may contain quotes, backslashes, or newlines. Single-quoting
+    // in bash is fragile; base64-decode straight into curl's stdin is
+    // dependency-free and lossless. Same pattern as JournalInterpreter.
+    Process {
+        id: ollamaCall
+        running: false
+        stdout: SplitParser {
+            onRead: data => { service._ollamaBuf += data + "\n" }
+        }
+        onExited: (exitCode, exitStatus) => {
+            var raw = service._ollamaBuf
+            service._ollamaBuf = ""
+            var res = service._parseOllamaResponse(exitCode, raw)
+            service._onOllamaResult(res.ok, res.parsed)
+        }
+    }
+
+    function _runOllama(body) {
+        _ollamaBuf = ""
+        var b64 = Qt.btoa(body)
+        ollamaCall.command = ["bash", "-c",
+            "printf '%s' '" + b64 + "' | base64 -d | " +
+            "curl -sS -m " + requestTimeoutSec + " -X POST " +
+            "-H 'Content-Type: application/json' " +
+            "--data-binary @- " + ollamaUrl
+        ]
+        ollamaCall.running = true
+    }
+
+    function _parseOllamaResponse(exitCode, raw) {
+        if (exitCode !== 0) return { ok: false, parsed: null }
+        if (!raw || raw.trim().length === 0) return { ok: false, parsed: null }
+        try {
+            var outer = JSON.parse(raw)
+            if (typeof outer !== "object" || outer === null) {
+                return { ok: false, parsed: null }
+            }
+            if (typeof outer.response !== "string") {
+                return { ok: false, parsed: null }
+            }
+            var inner = JSON.parse(outer.response)
+            return { ok: true, parsed: inner }
+        } catch (e) {
+            return { ok: false, parsed: null }
+        }
+    }
+
+    // ── Health check (only runs while rawMode) ──────────────────
+    Timer {
+        id: healthCheck
+        interval: service.healthCheckMs
+        repeat: true
+        running: false
+        triggeredOnStart: false
+        onTriggered: {
+            if (!healthProbe.running) healthProbe.running = true
+        }
+    }
+
+    Process {
+        id: healthProbe
+        running: false
+        command: ["bash", "-c",
+            "curl -sS -m 5 -o /dev/null -w '%{http_code}' " + service.ollamaTagsUrl
+        ]
+        property string _buf: ""
+        stdout: SplitParser {
+            onRead: data => { healthProbe._buf += data }
+        }
+        onExited: (exitCode, exitStatus) => {
+            var code = healthProbe._buf.trim()
+            healthProbe._buf = ""
+            if (exitCode === 0 && code.charAt(0) === "2") {
+                service.rawMode = false
+                service._consecutiveFailures = 0
+                healthCheck.running = false
+            }
+        }
+    }
+
+    onRawModeChanged: {
+        if (!rawMode && healthCheck.running) healthCheck.running = false
+    }
+
+    // ── Body builder ─────────────────────────────────────────────
+    function _buildOllamaBody(job) {
+        var fields = [
+            "app_name: " + JSON.stringify(job.appName || ""),
+            "urgency: " + _urgencyWord(job.urgency),
+            "summary: " + JSON.stringify(job.summary || ""),
+            "body: " + JSON.stringify(job.body || "")
+        ].join("\n")
+        var fullPrompt = _rewritePrompt() +
+            "\n\nNOTIFICATION:\n" + fields +
+            "\n\n/no_think"
+        return JSON.stringify({
+            model: ollamaModel,
+            prompt: fullPrompt,
+            stream: false,
+            format: "json",
+            think: false,
+            keep_alive: ollamaKeepAliveSec,
+            options: {
+                temperature: 0.3,
+                num_predict: 256
+            }
+        })
+    }
+
+    function _urgencyWord(u) {
+        // Quickshell exposes NotificationUrgency.{Low,Normal,Critical}
+        // as 0/1/2. Accept the int form (most likely) and a stringified
+        // fallback for safety.
+        if (u === 0 || u === "0" || u === "low") return "low"
+        if (u === 2 || u === "2" || u === "critical") return "critical"
+        return "normal"
+    }
+
+    // ── Persona prompt ───────────────────────────────────────────
+    // DATA-TNG voice. Voice rules track JournalInterpreter._ambientPrompt
+    // by intent so the two ambient surfaces speak with one persona.
+    function _rewritePrompt() {
+        return [
+            "You are Lt. Commander Data from Star Trek: The Next Generation,",
+            "acting as the ship's computer notification interpreter. Your",
+            "voice is earnest, exact, and formally helpful. Never use",
+            "contractions. Never use exclamation points. Use formal verbs.",
+            "",
+            "You are given a single Linux desktop notification with fields:",
+            "  app_name, urgency (low / normal / critical), summary, body.",
+            "",
+            "Rewrite the summary and body in your voice. Return a JSON",
+            "object with this exact shape:",
+            "",
+            "  {",
+            "    \"summary\": \"<rewritten summary, no more than 60 characters>\",",
+            "    \"body\":    \"<rewritten body, no more than 200 characters; empty string if the original body was empty>\"",
+            "  }",
+            "",
+            "=== VOICE RULES (absolute) ===",
+            "",
+            "1. INTERPRET — do not restate. Explain what happened in plain",
+            "   English, not the raw notification text.",
+            "2. Translate severity into prose only when meaningful: routine,",
+            "   warning, critical. Do not say the urgency level as a word.",
+            "3. No filler (\"Notification received\", \"An event occurred\").",
+            "4. Clarify cryptic identifiers. \"OOM\", \"I/O error\", \"DPMS off\",",
+            "   \"build failed exit 1\" each become plain English.",
+            "5. Name the actor when available. Prefer \"The backup script has",
+            "   completed.\" to \"Completed.\"",
+            "",
+            "=== EXAMPLES ===",
+            "",
+            "Input:",
+            "  app_name: \"borg-backup.sh\"",
+            "  urgency: normal",
+            "  summary: \"Backup OK\"",
+            "  body: \"Repository ssh://{{ .backup_host }}/borg/7800x; archive created in 218.4s; 14.2 GB transferred.\"",
+            "Output:",
+            "  {\"summary\":\"Borg backup completed.\",\"body\":\"The archive to {{ .backup_host }} finished in three minutes and twenty-eight seconds.\"}",
+            "",
+            "Input:",
+            "  app_name: \"systemd\"",
+            "  urgency: critical",
+            "  summary: \"atlas-db-sync.service: Failed\"",
+            "  body: \"Result: exit-code (1)\"",
+            "Output:",
+            "  {\"summary\":\"ATLAS database synchronisation has failed.\",\"body\":\"The service exited with an error. Manual review is required.\"}",
+            "",
+            "=== FORMAT ===",
+            "",
+            "Respond with the JSON object and nothing else. No markdown",
+            "fences. No commentary. The \"summary\" must be present and",
+            "non-empty. The \"body\" may be an empty string only if the",
+            "input body was empty."
+        ].join("\n")
+    }
+}

@@ -1,0 +1,11 @@
+module popovers
+NotificationList 1.0 NotificationList.qml
+PowerMenu 1.0 PowerMenu.qml
+Calendar 1.0 Calendar.qml
+CpuDetail 1.0 CpuDetail.qml
+MemDetail 1.0 MemDetail.qml
+TempDetail 1.0 TempDetail.qml
+NetDetail 1.0 NetDetail.qml
+VolumePicker 1.0 VolumePicker.qml
+GpuDetail 1.0 GpuDetail.qml
+DigestView 1.0 DigestView.qml

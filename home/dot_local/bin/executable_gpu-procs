@@ -1,0 +1,239 @@
+#!/usr/bin/python3 -I
+"""gpu-procs — what is using the GPU, for the Liquid Tron GPU detail dropdown.
+
+  gpu-procs snapshot [--limit N]          one JSON sample: GPU totals plus the top VRAM holders
+  gpu-procs end <pid> <starttime> [--force]
+  gpu-procs alive <pid> <starttime>       both delegate to cpu-procs (same pid-reuse and session guards)
+  gpu-procs unload                        ask Ollama to unload every resident model (keep_alive 0)
+
+Rows are sorted by VRAM, then by SM (shader) load, because VRAM exhaustion is what breaks the desktop
+(nvidia-drm "Failed to allocate NVKMS memory" -> ghosted, stale windows). `sm` is the process's share of
+the GPU's shader time over nvidia-smi's last sample, or null when the driver reports none.
+Ollama's runner belongs to the ollama user, so it cannot be ended; its row carries `action: "unload"`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+PROC = os.environ.get("GPU_PROCS_PROC_ROOT", "/proc")
+NVSMI = os.environ.get("GPU_PROCS_NVIDIA_SMI", "nvidia-smi")
+OLLAMA = os.environ.get("GPU_PROCS_OLLAMA_URL", "http://127.0.0.1:11434")
+CPU_PROCS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cpu-procs")
+MY_UID = os.getuid()
+PROTECTED = {"Hyprland", "hyprland", "Xwayland", "noctalia", "hyprlock", "hypridle", "qs", "systemd"}
+INTERPRETERS = ("python", "node", "bash", "sh", "zsh", "perl", "ruby")
+
+
+def read(path: str) -> str:
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "replace")
+
+
+def smi(*args: str) -> str:
+    return subprocess.run([NVSMI, *args], capture_output=True, text=True, timeout=10, check=True).stdout
+
+
+def num(s: str) -> float | None:
+    try:
+        return float(s.strip())
+    except ValueError:
+        return None
+
+
+def gpu_totals() -> dict:
+    q = "utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit,name"
+    f = [x.strip() for x in smi(f"--query-gpu={q}", "--format=csv,noheader,nounits").splitlines()[0].split(",")]
+    return {"util": num(f[0]) or 0.0, "mem_util": num(f[1]) or 0.0, "vram_used_mb": int(num(f[2]) or 0),
+            "vram_total_mb": int(num(f[3]) or 0), "temp": num(f[4]), "power_w": num(f[5]),
+            "power_limit_w": num(f[6]), "name": f[7]}
+
+
+def pmon() -> dict[int, dict]:
+    """pid -> {type, sm, fb_mb} from one `nvidia-smi pmon` sample (columns found from its header)."""
+    out: dict[int, dict] = {}
+    cols: list[str] = []
+    for line in smi("pmon", "-c", "1", "-s", "um").splitlines():
+        parts = line.split()
+        if line.startswith("#"):
+            if not cols and "pid" in parts:
+                cols = parts[1:]
+            continue
+        if not cols or len(parts) < len(cols) or not parts[1].isdigit():
+            continue
+        row = dict(zip(cols, parts))
+        pid = int(row["pid"])
+        sm = num(row.get("sm", "-"))
+        fb = num(row.get("fb", "-")) or 0.0
+        out[pid] = {"type": row.get("type", "?"), "sm": sm, "fb_mb": int(fb)}
+    return out
+
+
+def proc_info(pid: int) -> dict | None:
+    p = str(pid)
+    try:
+        raw = read(f"{PROC}/{p}/stat")
+        uid = os.stat(f"{PROC}/{p}").st_uid
+    except OSError:
+        return None
+    comm = raw[raw.find("(") + 1:raw.rfind(")")]
+    start = int(raw[raw.rfind(")") + 2:].split()[19])
+    try:
+        argv = [a for a in read(f"{PROC}/{p}/cmdline").split("\0") if a]
+    except OSError:
+        argv = []
+    if len(argv) == 1 and " --" in argv[0]:
+        argv = argv[0].split()  # Chromium children rewrite their title into one space-joined string
+    try:
+        exe = os.path.basename(os.readlink(f"{PROC}/{p}/exe")).removesuffix(" (deleted)")
+    except OSError:
+        exe = ""
+    return {"comm": comm, "start": start, "argv": argv, "exe": exe, "uid": uid}
+
+
+def unit_of(pid: int) -> str:
+    """The systemd unit that owns the process (a service ends cleanly and does not restart on SIGTERM)."""
+    try:
+        cg = read(f"{PROC}/{pid}/cgroup").strip().rsplit("/", 1)[-1]
+    except OSError:
+        return ""
+    return cg if cg.endswith(".service") else ""
+
+
+def display_name(info: dict) -> str:
+    argv, exe, comm = info["argv"], info["exe"], info["comm"]
+    if any(a == "--type=gpu-process" for a in argv):
+        return f"{exe or comm} (GPU process)"  # Chromium/Electron: name the app, not 'renderD129 --cr'
+    base = os.path.basename(argv[0]) if argv else ""
+    if base.startswith(INTERPRETERS) and len(argv) > 1:
+        for a in argv[1:]:
+            if not a.startswith("-"):
+                return os.path.basename(a)
+    if base and len(base) <= 32 and " " not in base:
+        return base
+    return exe or comm
+
+
+def is_ollama(info: dict) -> bool:
+    return info["exe"] in ("ollama", "llama-server") or info["comm"] in ("ollama", "llama-server")
+
+
+def app_root(pid: int, info: dict) -> tuple[int, dict]:
+    """Chromium/Electron GPU children respawn when killed (and Hermes then falls back to software GL), so a row
+    for one names and ends the app's browser process: the nearest ancestor without a --type= switch."""
+    if not any(a == "--type=gpu-process" for a in info["argv"]):
+        return pid, info
+    cur, cinfo = pid, info
+    for _ in range(6):
+        try:
+            ppid = int(read(f"{PROC}/{cur}/stat").rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+        pinfo = proc_info(ppid)
+        if pinfo is None or ppid <= 1:
+            break
+        cur, cinfo = ppid, pinfo
+        if not any(a.startswith("--type=") for a in pinfo["argv"]):
+            # Hermes re-execs itself (launcher -> --ozone-platform child): end the outermost copy.
+            while True:
+                try:
+                    up = int(read(f"{PROC}/{cur}/stat").rsplit(")", 1)[1].split()[1])
+                except (OSError, IndexError, ValueError):
+                    break
+                uinfo = proc_info(up) if up > 1 else None
+                if uinfo is None or uinfo["exe"] != cinfo["exe"] or any(a.startswith("--type=") for a in uinfo["argv"]):
+                    break
+                cur, cinfo = up, uinfo
+            return cur, cinfo
+    return pid, info
+
+
+def snapshot(limit: int) -> dict:
+    totals = gpu_totals()
+    rows = []
+    for gpid, g in pmon().items():
+        ginfo = proc_info(gpid)
+        if ginfo is None:
+            continue
+        pid, info = app_root(gpid, ginfo)
+        mine = info["uid"] == MY_UID
+        ollama = is_ollama(info)
+        protected = (not mine) or pid == 1 or info["comm"] in PROTECTED or info["exe"] in PROTECTED
+        argv = info["argv"]
+        rows.append({
+            "pid": pid, "start": info["start"], "name": display_name(info), "comm": info["comm"],
+            "cmd": " ".join(" ".join(argv).split())[:240] if argv else f"[{info['comm']}]",
+            "vram_mb": g["fb_mb"], "sm": g["sm"], "type": g["type"], "unit": unit_of(pid),
+            "mine": mine, "protected": protected, "action": "unload" if ollama else ("" if protected else "end"),
+        })
+    merged: dict[int, dict] = {}  # an app with several GPU children shows once, with their VRAM and SM summed
+    for r in rows:
+        m = merged.get(r["pid"])
+        if m is None:
+            merged[r["pid"]] = r
+        else:
+            m["vram_mb"] += r["vram_mb"]
+            if r["sm"] is not None:
+                m["sm"] = (m["sm"] or 0) + r["sm"]
+    rows = sorted(merged.values(), key=lambda r: (r["vram_mb"], r["sm"] or 0), reverse=True)
+    cause = None
+    if rows:
+        top = rows[0]
+        cause = {"name": top["name"], "vram_mb": top["vram_mb"], "pid": top["pid"]}
+    return {**totals, "procs": rows[:limit], "count": len(rows), "cause": cause}
+
+
+def unload() -> int:
+    try:
+        with urllib.request.urlopen(f"{OLLAMA}/api/ps", timeout=5) as r:
+            models = [m["name"] for m in json.load(r).get("models", [])]
+    except (OSError, ValueError) as e:
+        print(f"Ollama did not answer: {e}", file=sys.stderr)
+        return 3
+    for m in models:
+        body = json.dumps({"model": m, "keep_alive": 0}).encode()
+        req = urllib.request.Request(f"{OLLAMA}/api/generate", data=body, headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=30).read()
+        except OSError as e:
+            print(f"could not unload {m}: {e}", file=sys.stderr)
+            return 3
+    print(json.dumps({"unloaded": models}))
+    return 0 if models else 4
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="gpu-procs")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    n = sub.add_parser("snapshot")
+    n.add_argument("--limit", type=int, default=8)
+    for name in ("end", "alive"):
+        e = sub.add_parser(name)
+        e.add_argument("pid")
+        e.add_argument("start")
+        if name == "end":
+            e.add_argument("--force", action="store_true")
+    sub.add_parser("unload")
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit as exc:
+        return 2 if exc.code else 0
+    if a.cmd == "snapshot":
+        try:
+            print(json.dumps(snapshot(max(1, a.limit)), separators=(",", ":")))
+        except (OSError, subprocess.SubprocessError, IndexError) as e:
+            print(f"nvidia-smi failed: {e}", file=sys.stderr)
+            return 1
+        return 0
+    if a.cmd == "unload":
+        return unload()
+    args = [CPU_PROCS, a.cmd, a.pid, a.start] + (["--force"] if getattr(a, "force", False) else [])
+    return subprocess.run([sys.executable, "-I", *args]).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

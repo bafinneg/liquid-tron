@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Cycle the focused monitor's local 1..6 workspace stack with the physical slide direction.
+# FEAT-lt26r-5 OD-F: the direction policy lives in hyprland.lua (LT26R_CYCLE_LOCAL), which flips
+# slidevert only for a 6 -> 1 or 1 -> 6 wrap and restores the configured style straight after the
+# dispatch. Every bind calls it in-process; this script is the entry point for external callers.
+set -euo pipefail
+
+case "${1:-}" in
+  down) delta="+1" ;;
+  up) delta="-1" ;;
+  *)
+    printf 'usage: %s up|down\n' "${0##*/}" >&2
+    exit 64
+    ;;
+esac
+
+hyprctl dispatch "function() return LT26R_CYCLE_LOCAL(\"$delta\") end" >/dev/null

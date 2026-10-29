@@ -1,0 +1,30 @@
+[wallpaper]
+enabled = false
+directory = "{{ .chezmoi.homeDir }}/Pictures/Wallpapers"
+fill_mode = "crop"
+
+[wallpaper.automation]
+enabled = false
+recursive = true
+
+[hooks]
+wallpaper_changed = "{{ .chezmoi.homeDir }}/.local/bin/wallpaper-selected-apply"
+# HQ-0100 round 3: the Ares helm follows the theme (instrument.luau re-tints on this event).
+colors_changed = "{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg plugin liquidtron/ares:instrument all theme"
+
+[theme]
+wallpaper_scheme = "m3-content"
+
+[shell.launcher.providers.wallpaper]
+global = false
+prefix = "/wall"
+
+# Left click opens the native Liquid Tron wallpaper picker panel (plugin liquidtron/wallpaper:picker: one click sets
+# a wallpaper on all three monitors; FULL STUDIO opens the per-monitor Wallpaper Studio). A native panel, so it opens
+# with Noctalia's own animation and closes on any outside click. Right click keeps the stock still-image picker.
+[widget.wallpaper]
+type = "wallpaper"
+
+[widget.wallpaper.actions]
+left = "panel-toggle liquidtron/wallpaper:picker"
+right = "panel-toggle wallpaper"

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Liquid Tron",
+  "version": "1.0.0",
+  "description": "Liquid Tron browser colors from home-infra (LT26R-2). Colors only: no permissions, scripts, or remote content.",
+  "theme": {
+    "colors": {
+      "frame": [6, 6, 12],
+      "frame_inactive": [6, 6, 12],
+      "toolbar": [10, 10, 20],
+      "tab_text": [10, 189, 198],
+      "tab_background_text": [112, 112, 128],
+      "tab_background_text_inactive": [112, 112, 128],
+      "toolbar_text": [192, 192, 208],
+      "toolbar_button_icon": [192, 192, 208],
+      "bookmark_text": [192, 192, 208],
+      "omnibox_background": [14, 14, 28],
+      "omnibox_text": [192, 192, 208],
+      "ntp_background": [10, 10, 20],
+      "ntp_text": [192, 192, 208],
+      "ntp_link": [10, 189, 198]
+    }
+  }
+}

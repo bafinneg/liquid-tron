@@ -1,0 +1,486 @@
+#!/usr/bin/env -S python3 -I
+"""ares-signal-act (FEAT-ares-signal-meter C4): the meter's and the advisor panel's allowlisted actions.
+
+Reads $XDG_RUNTIME_DIR/ares/advisor/signals.json (written by ares-advisor). Exit 0 done, 2 usage or unknown signal id.
+`open` runs exactly one allowlisted, read-only action chosen by the signal's action hint, then records the feedback
+through `ares-advisor feedback <sig> open`. Journal and task advisories open inside the Liquid Tron signals panel
+(`panel-open liquidtron/advisor:panel <id>`); `detail` prints the read-only lines that panel shows, `read` only
+records that the advisory was read (the meter's amber follow-up tint then clears). Approvals open their Conversation
+directly (a Hermes Conversation no state.db knows opens the brief instead, never a blank Conversation); every other advisory opens a plain-language brief (what happened, what it affects, what to do) whose one
+button runs `go`, the advisory's allowlisted surface. Nothing here restarts, stops, kills or edits anything. Every command is an
+argv list; signal text is never interpolated into a shell string.
+
+Usage: ares-signal-act <id> open|go|dismiss|read|detail | list
+"""
+import json
+import os
+import re
+import glob
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+SIGNALS = os.path.join(RUNTIME, "ares", "advisor", "signals.json")
+PRESENCE = os.path.join(RUNTIME, "ares", "presence.json")
+BASELINE = os.path.join(HOME, ".local/state/ares-advisor/baseline.json")
+CONFIG = os.path.join(HOME, ".config/ares-advisor/config.json")
+TASK_STATE = os.path.join(HOME, ".hermes/profiles/fullpower/scripts/task-state.py")
+DEFAULT_MODEL = "qwen2.5:7b-instruct"          # mirrors ares-advisor's DEFAULT_MODEL
+RECENT = 20
+PANEL = "liquidtron/advisor:panel"
+
+UNIT = re.compile(r"^[A-Za-z0-9@._:-]+\.(service|timer|socket|mount)$")
+TASK_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+UUID = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+# The only panels a signal may open.
+PANELS = {"liquidtron/cpu:detail": ["panel-toggle", "liquidtron/cpu:detail"],
+          "control-center network": ["panel-toggle", "control-center", "network"]}
+
+
+def binary(name):
+    d = os.environ.get("ARES_SIGNAL_ACT_BINDIR")
+    if d:
+        return os.path.join(d, name)
+    local = os.path.join(HOME, ".local/bin", name)
+    return local if os.access(local, os.X_OK) else name
+
+
+def load(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def signals():
+    d = load(SIGNALS, {})
+    return d if isinstance(d, dict) else {}
+
+
+def spawn(argv):
+    """Fire and forget (a terminal window outlives this process)."""
+    try:
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
+def call(argv):
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=15, check=False).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def msg(*args):
+    return call([binary("noctalia-primary-msg"), *args])
+
+
+def hermes_dbs():
+    root = os.path.join(HOME, ".hermes")
+    return [p for p in [os.path.join(root, "state.db"), *sorted(glob.glob(os.path.join(root, "profiles/*/state.db")))]
+            if os.path.isfile(p)]
+
+
+def hermes_exists(sid):
+    """True when a Hermes profile knows the Conversation, False when every readable store lacks it, None when no
+    store can be read (then the click keeps its old behaviour). A missing target would open a blank Conversation."""
+    seen = False
+    for path in hermes_dbs():
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+            try:
+                if con.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (sid,)).fetchone():
+                    return True
+            finally:
+                con.close()
+            seen = True
+        except sqlite3.Error:
+            continue
+    return False if seen else None
+
+
+def missing_target(action):
+    kind, _, rest = action.partition(":")
+    what, _, ident = rest.partition(":")
+    return kind == "open" and what == "hermes" and SESSION_ID.fullmatch(ident) is not None \
+        and hermes_exists(ident) is False
+
+
+def chat_cwd(sid):
+    d = load(PRESENCE, {})
+    for c in (d.get("chats") or []) if isinstance(d, dict) else []:
+        if isinstance(c, dict) and c.get("id") == sid:
+            o = c.get("open")
+            cwd = (o.get("cwd") if isinstance(o, dict) else None) or c.get("cwd")
+            return cwd if isinstance(cwd, str) else None
+    return None
+
+
+DETAIL_LINES = 12
+DETAIL_CHARS = 220
+
+
+def capture(argv):
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def journal_lines(scope, unit):
+    argv = [binary("journalctl"), *(["--user"] if scope == "user" else []), "-u", unit, "-n", str(DETAIL_LINES),
+            "-o", "json", "--output-fields=MESSAGE,PRIORITY", "--no-pager"]
+    out = capture(argv)
+    lines = []
+    for raw in (out or "").splitlines():
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            continue
+        m = e.get("MESSAGE")
+        if not isinstance(m, str):                  # binary payloads arrive as byte arrays: skip them
+            continue
+        try:
+            lt = time.localtime(int(e.get("__REALTIME_TIMESTAMP", "0")) / 1e6)
+            ts, day = time.strftime("%H:%M:%S", lt), time.strftime("%Y-%m-%d", lt)
+            pri = int(e.get("PRIORITY", 6))
+        except (TypeError, ValueError):
+            ts, day, pri = "", "", 6
+        lines.append({"t": ts, "d": day, "p": pri, "m": " ".join(m.split())[:DETAIL_CHARS]})
+    return lines
+
+
+def task_lines(ident):
+    out = capture([sys.executable, "-I", TASK_STATE, "status", ident])
+    return [{"t": "", "p": 6, "m": " ".join(l.split())[:DETAIL_CHARS]}
+            for l in (out or "").splitlines() if l.strip()][:DETAIL_LINES]
+
+
+SHARE_WORDS = {"homes": "home folders", "photo": "photos", "music": "music", "video": "videos", "media": "media"}
+URGENCY = {1: ("ACT NOW", 3), 2: ("ACT NOW", 3), 3: ("WHEN CONVENIENT", 1), 4: ("FOR YOUR INFORMATION", 0)}
+
+
+def task_state(ident):
+    d = load(os.path.join(HOME, ".hermes/tasks", ident, "state.json"), {})
+    return d if isinstance(d, dict) else {}
+
+
+def plain_reason(reason):
+    r = (reason or "").lower()
+    if "budget" in r:
+        return "It used up its work budget before finishing."
+    if "owner" in r or "approval" in r or "decision" in r:
+        return "It is waiting for a decision from you."
+    if "review" in r:
+        return "A review found a problem it could not settle alone."
+    return "It hit a problem it could not solve alone."
+
+
+def opened_text(sig):
+    if isinstance(sig.get("opened_ms"), int):
+        return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(sig["opened_ms"] / 1000))
+    return ""
+
+
+def hermes_prompt(sig, cls, action, st=None):
+    """The exact prompt the brief's ASK HERMES block shows and copies, for advisories whose fix is "ask Hermes".
+
+    Only validated identifiers (unit names, task ids) and the advisor's own timestamp are interpolated; free text
+    (a task title or reason) is collapsed to one printable line. "" when the advisory needs no investigation.
+    """
+    when = opened_text(sig)
+    since = f" (ARES advisory {one_line(sig.get('id') or sig.get('sig'))}, opened {when})" if when else \
+        f" (ARES advisory {one_line(sig.get('id') or sig.get('sig'))})"
+    if cls == "unit.failed":
+        kind, _, rest = action.partition(":")
+        scope, _, unit = rest.partition(":")
+        if kind != "journal" or scope not in ("system", "user") or not UNIT.fullmatch(unit):
+            return ""
+        user = " --user" if scope == "user" else ""
+        where = "user" if scope == "user" else "system"
+        if unit.endswith(".mount"):
+            return (f"ARES on 7800x reports that the {where} mount {unit} is not connected{since}. Investigate why: "
+                    f"run `systemctl{user} status {unit} --no-pager` and `journalctl{user} -u {unit} -n 100 --no-pager`, "
+                    "check that the server behind it is reachable and exporting the share, then reconnect it if that "
+                    "is safe. Verify the folder lists files again, and report the root cause and what you changed.")
+        return (f"ARES on 7800x reports that the {where} unit {unit} stopped{since}. Investigate why: run "
+                f"`systemctl{user} status {unit} --no-pager` and `journalctl{user} -u {unit} -n 100 --no-pager`, find "
+                "the root cause, and fix it if the fix is safe. Verify the unit is active (or its last run succeeded, "
+                "for a timer or oneshot), and report the root cause and what you changed.")
+    if cls == "ts.down":
+        return (f"ARES on 7800x reports that Tailscale is off{since}. Investigate why: run `tailscale status` and "
+                "`systemctl status tailscaled --no-pager`, bring Tailscale back up if that is safe, verify this PC "
+                "is reachable on the tailnet again, and report the root cause and what you changed.")
+    if cls == "task.blocked":
+        ident = action.rsplit(":", 1)[-1]
+        if not TASK_ID.fullmatch(ident):
+            return ""
+        st = st or {}
+        title = one_line(st.get("title")) if isinstance(st.get("title"), str) else ""
+        ref = one_line(st.get("ref")) if isinstance(st.get("ref"), str) else ""
+        reason = one_line(st.get("blocked_reason")) if isinstance(st.get("blocked_reason"), str) else ""
+        name = " ".join(x for x in (ref, ident) if x) + (f" ({title})" if title else "")
+        why = f" It stopped with: \"{reason}\"." if reason else ""
+        return (f"Hermes paused task {name}{since}.{why} Run `python3 {TASK_STATE} status {ident}`, find out why it "
+                "stopped, and resolve it: continue the task if it is still needed, or tell me it should be closed "
+                "and why. Report what blocked it and what you did.")
+    return ""
+
+
+def brief(sig):
+    """Executive summary of one advisory: icon, tone, what happened, what it affects, what to do. Plain words only."""
+    cls = (sig.get("sig") or "").split(":", 1)[0]
+    action = sig.get("action") or ""
+    if action.startswith("journal:"):
+        cls = "unit.failed"                         # the action names the unit; the brief explains it
+    pri = sig.get("priority") if isinstance(sig.get("priority"), int) else 3
+    tone = {1: "tertiary", 2: "error", 3: "primary", 4: "secondary"}.get(pri, "primary")
+    b = {"glyph": "info-circle", "tone": tone, "what": "", "impact": "", "next": "", "button": "", "facts": [],
+         "prompt": ""}
+    if cls == "approval":
+        claude = action.startswith("open:claude:")
+        b.update(glyph="lock-open", what=("Claude Code" if claude else "Hermes") + " is waiting for your OK.",
+                 impact="That work is paused until you answer.", next="Open the Conversation and approve or decline.",
+                 button="OPEN CONVERSATION")
+        if missing_target(action):
+            b.update(glyph="lock-open", what="The Conversation that asked for your OK no longer exists.",
+                     impact="Nothing is waiting on you.", next="Dismiss this advisory.", button="")
+    elif cls in ("net.down", "net.dns"):
+        b.update(glyph="wifi-off", what="This PC cannot reach the internet.",
+                 impact="Websites, cloud apps and AI services will not work.",
+                 next="Check the router. This clears by itself when the connection returns.", button="NETWORK")
+    elif cls == "ups.battery":
+        b.update(glyph="battery-2", what="Wall power is out. The battery is keeping this PC running.",
+                 impact="The PC will shut down when the battery runs out.",
+                 next="Save your work now. Shut down if power does not return soon.")
+    elif cls in ("temp.cpu", "temp.gpu"):
+        b.update(glyph="flame", what="The " + ("graphics card" if cls == "temp.gpu" else "processor") + " is too hot.",
+                 impact="The PC may slow itself down or shut off to protect itself.",
+                 next="Close heavy apps or games. This clears once it cools.", button="SYSTEM MONITOR")
+    elif cls in ("temp.p99", "temp.nvme") or (cls == "trend" and "temp" in (sig.get("sig") or "")):
+        b.update(glyph="temperature", what="A part is running warmer than it normally does.",
+                 impact="Still within safe limits. Nothing is affected yet.",
+                 next="No action needed now. If it keeps happening, have the fans and dust checked.",
+                 button="SYSTEM MONITOR")
+    elif cls == "cpu.util":
+        b.update(glyph="cpu", what="Something has kept the processor busy for a while.",
+                 impact="Other apps may feel slower.", next="Normal during builds or games. Otherwise, see what is running.",
+                 button="SYSTEM MONITOR")
+    elif cls == "psi.mem":
+        b.update(glyph="cpu", what="Apps are competing for memory.", impact="Things may feel slow or pause briefly.",
+                 next="Close apps you are not using.", button="SYSTEM MONITOR")
+    elif cls in ("disk.crit", "disk.low") or (cls == "trend" and "disk" in (sig.get("sig") or "")):
+        b.update(glyph="database", what="Storage space is running out.",
+                 impact="When it is full, apps cannot save and updates fail.",
+                 next="Delete or move large files you no longer need.", button="SYSTEM MONITOR")
+    elif cls == "ts.down":
+        b.update(glyph="cloud-off", what="Remote access (Tailscale) is off.",
+                 impact="You cannot reach this PC from your phone or away from home.",
+                 next="Turn Tailscale back on, or copy the prompt below into Hermes.", button="NETWORK")
+    elif cls == "unit.failed":
+        unit = action.rsplit(":", 1)[-1]
+        stem, _, kind = unit.rpartition(".")
+        if kind == "mount":
+            parts = stem.split("-")
+            host = parts[1].capitalize() if len(parts) > 1 else "the server"
+            what = SHARE_WORDS.get(parts[-1], parts[-1]) if len(parts) > 2 else "shared"
+            b.update(glyph="server-off", what=f"The {what} folder on {host} is not connected.",
+                     impact=f"Those files cannot be opened on this PC. Nothing is lost; they are still on {host}.",
+                     next=f"It usually reconnects when {host} is back online. If not, copy the prompt below into Hermes.")
+            b["facts"] = [{"k": "SERVER", "v": host.upper()}, {"k": "FOLDER", "v": what.upper()},
+                          {"k": "DATA", "v": "SAFE", "tone": "secondary"}]
+        else:
+            b.update(glyph="alert-triangle", what="A background service on this PC stopped.",
+                     impact="The feature it provides may not work until it restarts.",
+                     next="Copy the prompt below into Hermes to investigate it.")
+    elif cls == "task.blocked":
+        st = task_state(action.rsplit(":", 1)[-1])
+        title = st.get("title") if isinstance(st.get("title"), str) else (sig.get("text") or "")
+        reason = st.get("blocked_reason") if isinstance(st.get("blocked_reason"), str) else ""
+        b.update(glyph="player-pause", what=f"Hermes paused a task: {title}.", impact=plain_reason(reason),
+                 next="Copy the prompt below into a new Hermes Conversation to continue it, or close it if it is "
+                      "no longer needed.")
+        try:
+            used = int(st.get("tokens_used")) * 100 // int(st.get("budget_tokens"))
+            b["facts"] = [{"k": "WORK BUDGET", "v": f"{used}% USED", "tone": "error" if used >= 100 else "tertiary"}]
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    elif cls == "task.done":
+        b.update(glyph="circle-check", what="Hermes finished a task.", impact="Nothing needs your attention.",
+                 next="No action needed.")
+    else:
+        b.update(what=(sig.get("text") or "").capitalize(), next="No action needed now.")
+    b["prompt"] = hermes_prompt(sig, cls, action, task_state(action.rsplit(":", 1)[-1])
+                                if cls == "task.blocked" and TASK_ID.fullmatch(action.rsplit(":", 1)[-1]) else None)
+    b["urgency"], b["level"] = URGENCY.get(pri, URGENCY[3])
+    if cls == "approval" and missing_target(action):
+        b["tone"], (b["urgency"], b["level"]) = "secondary", URGENCY[4]   # nothing to act on: never "ACT NOW"
+    if b["button"] and do_open_kind(action) not in ("summon", "panel"):
+        b["button"] = ""
+    return b
+
+
+def do_open_kind(action):
+    kind, _, rest = action.partition(":")
+    if kind == "panel" and rest in PANELS:
+        return "panel"
+    if kind == "open" and rest.split(":", 1)[0] in ("hermes", "claude"):
+        return "summon"
+    return ""
+
+
+PRI_WORDS = ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")
+
+
+def one_line(s):
+    """Single printable line: control characters (escape sequences, carriage returns) become spaces."""
+    return " ".join("".join(c if c.isprintable() else " " for c in str(s or "")).split())
+
+
+def code_block(sig, source, lines, commands):
+    """The TECHNICAL DETAILS block the panel shows and copies: safe to paste into Hermes or a terminal.
+
+    Everything except the trailing read-only commands is a `#` comment on a single line (whitespace collapsed), so
+    a paste into zsh (interactivecomments) runs only those commands, which are built from validated ids alone.
+    Rows carry the journal priority so the panel can keep its colours.
+    """
+    when = opened_text(sig)
+    rows = [{"s": f"# ARES advisory: {one_line(sig.get('text'))} ({one_line(sig.get('id') or sig.get('sig'))})"},
+            {"s": "# " + " · ".join(x for x in (f"opened {when}" if when else "", one_line(source)) if x)}]
+    for l in lines[::-1]:                           # oldest first, as a log reads
+        p = l.get("p")
+        tag = f"[{PRI_WORDS[p]}] " if isinstance(p, int) and 0 <= p < len(PRI_WORDS) else ""
+        stamp = " ".join(x for x in (one_line(l.get("d")), one_line(l.get("t"))) if x)
+        rows.append({"s": "# " + " ".join(x for x in (stamp, tag + one_line(l.get("m"))) if x), "p": p})
+    if commands:
+        rows.append({"s": "# Read-only follow-up:"})
+        rows += [{"s": c, "cmd": True} for c in commands]
+    return rows
+
+
+def detail(sig):
+    """Read-only lines for the signals panel; nothing is launched."""
+    action = sig.get("action") or ""
+    kind, _, rest = action.partition(":")
+    lines, source, commands = [], "", []
+    if kind == "journal":
+        scope, _, unit = rest.partition(":")
+        if scope in ("system", "user") and UNIT.fullmatch(unit):
+            lines, source = journal_lines(scope, unit)[::-1], f"JOURNAL · {unit}"  # newest first
+            user = " --user" if scope == "user" else ""
+            commands = [f"systemctl{user} status {unit} --no-pager", f"journalctl{user} -u {unit} -n 50 --no-pager"]
+    elif kind == "open":
+        what, _, ident = rest.partition(":")
+        if what == "task" and TASK_ID.fullmatch(ident):
+            lines, source = task_lines(ident), f"TASK · {ident}"
+            commands = [f"python3 {shlex.quote(TASK_STATE)} status {ident}"]
+    code = code_block(sig, source, lines, commands) if lines else []
+    return {"sig": sig.get("sig"), "id": sig.get("id"), "text": sig.get("text"), "priority": sig.get("priority"),
+            "opened_ms": sig.get("opened_ms"), "action": action, "source": source, "lines": lines, "code": code,
+            "brief": brief(sig)}
+
+
+def do_go(sig):
+    """The brief's one action button: run the advisory's allowlisted surface (a Conversation or a system panel)."""
+    action = sig.get("action") or ""
+    kind, _, rest = action.partition(":")
+    if kind == "open":
+        what, _, ident = rest.partition(":")
+        if what == "hermes" and SESSION_ID.fullmatch(ident):
+            if hermes_exists(ident) is False:
+                return False                        # never open a blank Conversation for a missing target
+            return call([binary("ares-summon"), "--hermes", ident])
+        if what == "claude" and UUID.fullmatch(ident):
+            cwd = chat_cwd(ident)
+            if cwd:
+                return call([binary("ares-summon"), "--claude", ident, cwd])
+    elif kind == "panel" and rest in PANELS:
+        return msg(*PANELS[rest])
+    return None
+
+
+def do_open(sig):
+    """Meter click / list click. Approvals go straight to their Conversation (the fix is the click); every other
+    advisory opens its plain-language brief in the signals panel, which records `read` once shown."""
+    action = sig.get("action") or ""
+    if not openable(action):
+        return None                                 # no hint, or one outside the allowlist: do nothing
+    if do_open_kind(action) == "summon" and not missing_target(action):
+        return do_go(sig)                           # a missing Conversation shows its brief in the panel instead
+    return "panel" if msg("panel-open", PANEL, sig.get("id") or sig["sig"]) else False
+
+
+def openable(action):
+    kind, _, rest = action.partition(":")
+    if kind == "panel":
+        return rest in PANELS
+    if kind == "journal":
+        scope, _, unit = rest.partition(":")
+        return scope in ("system", "user") and bool(UNIT.fullmatch(unit))
+    if kind == "open":
+        what, _, ident = rest.partition(":")
+        return ((what == "hermes" and bool(SESSION_ID.fullmatch(ident))) or (what == "claude" and bool(UUID.fullmatch(ident)))
+                or (what == "task" and bool(TASK_ID.fullmatch(ident))))
+    return False
+
+
+def feedback(sid, what):
+    return call([binary("ares-advisor"), "feedback", sid, what])
+
+
+def listing():
+    d = signals()
+    n = 0
+    bl = load(BASELINE, {})
+    for m in (bl.get("metrics") or {}).values() if isinstance(bl, dict) else []:
+        if isinstance(m, dict) and isinstance(m.get("n"), int):
+            n = max(n, m["n"])
+    cfg = load(CONFIG, {})
+    model = cfg.get("model") if isinstance(cfg, dict) and isinstance(cfg.get("model"), str) else DEFAULT_MODEL
+    active = [{**a, "glyph": brief(a)["glyph"]} for a in d.get("active") or [] if isinstance(a, dict)]
+    return {"now_ms": int(time.time() * 1000), "active": active,
+            "resolved": (d.get("resolved") or [])[-RECENT:][::-1], "baseline_n": n, "model": model}
+
+
+def main(argv):
+    if argv == ["list"]:
+        print(json.dumps(listing(), separators=(",", ":")))
+        return 0
+    if len(argv) != 2 or argv[1] not in ("open", "go", "dismiss", "read", "detail"):
+        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+        return 2
+    sid, verb = argv
+    sig = next((s for s in signals().get("active") or []
+                if isinstance(s, dict) and sid in (s.get("sig"), s.get("id"))), None)
+    if sig is None:
+        print(f"ares-signal-act: unknown signal {sid!r}", file=sys.stderr)
+        return 2
+    if verb == "dismiss":
+        return 0 if feedback(sig["sig"], "dismiss") else 1
+    if verb == "read":
+        return 0 if feedback(sig["sig"], "open") else 1
+    if verb == "detail":
+        print(json.dumps(detail(sig), separators=(",", ":"), ensure_ascii=False))
+        return 0
+    ok = do_go(sig) if verb == "go" else do_open(sig)
+    if ok is None:
+        print(f"ares-signal-act: signal {sid!r} has no allowlisted action", file=sys.stderr)
+        return 2
+    if ok is True:
+        feedback(sig["sig"], "open")                # in-panel advisories record `read` from the panel once shown
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

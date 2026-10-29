@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# lt-companion-launch <config-name> [VAR=value ...]
+#
+# Start a Liquid Tron Quickshell companion (`qs -c <config-name> -d`) in its own transient systemd scope, so it
+# never lives in the caller's cgroup. A companion started from a Hermes terminal used to sit inside
+# hermes-gateway.service and died with every gateway restart (FEAT-lt28 AC1; the pattern is atoll's "an app launched
+# from the shell dies with the shell"). QSG_RENDER_LOOP=threaded: Qt picks the GUI-thread basic loop on NVIDIA whenever
+# XDG_CURRENT_DESKTOP is set, which caps animation near 60 fps on 120/240 Hz panels.
+set -euo pipefail
+
+name=${1:?usage: lt-companion-launch <config-name> [VAR=value ...]}
+shift
+[[ $name =~ ^[a-z0-9-]+$ ]] || { echo "lt-companion-launch: bad config name: $name" >&2; exit 2; }
+
+envs=(--setenv=QSG_RENDER_LOOP=threaded)
+for kv in "$@"; do
+  [[ $kv =~ ^[A-Z_][A-Z0-9_]*=.*$ ]] || { echo "lt-companion-launch: bad VAR=value: $kv" >&2; exit 2; }
+  envs+=("--setenv=$kv")
+done
+
+# With --scope, systemd-run moves itself into a new transient scope and execs the command there; `qs -d` daemonises
+# and its daemon stays in that scope's cgroup, so the scope lives exactly as long as the companion.
+exec systemd-run --user --scope --collect --quiet \
+  --unit="lt-companion-${name}-$(date +%s%N)" \
+  --description="Liquid Tron companion ${name}" \
+  "${envs[@]}" \
+  -- qs -c "$name" -d

@@ -1,0 +1,422 @@
+-- GPU detail panel: what is using the GPU, under the bar's GPU gauge.
+--
+-- While open it takes a `gpu-procs snapshot` every 2 s (second ticks stop when the panel closes, so nothing samples at
+-- idle). Rows are sorted by VRAM, because VRAM exhaustion is what corrupts the desktop (nvidia-drm cannot allocate
+-- window buffers, so apps show ghosted, stale frames). Each row: app, pid and command, VRAM, shader (SM) share, and
+-- END: click once to arm (CONFIRM), again to send SIGTERM; a process still alive after 3 s is offered FORCE (SIGKILL).
+-- Chromium/Electron GPU children are reported as their app, so END closes the app instead of a respawning helper.
+-- Ollama's runner belongs to the ollama user; its row offers UNLOAD (keep_alive 0) instead of END.
+-- gpu-procs delegates end/alive to cpu-procs, which re-checks pid + start time and refuses other users' and session
+-- processes. Esc, a click anywhere else and a second gauge click close it (Noctalia's attached-panel behaviour).
+-- No background fill: the panel inherits the shell panel material. Labels inherit the shell font; only size is set.
+--
+-- Colour literal (everything else is a palette role):
+--   #ff8c00  amber (busy / armed)
+
+local PROCS = "{{ .chezmoi.homeDir }}/.local/bin/gpu-procs"
+local MAX_ROWS = 8
+local SAMPLE_EVERY_S = 2
+local DISARM_MS = 4000
+local GRACE_TERM_MS = 3000
+local GRACE_KILL_MS = 1000
+local MAX_CMD = 44
+local W_NAME = 290 -- fixed column widths so every row lines up with the header
+local W_MEM = 100
+local W_CPU = 90
+local W_END = 110
+
+local AMBER = "#ff8c00"
+local RED = "error"
+local DIM = "on_surface_variant"
+
+local isOpen = false
+local gen = 0 -- bumped on every open/close; stale async results are dropped
+local sampling = false
+local ticks = 0
+local sample = nil
+local hovered = nil
+local message = ""
+local messageIsError = false
+local armedKey = nil
+local armedAt = 0
+local ending = {} -- key -> { force = bool, at = ms, proc = row }
+local stubborn = {} -- key -> true when SIGTERM did not end it
+local busy = false -- an end/alive call is in flight
+
+local function keyOf(p)
+  return tostring(p.pid) .. ":" .. tostring(p.start)
+end
+
+local function clip(s, n)
+  s = string.gsub(s or "", "%s+", " ")
+  local len = utf8.len(s)
+  if len == nil then
+    return string.sub(s, 1, n)
+  end
+  if len <= n then
+    return s
+  end
+  return string.sub(s, 1, utf8.offset(s, n) - 1) .. "…"
+end
+
+local function fmtMem(mb)
+  if mb >= 1024 then
+    return string.format("%.1f GB", mb / 1024)
+  end
+  return string.format("%d MB", mb)
+end
+
+local function loadColor(pct)
+  if pct >= 50 then
+    return RED
+  elseif pct >= 20 then
+    return AMBER
+  end
+  return "primary"
+end
+
+local function rowState(p)
+  local k = keyOf(p)
+  if ending[k] ~= nil then
+    return ending[k].force and "force" or "term"
+  end
+  if stubborn[k] then
+    return "stubborn"
+  end
+  if armedKey == k then
+    return "armed"
+  end
+  return "idle"
+end
+
+local render -- forward
+
+local function setMessage(text, isError)
+  message = text
+  messageIsError = isError == true
+end
+
+local function checkAlive(k, entry)
+  local myGen = gen
+  busy = true
+  noctalia.runAsync({ PROCS, "alive", tostring(entry.proc.pid), tostring(entry.proc.start) }, function(result)
+    busy = false
+    if myGen ~= gen then
+      return
+    end
+    ending[k] = nil
+    local name = entry.proc.name
+    if result.exitCode ~= 0 then
+      stubborn[k] = nil
+      setMessage((entry.force and "Killed " or "Closed ") .. name .. ".")
+    else
+      stubborn[k] = true
+      if entry.force then
+        setMessage(name .. " is still running (it may be stuck in the kernel).", true)
+      else
+        setMessage(name .. " ignored the request. Click FORCE to kill it.", true)
+      end
+    end
+    render()
+  end)
+end
+
+local function unloadClicked(p)
+  local k = keyOf(p)
+  if busy then
+    return
+  end
+  if armedKey ~= k then
+    armedKey = k
+    armedAt = noctalia.nowMs()
+    setMessage("Click CONFIRM to unload every Ollama model (it reloads on next use).")
+    render()
+    return
+  end
+  armedKey = nil
+  local myGen = gen
+  busy = true
+  setMessage("Unloading Ollama models…")
+  render()
+  noctalia.runAsync({ PROCS, "unload" }, function(result)
+    busy = false
+    if myGen ~= gen then
+      return
+    end
+    if result.exitCode == 0 then
+      setMessage("Ollama models unloaded.")
+    elseif result.exitCode == 4 then
+      setMessage("No Ollama model was loaded.")
+    else
+      local err = string.gsub(result.stderr or "", "%s+$", "")
+      setMessage("Not unloaded: " .. (err ~= "" and err or "refused"), true)
+    end
+    render()
+  end)
+end
+
+local function endClicked(p)
+  local k = keyOf(p)
+  local st = rowState(p)
+  if st == "term" or st == "force" or busy then
+    return
+  end
+  if st == "idle" then
+    armedKey = k
+    armedAt = noctalia.nowMs()
+    setMessage("Click CONFIRM to close " .. p.name .. " (pid " .. tostring(p.pid) .. ")" ..
+      ((p.unit or "") ~= "" and (", service " .. p.unit) or "") .. ".")
+    render()
+    return
+  end
+  -- armed -> SIGTERM; stubborn -> SIGKILL
+  local force = st == "stubborn"
+  armedKey = nil
+  local argv = { PROCS, "end", tostring(p.pid), tostring(p.start) }
+  if force then
+    table.insert(argv, "--force")
+  end
+  local myGen = gen
+  busy = true
+  noctalia.runAsync(argv, function(result)
+    busy = false
+    if myGen ~= gen then
+      return
+    end
+    if result.exitCode == 0 then
+      ending[k] = { force = force, at = noctalia.nowMs(), proc = p }
+      setMessage((force and "Killing " or "Asking ") .. p.name .. (force and "…" or " to close…"))
+    elseif result.exitCode == 4 then
+      setMessage(p.name .. " had already exited.")
+    else
+      local err = string.gsub(result.stderr or "", "%s+$", "")
+      setMessage("Not ended: " .. (err ~= "" and err or "refused"), true)
+    end
+    render()
+  end)
+end
+
+local function takeSample()
+  if sampling then
+    return
+  end
+  sampling = true
+  local myGen = gen
+  noctalia.runAsync({ PROCS, "snapshot", "--limit", tostring(MAX_ROWS) }, function(result)
+    sampling = false
+    if myGen ~= gen or result.exitCode ~= 0 then
+      return
+    end
+    local ok, d = pcall(noctalia.json.decode, result.stdout or "")
+    if ok and type(d) == "table" then
+      sample = d
+      render()
+    end
+  end)
+end
+
+local function onRowHover(state, key)
+  local next = (state == "true") and key or nil
+  if next ~= hovered then
+    hovered = next
+    render()
+  end
+end
+
+local function vramPct()
+  if sample == nil or (sample.vram_total_mb or 0) == 0 then
+    return 0
+  end
+  return 100 * sample.vram_used_mb / sample.vram_total_mb
+end
+
+local function causeText()
+  if sample == nil then
+    return "Sampling…"
+  end
+  local c = sample.cause
+  if c == nil then
+    return "No process is using the GPU."
+  end
+  local lead = vramPct() >= 90 and "VRAM nearly full. Largest: " or "Largest: "
+  return string.format("%s%s · %s of VRAM", lead, c.name, fmtMem(c.vram_mb or 0))
+end
+
+local function endButton(p, st)
+  if p.action == "unload" then
+    local armed = armedKey == keyOf(p)
+    return ui.button({ key = "unload-" .. keyOf(p), text = armed and "CONFIRM" or "UNLOAD", variant = "destructive",
+      controlSize = "sm", width = W_END, enabled = not busy, onClick = function()
+        unloadClicked(p)
+      end })
+  end
+  local text = "END"
+  local variant = "destructive" -- red: this stops the process
+  if st == "armed" then
+    text = "CONFIRM"
+    variant = "destructive"
+  elseif st == "stubborn" then
+    text = "FORCE"
+    variant = "destructive"
+  elseif st == "term" or st == "force" then
+    text = "ENDING…"
+  end
+  return ui.button({
+    key = "end-" .. keyOf(p),
+    text = text,
+    variant = variant,
+    controlSize = "sm",
+    width = W_END,
+    enabled = not (st == "term" or st == "force"),
+    onClick = function()
+      endClicked(p)
+    end,
+  })
+end
+
+local function processRow(i, p)
+  local k = keyOf(p)
+  local st = rowState(p)
+  local tail
+  if p.action == "end" or p.action == "unload" then
+    tail = endButton(p, st)
+  else
+    tail = ui.column({ width = W_END, align = "center" }, {
+      ui.label({ text = p.mine and "SESSION" or "SYSTEM", fontSize = 12, color = DIM }),
+    })
+  end
+  return ui.row({
+    key = k,
+    gap = 12,
+    align = "center",
+    paddingH = 10,
+    paddingV = 4,
+    radius = 8,
+    fill = hovered == k and "surface_variant/0.5" or nil,
+    onHover = onRowHover,
+  }, {
+    ui.column({ gap = 2, width = W_NAME }, {
+      ui.label({ text = clip(p.name, 28), fontSize = 15, fontWeight = "semibold", maxLines = 1 }),
+      ui.label({ text = clip("pid " .. tostring(p.pid) .. " · " .. (p.cmd or ""), MAX_CMD), fontSize = 12,
+        color = DIM, maxLines = 1 }),
+    }),
+    ui.column({ gap = 2, width = W_MEM }, {
+      ui.label({ text = fmtMem(p.vram_mb or 0), fontSize = 15, fontWeight = "semibold",
+        color = (p.vram_mb or 0) >= 4096 and AMBER or "on_surface" }),
+      ui.label({ text = sample and sample.vram_total_mb and sample.vram_total_mb > 0
+        and string.format("%d%% of VRAM", math.floor(100 * (p.vram_mb or 0) / sample.vram_total_mb + 0.5)) or "",
+        fontSize = 12, color = DIM }),
+    }),
+    ui.column({ width = W_CPU }, { ui.label({ text = p.sm ~= nil and string.format("%d%%", math.floor(p.sm + 0.5)) or "–",
+      fontSize = 14, color = p.sm ~= nil and loadColor(p.sm) or DIM }) }),
+    tail,
+  })
+end
+
+render = function()
+  if not isOpen then
+    return
+  end
+  local total = sample and sample.util or 0
+  local children = {
+    ui.row({ key = "head", gap = 12, align = "center" }, {
+      ui.glyph({ name = "gpu-usage", size = 22, color = "primary" }),
+      ui.label({ text = "GPU", fontSize = 16, fontWeight = "bold", color = "primary" }),
+      ui.label({ text = sample and (tostring(math.floor(total + 0.5)) .. "%") or "…", fontSize = 22,
+        fontWeight = "bold", color = loadColor(total) }),
+      ui.label({ text = sample and string.format("VRAM %.1f / %.1f GB · %s°C · %d W", (sample.vram_used_mb or 0) / 1024,
+        (sample.vram_total_mb or 0) / 1024, sample.temp and tostring(math.floor(sample.temp + 0.5)) or "?",
+        math.floor((sample.power_w or 0) + 0.5)) or "",
+        fontSize = 14, color = DIM, flexGrow = 1 }),
+    }),
+    ui.label({ key = "cause", text = causeText(), fontSize = 15, maxLines = 1,
+      color = vramPct() >= 90 and RED or "on_surface" }),
+    ui.separator({ key = "sep1" }),
+    ui.row({ key = "cols", gap = 12, paddingH = 10 }, {
+      -- a bare label sizes to its text, so each header sits in a fixed-width column like the rows below
+      ui.column({ width = W_NAME }, { ui.label({ text = "PROCESS", fontSize = 12, color = DIM }) }),
+      ui.column({ width = W_MEM }, { ui.label({ text = "VRAM", fontSize = 12, color = DIM }) }),
+      ui.column({ width = W_CPU }, { ui.label({ text = "SHADER", fontSize = 12, color = DIM }) }),
+      ui.spacer({ width = W_END }),
+    }),
+  }
+  local rows = {}
+  if sample ~= nil and type(sample.procs) == "table" then
+    for i, p in ipairs(sample.procs) do
+      table.insert(rows, processRow(i, p))
+    end
+  end
+  table.insert(children, ui.column({ key = "rows", gap = 2, flexGrow = 1 }, rows))
+  table.insert(children, ui.separator({ key = "sep2" }))
+  table.insert(children, ui.row({ key = "foot", gap = 12, align = "center" }, {
+    ui.label({
+      text = message,
+      fontSize = 13,
+      color = messageIsError and RED or DIM,
+      maxLines = 2,
+      flexGrow = 1,
+    }),
+    ui.button({ text = "ALL PROCESSES", glyph = "external-link", variant = "outline", controlSize = "sm",
+      onClick = function()
+        noctalia.runAsync({ "kitty", "--class", "nvtop", "-e", "nvtop" })
+        panel.close()
+      end }),
+  }))
+  panel.render(ui.column({ padding = 18, gap = 10, flexGrow = 1 }, children))
+end
+
+function onOpen(_context)
+  gen += 1
+  isOpen = true
+  sample = nil
+  hovered = nil
+  message = ""
+  messageIsError = false
+  armedKey = nil
+  ending = {}
+  stubborn = {}
+  busy = false
+  sampling = false
+  ticks = 0
+  panel.setWantsSecondTicks(true)
+  render()
+  takeSample()
+end
+
+function onClose()
+  gen += 1
+  isOpen = false
+  sampling = false
+  busy = false
+  panel.setWantsSecondTicks(false)
+end
+
+function update()
+  if not isOpen then
+    return
+  end
+  local now = noctalia.nowMs()
+  local changed = false
+  if armedKey ~= nil and now - armedAt > DISARM_MS then
+    armedKey = nil
+    if string.find(message, "CONFIRM", 1, true) then
+      message = ""
+    end
+    changed = true
+  end
+  if not busy then
+    for k, entry in pairs(ending) do
+      if now - entry.at >= (entry.force and GRACE_KILL_MS or GRACE_TERM_MS) then
+        checkAlive(k, entry)
+        break
+      end
+    end
+  end
+  ticks += 1
+  if ticks >= SAMPLE_EVERY_S then
+    ticks = 0
+    takeSample()
+  elseif changed then
+    render()
+  end
+end

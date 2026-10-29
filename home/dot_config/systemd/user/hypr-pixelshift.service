@@ -1,0 +1,13 @@
+[Unit]
+Description=Hyprland pixel shift for OLED burn-in mitigation
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hypr-pixelshift.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

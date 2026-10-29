@@ -1,0 +1,140 @@
+# ── Starship prompt ──
+eval "$(starship init zsh)"
+fastfetch
+
+# ── History ──
+HISTFILE=~/.zsh_history
+HISTSIZE=50000
+SAVEHIST=50000
+setopt EXTENDED_HISTORY       # Timestamps in history
+setopt HIST_IGNORE_ALL_DUPS   # No duplicate entries
+setopt HIST_REDUCE_BLANKS     # Remove extra blanks
+setopt SHARE_HISTORY          # Share history across all tabs/sessions
+
+# ── Directory navigation ──
+setopt AUTO_CD                # Type directory name to cd into it
+setopt AUTO_PUSHD             # cd pushes onto directory stack
+setopt PUSHD_IGNORE_DUPS      # No duplicates in dir stack
+setopt PUSHD_SILENT           # Don't print stack after pushd
+
+# ── Completion ──
+autoload -Uz compinit && compinit
+zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'   # Case-insensitive
+zstyle ':completion:*' menu select                            # Arrow-key menu
+zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"       # Colored completions
+zstyle ':completion:*:descriptions' format '%F{yellow}── %d ──%f'
+
+# ── Plugins ──
+source /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
+source /usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+
+# ── fzf ──
+source <(fzf --zsh)
+export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+export FZF_ALT_C_COMMAND='fd --type d --hidden --follow --exclude .git'
+export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border'
+
+# ── Key bindings ──
+bindkey '^ ' autosuggest-accept              # Ctrl+Space: accept autosuggestion
+bindkey '^[[1;5C' forward-word               # Ctrl+Right: forward word
+bindkey '^[[1;5D' backward-word              # Ctrl+Left: backward word
+bindkey '^H' backward-kill-word              # Ctrl+Backspace: delete word
+
+# ── Shared aliases (generated from shared/shell/aliases.toml) ──
+source ~/.config/zsh/aliases.zsh
+
+# ── local scripts ──
+export PATH="$HOME/.local/bin:$PATH"
+
+# ── cargo ──
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# ── pyenv ──
+export PYENV_ROOT="$HOME/.pyenv"
+[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init -)"
+eval "$(pyenv virtualenv-init -)"
+
+# ── Shell-specific aliases (can't be shared due to syntax/env differences) ──
+alias reboot-linux='# you'\''re already here'
+alias email='TERM=xterm-direct neomutt'
+alias music='~/.local/bin/music'
+alias kanban="$HOME/home-infra/tools/kanban/.venv/bin/kanban"
+
+# ── SSH with colored terminal ──
+ssh() {
+  printf '\033]10;#39ff14\007'
+  command ssh "$@"
+  printf '\033]110;\007'
+}
+
+# ── System modes ──
+enable() {
+    case "$1" in
+        gaming|intelligent) system-mode-toggle "$1" ;;
+        *) builtin enable "$@" ;;
+    esac
+}
+
+# ── Alfred (home-infra agent) ──
+alfred() {
+  printf '\033]11;#0a1929\007'
+  (cd ~/home-infra && command claude "$@")
+  printf '\033]111;\007'
+}
+
+# ── Codex Alfred profile ──
+codex() {
+  if [[ "$1" == "-alfred" ]]; then
+    shift
+    command codex -C "$HOME/home-infra" -p auto_review "$@"
+  else
+    command codex "$@"
+  fi
+}
+
+# ── nvm ──
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+
+# ── quickshell reload ──
+# Reaps quickshell (-c mocr) plus the sidecars it spawned that can
+# outlive it on SIGPIPE: presence-monitor.sh and gdbus monitor. Without
+# the explicit reap, stale sidecars accumulate across reloads (seen
+# 2026-04-24: 10 zombie presence-monitor.sh processes after a few
+# quickshell cycles). pkill returns 1 when nothing matches — harmless
+# here, stderr redirected so the function stays quiet on first run.
+# `&!` is zsh shorthand for `& disown`.
+qs-reload() {
+  pkill -f 'quickshell -c mocr'    2>/dev/null
+  pkill -f 'presence-monitor.sh'   2>/dev/null
+  pkill -f 'gdbus monitor --system' 2>/dev/null
+  sleep 1
+  qs -c mocr -d & disown
+}
+
+# ── Claude Code zellij session (2×2 grid) ──
+t-claude() {
+  if zellij list-sessions -s 2>/dev/null | grep -qx claude; then
+    zellij attach claude
+  else
+    zellij --session claude --new-session-with-layout claude
+  fi
+}
+
+# ── atuin (shell history sync) ──
+eval "$(atuin init zsh)"
+
+# ── zoxide (smart cd) ── must be last
+eval "$(zoxide init zsh --cmd cd)"
+# Override zoxide's doctor check: Claude Code's shell-snapshot replay captures
+# functions but not the chpwd_functions array, causing a false positive. The
+# env-var guard (_ZO_DOCTOR=0) didn't work because the snapshot only persists
+# PATH, not arbitrary exports. Functions *are* captured, so overriding the
+# doctor function makes the fix survive replay. The init call above is already
+# at the end of this file, so the check is redundant for this config anyway.
+__zoxide_doctor() { return 0; }
+
+alias tank='uv run --project {{ .chezmoi.homeDir }}/tank orchestrator'

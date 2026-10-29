@@ -1,0 +1,10 @@
+[Unit]
+Description=Hand gesture HUD (Quickshell, PG42UQ)
+PartOf=hand-gesture.service
+After=hand-gesture.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/qs -n -c hand-gesture
+Restart=on-failure
+RestartSec=2

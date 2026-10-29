@@ -1,0 +1,34 @@
+# FEAT-lt36 owner round 1 (HQ-0098): the Repo Grid moved from a left-monitor Quickshell sheet to a native Noctalia
+# dropdown on the centre PG42UQ bar. The bar glyph (button.luau) and SUPER+C toggle the attached panel (grid.luau);
+# the panel takes Noctalia's attached-panel material, so it gets the same Hyprland blur and bounded rounded edge as
+# the CPU / GPU / wallpaper dropdowns (`noctalia-attached-panel` layer rule in hyprland.lua).
+id          = "liquidtron/repogrid"
+name        = "Repo Grid"
+version     = "1.0.0"
+plugin_api  = 35
+author      = "liquidtron"
+description = "Git and agent view: repos, worktrees, specs, Conversations and Claude jobs, today's tokens, task budgets."
+
+[[widget]]
+id    = "button"
+entry = "button.luau"
+
+[[panel]]
+id              = "grid"
+entry           = "grid.luau"
+placement       = "attached"
+width           = 1680
+height          = 1180
+open_near_click = false            # centred under the centre bar, whether the glyph or SUPER+C opened it
+keyboard_focus  = "exclusive"      # Tab / arrows / Enter work right after SUPER+C; Esc still dismisses
+capture_keys    = ["Tab", "Left", "Right", "Up", "Down", "Return"]   # Left / Right switch OVERVIEW / DETAILS
+
+# Round 4 (HQ-0098): the same grid as a movable window (Noctalia lt14 `window = true`, an xdg toplevel). The dropdown's
+# pop-out glyph opens it; drag empty space to move it anywhere or onto another monitor; SUPER+Q or the compositor closes it.
+[[panel]]
+id     = "window"
+entry  = "grid.luau"
+window = true
+title  = "Repo Grid"
+width  = 1680
+height = 1180

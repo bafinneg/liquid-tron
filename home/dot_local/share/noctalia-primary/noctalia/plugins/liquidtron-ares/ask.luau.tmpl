@@ -1,0 +1,240 @@
+-- Ask the Grid (FEAT-lt31 C2): launcher provider `/ask` (ZGX: qwen on zgx-02, the default since HQ-0062) and
+-- `/ask >` (cloud, Hermes).
+--
+-- onQuery shows one routing row and sends nothing. Enter on that row keeps the launcher open (launcher.setQuery with
+-- the same sub-query; without it the launcher closes) and starts ares-ask through noctalia.runStream, which runs ONE
+-- string under /bin/sh -c (C0 F8): the typed text goes single-quoted after `--`, with ' written as '\''.
+-- The absolute path is required: Noctalia's PATH has no ~/.local/bin.
+--
+-- ares-ask prints one JSON event per line, {t, title, lines, full} (t = status|partial|answer|yield|error|cancelled).
+-- The launcher runs `compact = true`, which hides row subtitles (C2 F9), so the answer lines are rows of their own:
+--   1  status title from ares-ask (SENT // 00:01, ANSWERING, ZGX // 00:00, …)  id "route": Enter re-sends
+--   2  up to two answer lines                                                      id "line1"/"line2"
+--   3  OPEN // SESSION (cloud, ares-summon) or COPY (local, once an answer exists)
+-- Rows must echo the current query (the launcher maps results by query), so a stream line only redraws while the
+-- input still equals the query that started it. A later Enter replaces the run: ares-ask SIGTERMs its predecessor
+-- on the same route, and this file ignores lines from any stream but the newest.
+--
+-- Cancel: there is no provider close callback; ares-ask watches the launcher layer and exits when it is gone (C0 F7).
+-- No timer, no idle work: this file only runs while the launcher calls it or a stream it started prints a line.
+
+local ASK = "{{ .chezmoi.homeDir }}/.local/bin/ares-ask"
+local SUMMON = "{{ .chezmoi.homeDir }}/.local/bin/ares-summon"
+local SYSTEM_MODE = "~/.local/state/system-mode"
+local MAX_LEN = 48
+local CATEGORY = "ASK"
+
+-- Same strings as ares-ask TITLE_LOCAL / TITLE_CLOUD / YIELD_GAMING (test_ares_ask.py checks they agree).
+local TITLE_LOCAL = "ASK // ZGX // QWEN 7B"
+local TITLE_CLOUD = "ASK // CLOUD // OPUS 5.5"
+local TITLE_EMPTY = "ASK // TYPE A QUESTION"
+local HINT_EMPTY = "/ASK TEXT = ZGX // /ASK > TEXT = CLOUD"
+local YIELD_GAMING = "LOCAL MODEL YIELDED // GAMING"
+local TITLE_BUSY = "ASK // BUSY // TRY AGAIN"
+
+local STATE_GLYPH = {
+  status = "loader-2",
+  partial = "loader-2",
+  answer = "terminal",
+  yield = "player-pause",
+  error = "alert-triangle",
+  cancelled = "x",
+}
+
+local cur = nil -- the sub-query the launcher last passed to onQuery
+local run = nil -- { seq, query, route, text, t, title, lines, full }
+local seq = 0
+
+-- ------------------------------------------------------------------------------------------------- pure helpers
+
+local function trim(s)
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- (route, question) for the sub-query after `/ask`; ZGX is the default, a leading `>` means cloud (ares-ask route()).
+local function parse(text)
+  local s = text:gsub("^%s+", "")
+  if s:sub(1, 1) == ">" then
+    return "cloud", trim(s:sub(2))
+  end
+  return "local", trim(s)
+end
+
+-- The first n characters of s, cut on a UTF-8 boundary (bytes when s is not valid UTF-8).
+local function cut(s, n)
+  local count = utf8.len(s)
+  if count == nil then
+    return s:sub(1, n)
+  end
+  if count <= n then
+    return s
+  end
+  return s:sub(1, utf8.offset(s, n + 1) - 1)
+end
+
+-- One uppercase line of at most MAX_LEN characters; control characters become spaces.
+local function preview(text)
+  local s = text:gsub("%c", " "):gsub("%s+", " ")
+  s = trim(s):upper()
+  if cut(s, MAX_LEN) ~= s then
+    s = cut(s, MAX_LEN - 3) .. "..."
+  end
+  return s
+end
+
+-- POSIX single quoting, the exact rule ares-ask sh_quote() documents. (A NUL would end the execve string early and
+-- leave the quote open: /bin/sh then fails with a syntax error and runs nothing.)
+local function shQuote(text)
+  return "'" .. text:gsub("'", "'\\''") .. "'"
+end
+
+local function command(route, question)
+  return ASK .. " --" .. route .. " -- " .. shQuote(question)
+end
+
+local function gaming()
+  local raw = noctalia.readFile(SYSTEM_MODE)
+  return type(raw) == "string" and trim(raw) == "gaming"
+end
+
+local function short(s)
+  return cut(tostring(s or ""), MAX_LEN)
+end
+
+-- ------------------------------------------------------------------------------------------------- rows
+
+local function row(id, title, glyph, score, subtitle)
+  return { id = id, title = short(title), subtitle = subtitle, glyph = glyph, category = CATEGORY, score = score }
+end
+
+local function routingRows(text)
+  local route, question = parse(text)
+  if question == "" then
+    return { row("hint", TITLE_EMPTY, "terminal", 100, HINT_EMPTY) }
+  end
+  if route == "local" then
+    if gaming() then
+      return { row("route", YIELD_GAMING, "player-pause", 100, preview(question)) }
+    end
+    return { row("route", TITLE_LOCAL, "cpu", 100, preview(question)) }
+  end
+  return { row("route", TITLE_CLOUD, "cloud", 100, preview(question)) }
+end
+
+local function runRows(r)
+  local rows = { row("route", r.title, STATE_GLYPH[r.t] or "terminal", 100, preview(r.text)) }
+  for i = 1, math.min(2, #r.lines) do
+    rows[#rows + 1] = row("line" .. i, r.lines[i], "corner-down-right", 100 - i)
+  end
+  if r.route == "cloud" then
+    rows[#rows + 1] = row("open", "OPEN // SESSION", "external-link", 80)
+  elseif r.t == "answer" and type(r.full) == "string" and r.full ~= "" then
+    rows[#rows + 1] = row("copy", "COPY", "copy", 80)
+  end
+  return rows
+end
+
+local function render()
+  if cur == nil then
+    return
+  end
+  if run ~= nil and run.query == cur then
+    launcher.setResults(cur, runRows(run))
+  else
+    launcher.setResults(cur, routingRows(cur))
+  end
+end
+
+-- ------------------------------------------------------------------------------------------------- stream
+
+local function onLine(mySeq, line)
+  if run == nil or run.seq ~= mySeq then
+    return -- a replaced run; its ares-ask is already being SIGTERMed by the newer one
+  end
+  local ev = noctalia.json.decode(line)
+  if type(ev) ~= "table" or type(ev.t) ~= "string" then
+    return
+  end
+  run.t = ev.t
+  if type(ev.title) == "string" and ev.title ~= "" then
+    run.title = ev.title
+  end
+  if type(ev.lines) == "table" then
+    local lines = {}
+    for i = 1, math.min(2, #ev.lines) do
+      if type(ev.lines[i]) == "string" then
+        lines[#lines + 1] = ev.lines[i]
+      end
+    end
+    run.lines = lines
+  end
+  if type(ev.full) == "string" then
+    run.full = ev.full
+  end
+  if run.query == cur then
+    render()
+  end
+end
+
+local function send(text)
+  local route, question = parse(text)
+  seq = seq + 1
+  local mySeq = seq
+  run = {
+    seq = mySeq,
+    query = text,
+    route = route,
+    text = question,
+    t = "status",
+    title = route == "local" and TITLE_LOCAL or TITLE_CLOUD,
+    lines = { "SENDING" },
+    full = nil,
+  }
+  local ok = noctalia.runStream(command(route, question), function(line)
+    onLine(mySeq, line)
+  end)
+  if not ok then
+    -- ≤ 4 live streams per host (kMaxStreamsPerHost) or the spawn failed
+    run.t = "error"
+    run.title = TITLE_BUSY
+    run.lines = {}
+  end
+end
+
+-- ------------------------------------------------------------------------------------------------- entry points
+
+function onQuery(text)
+  cur = text
+  if run ~= nil and run.query ~= text then
+    run = nil -- the input moved on: drop the display; ares-ask ends on its own or on the next Enter
+  end
+  render()
+end
+
+function onActivate(id)
+  if id == "open" then
+    noctalia.runAsync({ SUMMON }) -- no setQuery: the launcher closes, the hermes child keeps running (F7)
+    return
+  end
+  if id == "copy" or id == "line1" or id == "line2" then
+    if run ~= nil and run.route == "local" and run.t == "answer" and type(run.full) == "string" and run.full ~= "" then
+      noctalia.copyToClipboard(run.full, "text/plain") -- no setQuery: the launcher closes
+      return
+    end
+    if run ~= nil and run.route == "cloud" then
+      noctalia.runAsync({ SUMMON })
+      return
+    end
+  end
+  local text = cur or ""
+  -- setQuery takes the sub-query: the provider prepends its own `/ask ` (plugin_launcher_provider.cpp
+  -- buildProviderInput). The same text keeps the launcher open and does not re-run onQuery.
+  launcher.setQuery(text)
+  if id == "route" then
+    local _, question = parse(text)
+    if question ~= "" then
+      send(text)
+    end
+  end
+  render()
+end

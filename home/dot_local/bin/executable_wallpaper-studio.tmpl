@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Open the Liquid Tron wallpaper picker. The compact picker (one click sets a
+# wallpaper on all three monitors) is the default: a native Noctalia plugin panel
+# (liquidtron/wallpaper:picker), toggled over Noctalia IPC. `--full` opens or
+# toggles the per-monitor Wallpaper Studio, a retained Quickshell companion.
+
+export HOME={{ .chezmoi.homeDir }}
+export XDG_CONFIG_HOME={{ .chezmoi.homeDir }}/.config
+export XDG_STATE_HOME={{ .chezmoi.homeDir }}/.local/state
+export XDG_RUNTIME_DIR=/run/user/1000
+export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}
+
+readonly config_name=wallpaper-studio
+readonly config_path={{ .chezmoi.homeDir }}/.config/quickshell/wallpaper-studio/shell.qml
+[[ -f "$config_path" ]] || exit 1
+
+view=compact
+case "${1:-}" in
+  ""|--compact) ;;
+  --full) view=full ;;
+  *) echo "usage: wallpaper-studio [--compact|--full]" >&2; exit 2 ;;
+esac
+
+if [[ $view == compact ]]; then
+  exec "${NOCTALIA_MSG:-{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg}" panel-toggle liquidtron/wallpaper:picker
+fi
+
+# qs prints "No running instances" on stdout with a non-zero exit, so trust the
+# exit status, not the output.
+if qs -c "$config_name" ipc call wallpaperStudio status >/dev/null 2>&1; then
+  qs -c "$config_name" ipc call wallpaperStudio toggleFull >/dev/null 2>&1
+else
+  # FEAT-lt28: own transient scope, never the caller's cgroup (see lt-companion-launch).
+  launcher=${LT_COMPANION_LAUNCH:-{{ .chezmoi.homeDir }}/.local/bin/lt-companion-launch}
+  if [[ -x $launcher ]]; then
+    "$launcher" "$config_name" "WALLPAPER_STUDIO_VIEW=$view"
+  else
+    logger -t wallpaper-studio "lt-companion-launch missing; starting $config_name in the caller's cgroup"
+    WALLPAPER_STUDIO_VIEW=$view qs -c "$config_name" -d
+  fi
+fi

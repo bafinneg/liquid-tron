@@ -1,0 +1,33 @@
+# Spec: aesthetic-oled-burnin-mitigation, Chunk 10
+#
+# Holds an idle inhibit lock for the duration of the user's systemd --user
+# manager lifetime (while the user is logged in). Pairs with
+# /etc/systemd/logind.conf.d/idle-suspend.conf to ensure IdleAction=suspend
+# fires ONLY at the greeter (no active session) — never during active
+# Hyprland sessions.
+#
+# On logout the user@1000.service stops, this service stops, the inhibit
+# lock releases, and logind's IdleAction can fire after the 10min greeter
+# idle timeout.
+#
+# Deviation from Session 3 unit convention: WantedBy=default.target rather
+# than WantedBy=graphical-session.target. Reasons:
+#  (a) graphical-session.target is not reliably activated under bare
+#      Hyprland sessions (no uwsm wrapper present), so units targeting it
+#      may not auto-start on login.
+#  (b) idle inhibit is semantically a user-session concern, not a
+#      graphical-session one — it should exist whenever the user is
+#      logged in, regardless of which WM is running.
+
+[Unit]
+Description=Idle inhibit lock for active user session (oled-burnin)
+Documentation=man:systemd-inhibit(1)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=idle --who=user-session --why="Active user session" --mode=block sleep infinity
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

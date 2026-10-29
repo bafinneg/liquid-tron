@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Zen — AI
+GenericName=Web Browser (Claude.ai)
+Comment=Zen Browser, zen-ai profile (FEAT-workspace-ux-overhaul)
+Exec=env MOZ_APP_REMOTINGNAME=zen-ai /opt/zen-browser-bin/zen-bin -P zen-ai --new-instance %u
+Icon=zen-browser
+Type=Application
+StartupNotify=true
+StartupWMClass=zen-ai
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;

@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME={{ .chezmoi.homeDir }}
+export XDG_CONFIG_HOME={{ .chezmoi.homeDir }}/.config
+export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}
+
+uid=$(id -u)
+state_root={{ .chezmoi.homeDir }}/.local/state/noctalia-primary
+rollback_flag=$state_root/disable-noctalia
+lifecycle_lock=$state_root/lifecycle.lock
+selector_pattern='{{ .chezmoi.homeDir }}/.local/bin/desktop-shell-primary$'
+mocr_pattern='(^|/)(qs|quickshell) -c mocr -d($| )'
+install -d -m 700 "$state_root"
+exec 8>"$lifecycle_lock"
+chmod 600 "$lifecycle_lock"
+if ! flock -n 8; then
+  printf 'Another desktop-shell lifecycle operation is already running.\n' >&2
+  exit 1
+fi
+printf 'disabled by explicit rollback at %s\n' "$(date --iso-8601=seconds)" >"$rollback_flag"
+chmod 600 "$rollback_flag"
+
+if pgrep -u "$uid" -x noctalia >/dev/null; then
+  pkill -TERM -u "$uid" -x noctalia
+  for _ in {1..100}; do
+    pgrep -u "$uid" -x noctalia >/dev/null || break
+    sleep 0.1
+  done
+fi
+if pgrep -u "$uid" -x noctalia >/dev/null; then
+  printf 'Noctalia did not exit; refusing dual-shell rollback.\n' >&2
+  exit 1
+fi
+
+mocr_running() {
+  pgrep -u "$uid" -f "$mocr_pattern" >/dev/null
+}
+selector_running() {
+  pgrep -u "$uid" -f "$selector_pattern" >/dev/null
+}
+
+notification_owner_pid() {
+  local reply reply_type owner pid_reply pid_type pid
+  reply=$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+    org.freedesktop.DBus GetNameOwner s org.freedesktop.Notifications 2>/dev/null) || return 1
+  read -r reply_type owner <<<"$reply"
+  [[ $reply_type == s && $owner == \"*\" ]] || return 1
+  owner=${owner#\"}
+  owner=${owner%\"}
+  pid_reply=$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+    org.freedesktop.DBus GetConnectionUnixProcessID s "$owner" 2>/dev/null) || return 1
+  read -r pid_type pid <<<"$pid_reply"
+  [[ $pid_type == u && $pid =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+wait_notification_owner_pid() {
+  local expected=$1 actual
+  for _ in {1..100}; do
+    actual=$(notification_owner_pid 2>/dev/null || true)
+    [[ $actual == "$expected" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+single_mocr_pid() {
+  local -a pids=()
+  mapfile -t pids < <(pgrep -u "$uid" -f "$mocr_pattern" || true)
+  [[ ${#pids[@]} -eq 1 ]] || return 1
+  printf '%s\n' "${pids[0]}"
+}
+
+wait_single_mocr_pid() {
+  local candidate
+  for _ in {1..100}; do
+    candidate=$(single_mocr_pid 2>/dev/null || true)
+    if [[ -n $candidate ]] && ! selector_running \
+      && ! pgrep -u "$uid" -x noctalia >/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# The selector normally restores MOCR-Q when its Noctalia child exits. Give it
+# the first opportunity so this explicit helper cannot race a duplicate launch.
+for _ in {1..50}; do
+  mocr_running && break
+  selector_running || break
+  sleep 0.1
+done
+if ! mocr_running; then
+  if selector_running; then
+    pkill -TERM -u "$uid" -f "$selector_pattern" || true
+    for _ in {1..100}; do
+      selector_running || break
+      sleep 0.1
+    done
+  fi
+  if selector_running; then
+    printf 'Selector did not restore MOCR-Q or exit; refusing duplicate fallback.\n' >&2
+    exit 1
+  fi
+  hyprctl dispatch 'hl.dsp.exec_cmd("env HOME={{ .chezmoi.homeDir }} XDG_CONFIG_HOME={{ .chezmoi.homeDir }}/.config WAYLAND_DISPLAY=wayland-1 qs -c mocr -d")' >/dev/null
+fi
+for _ in {1..100}; do
+  mocr_running && break
+  sleep 0.1
+done
+mocr_pid=$(wait_single_mocr_pid) || {
+  printf 'Rollback did not produce exactly one MOCR-Q process.\n' >&2
+  exit 1
+}
+if ! wait_notification_owner_pid "$mocr_pid"; then
+  printf 'MOCR-Q did not acquire singular notification ownership.\n' >&2
+  exit 1
+fi
+if [[ $(single_mocr_pid 2>/dev/null || true) != "$mocr_pid" ]] \
+  || selector_running || pgrep -u "$uid" -x noctalia >/dev/null; then
+  printf 'Rollback ownership changed after notification acquisition.\n' >&2
+  exit 1
+fi
+printf 'MOCR-Q is active and persistent rollback is enabled.\n'

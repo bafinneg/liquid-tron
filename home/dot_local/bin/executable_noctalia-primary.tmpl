@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME={{ .chezmoi.homeDir }}
+# FEAT-lt26r-2 OD-A: Noctalia passes its whole environment to every app it
+# spawns, so the shell gets the user's real XDG config/cache homes. Its private
+# config/state/data homes travel only in NOCTALIA_*_HOME, which 5.3 reads first.
+export XDG_CONFIG_HOME={{ .chezmoi.homeDir }}/.config
+export XDG_CACHE_HOME={{ .chezmoi.homeDir }}/.cache
+export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}
+
+uid=$(id -u)
+runtime=${XDG_RUNTIME_DIR:-/run/user/$uid}
+expected_runtime=/run/user/$uid
+runtime_root=$runtime/noctalia-primary
+# The binary path and sha256 are pinned only in noctalia-primary-msg (INFRA-lt26r-1).
+pin_file={{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg
+binary=$(sed -nE 's#^binary=(/[^[:space:]]+)$#\1#p' "$pin_file" 2>/dev/null || true)
+expected_sha=$(sed -nE 's/^expected_sha=([0-9a-f]{64})$/\1/p' "$pin_file" 2>/dev/null || true)
+if [[ ! $binary =~ ^/[^[:space:]]+$ || ! $expected_sha =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'Noctalia pin in %s is missing, duplicated or malformed.\n' "$pin_file" >&2
+  exit 1
+fi
+canonical_config={{ .chezmoi.homeDir }}/home-infra/machines/7800x/dotfiles/noctalia/.config/noctalia
+state_home={{ .chezmoi.homeDir }}/.local/state/noctalia-primary
+config_home=$state_home/config-home
+data_home={{ .chezmoi.homeDir }}/.local/share/noctalia-primary
+user_config_home={{ .chezmoi.homeDir }}/.config
+user_cache_home={{ .chezmoi.homeDir }}/.cache
+
+if [[ "$runtime" != "$expected_runtime" || ! -d "$runtime" || -L "$runtime" ]]; then
+  printf 'Unsafe XDG_RUNTIME_DIR: %s\n' "$runtime" >&2
+  exit 1
+fi
+if pgrep -u "$uid" -f '(^|/)(qs|quickshell) -c mocr -d($| )' >/dev/null; then
+  printf 'MOCR-Q is active; refusing dual-shell launch.\n' >&2
+  exit 1
+fi
+if pgrep -u "$uid" -x noctalia >/dev/null; then
+  exit 0
+fi
+if [[ ! -x "$binary" ]]; then
+  printf 'Pinned Noctalia binary is unavailable: %s\n' "$binary" >&2
+  exit 1
+fi
+actual_sha=$(sha256sum "$binary" | cut -d' ' -f1)
+if [[ "$actual_sha" != "$expected_sha" ]]; then
+  printf 'Pinned Noctalia binary hash mismatch.\n' >&2
+  exit 1
+fi
+if [[ ! -f "$canonical_config/config.toml" ]]; then
+  printf 'Managed Noctalia configuration is unavailable.\n' >&2
+  exit 1
+fi
+
+install -d -m 700 "$runtime_root" "$state_home" "$data_home"
+# Private writable config home: static symlinks to the canonical (read-only at
+# runtime) config plus a real palettes/ directory for generated wallpaper palettes.
+{{ .chezmoi.homeDir }}/.local/bin/wallpaper-control prepare-config-home \
+  --config-home "$config_home" --canonical-dir "$canonical_config"
+printf '%s\n' "$$" >"$runtime_root/pid"
+chmod 600 "$runtime_root/pid"
+
+env HOME={{ .chezmoi.homeDir }} \
+  XDG_CONFIG_HOME="$user_config_home" \
+  WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+  NOCTALIA_CONFIG_HOME="$config_home" \
+  NOCTALIA_STATE_HOME="$state_home" \
+  NOCTALIA_DATA_HOME="$data_home" \
+  XDG_CACHE_HOME="$user_cache_home" \
+  "$binary" config validate >/dev/null
+
+exec env HOME={{ .chezmoi.homeDir }} \
+  XDG_CONFIG_HOME="$user_config_home" \
+  WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+  NOCTALIA_CONFIG_HOME="$config_home" \
+  NOCTALIA_STATE_HOME="$state_home" \
+  NOCTALIA_DATA_HOME="$data_home" \
+  XDG_CACHE_HOME="$user_cache_home" \
+  "$binary"

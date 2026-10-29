@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Stop any active wf-recorder process
+
+if pkill -INT wf-recorder 2>/dev/null; then
+    notify-send -u normal -i media-playback-stop "Recording stopped" "wf-recorder terminated"
+else
+    notify-send -u low -i dialog-information "Recording" "No recording in progress"
+fi

@@ -1,0 +1,13 @@
+[init]
+	defaultBranch = main
+[pull]
+	rebase = true
+[push]
+	autoSetupRemote = true
+[core]
+	editor = code --wait
+[user]
+	email = {{ .git.email }}
+	name = {{ .git.name }}
+[include]
+	path = ~/.config/git/aliases.inc

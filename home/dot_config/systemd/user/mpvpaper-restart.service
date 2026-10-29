@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodic mpvpaper restart (memory-leak mitigation)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+# The wallpaper controller re-applies the committed mode (Mainframe parallax or a
+# scene containing a video) and no-ops otherwise. mainframe-parallax-start launches
+# each mpvpaper instance as its own transient user service via systemd-run, so this
+# oneshot stays process-free after exit while the monitor-specific units own the
+# long-lived wallpaper processes.
+# Restart the wallpaper stack so mpvpaper RSS does not grow without bound
+# (~1 GB/hr/process leak on nvdec+waylandvk path; restart resets to ~200 MB base).
+ExecStart=%h/.local/bin/wallpaper-control restart-renderer

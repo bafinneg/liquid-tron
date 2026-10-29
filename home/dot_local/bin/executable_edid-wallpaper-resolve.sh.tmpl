@@ -1,0 +1,124 @@
+#!/bin/bash
+# Resolve EDID serials → current DP-N connectors before waypaper --restore.
+# Prevents wallpaper inversion when the two AW2725Q monitors swap DP-2/DP-4.
+#
+# Sidecar cache: ~/.local/state/waypaper/edid-connector-cache
+# Records serial→connector from the previous run. On connector change the
+# script rewrites state.ini keys so each monitor keeps its wallpaper.
+
+set -euo pipefail
+
+SERIAL_LEFT="{{ .monitors.left.serial }}"   # Alienware AW2725Q #1 (left position)
+SERIAL_RIGHT="{{ .monitors.right.serial }}"  # Alienware AW2725Q #2 (right position)
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/waypaper"
+STATE_INI="$STATE_DIR/state.ini"
+CONNECTOR_CACHE="$STATE_DIR/edid-connector-cache"
+
+# AC6: state.ini absent → nothing to rewrite; waypaper handles it
+if [ ! -f "$STATE_INI" ]; then
+    exec waypaper --restore
+fi
+
+# Extract Monitor Serial Number descriptor (tag 0xFF) from an EDID binary.
+# Checks descriptor blocks at EDID byte offsets 54, 72, 90, 108.
+# Prints the 13-byte serial string (stripped); returns 1 if not found.
+read_edid_serial() {
+    local edid_file="$1"
+    [ -r "$edid_file" ] || return 1
+    local offset tag serial
+    for offset in 54 72 90 108; do
+        tag=$(dd if="$edid_file" bs=1 skip=$((offset + 3)) count=1 2>/dev/null \
+            | od -An -tx1 | tr -d ' \n')
+        if [ "$tag" = "ff" ]; then
+            serial=$(dd if="$edid_file" bs=1 skip=$((offset + 5)) count=13 2>/dev/null \
+                | tr -d '\r\n' | sed 's/[[:space:]]*$//')
+            printf '%s' "$serial"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Probe sysfs: find which DP-N connector each known AW2725Q serial is on.
+dp_left=""
+dp_right=""
+
+for edid_path in /sys/class/drm/card*-DP-*/edid; do
+    [ -r "$edid_path" ] || continue
+    # /sys/class/drm/card0-DP-2/edid → DP-2
+    connector=$(basename "$(dirname "$edid_path")" | sed 's/^card[0-9]*-//')
+    serial=$(read_edid_serial "$edid_path") || continue
+    case "$serial" in
+        "$SERIAL_LEFT")  dp_left="$connector"  ;;
+        "$SERIAL_RIGHT") dp_right="$connector" ;;
+    esac
+done
+
+# AC3: neither AW2725Q serial recognised → warn and fall through
+if [ -z "$dp_left" ] && [ -z "$dp_right" ]; then
+    printf 'edid-wallpaper-resolve: no known AW2725Q serials found; skipping rewrite\n' >&2
+    exec waypaper --restore
+fi
+
+# Partial match (one monitor disconnected or unreadable) → fall through safely
+if [ -z "$dp_left" ] || [ -z "$dp_right" ]; then
+    printf 'edid-wallpaper-resolve: only one serial matched; skipping rewrite\n' >&2
+    exec waypaper --restore
+fi
+
+# Load cached connector assignments from previous run
+cached_left=""
+cached_right=""
+if [ -f "$CONNECTOR_CACHE" ]; then
+    while IFS='=' read -r key val; do
+        case "$key" in
+            "$SERIAL_LEFT")  cached_left="$val"  ;;
+            "$SERIAL_RIGHT") cached_right="$val" ;;
+        esac
+    done < "$CONNECTOR_CACHE"
+fi
+
+# Update cache for next run (reflects current physical assignment)
+printf '%s=%s\n' "$SERIAL_LEFT" "$dp_left" "$SERIAL_RIGHT" "$dp_right" > "$CONNECTOR_CACHE"
+
+# Bootstrap: no prior cache → assume state.ini is correct; seed cache and restore
+if [ -z "$cached_left" ] || [ -z "$cached_right" ]; then
+    exec waypaper --restore
+fi
+
+# No connector change → nothing to rewrite
+if [ "$dp_left" = "$cached_left" ] && [ "$dp_right" = "$cached_right" ]; then
+    exec waypaper --restore
+fi
+
+# Connectors changed — rewrite state.ini: move each wallpaper value to its
+# serial's new connector key.
+val_left=$(grep -i "^wallpaper_${cached_left}[[:space:]]*=" "$STATE_INI" \
+    | cut -d= -f2- | sed 's/^[[:space:]]*//' || true)
+val_right=$(grep -i "^wallpaper_${cached_right}[[:space:]]*=" "$STATE_INI" \
+    | cut -d= -f2- | sed 's/^[[:space:]]*//' || true)
+
+if [ -z "$val_left" ] || [ -z "$val_right" ]; then
+    printf 'edid-wallpaper-resolve: state.ini missing %s or %s entries; skipping rewrite\n' \
+        "$cached_left" "$cached_right" >&2
+    exec waypaper --restore
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+awk \
+    -v old_l="$cached_left"  -v old_r="$cached_right" \
+    -v new_l="$dp_left"      -v new_r="$dp_right" \
+    -v vl="$val_left"        -v vr="$val_right" \
+    'tolower($0) ~ "^wallpaper_" tolower(old_l) "[[:space:]]*=" { print "wallpaper_" new_l " = " vl; next }
+     tolower($0) ~ "^wallpaper_" tolower(old_r) "[[:space:]]*=" { print "wallpaper_" new_r " = " vr; next }
+     { print }' "$STATE_INI" > "$tmp"
+
+cp "$tmp" "$STATE_INI"
+
+printf 'edid-wallpaper-resolve: remapped %s→%s %s→%s\n' \
+    "$cached_left" "$dp_left" "$cached_right" "$dp_right" >&2
+
+exec waypaper --restore

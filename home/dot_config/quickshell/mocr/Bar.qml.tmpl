@@ -1,0 +1,385 @@
+import Quickshell
+import Quickshell.Wayland
+import QtQuick
+import "theme"
+import "modules"
+import "services" as Services
+import "components"
+
+PanelWindow {
+    id: bar
+    property var modelData
+    visible: !Services.SystemMode.gamingMode || !bar.isCenterBar
+
+    screen: modelData
+
+    // System stats service — instantiated per-bar, accessible to child modules via sysStats id.
+    Services.SystemStats { id: sysStats }
+
+    anchors {
+        top: true
+        left: true
+        right: true
+    }
+
+    readonly property int effectiveBarHeight: modelData.name === "DP-3" ? Geometry.barHeightCenter : Geometry.barHeightSide
+    implicitHeight: bar.effectiveBarHeight
+    exclusiveZone: bar.effectiveBarHeight
+
+    // DP-3 shelf coordination: center monitor bar writes screen reference and
+    // shelf state to NotificationService so the toast stack remains on the right
+    // monitor and shifts only below existing right-side popovers.
+    Component.onCompleted: {
+        if (modelData.name === "DP-3") {
+            Services.NotificationService.centerScreen = modelData
+            Services.NotificationService.popoverShelfOpen = Qt.binding(function() { return popoverShelf._anyRightOpen })
+            Services.NotificationService.popoverShelfHeight = Qt.binding(function() { return popoverShelf.implicitHeight })
+            // FEAT-nostromo-console: expose the DP-3 bar handle so
+            // shell.qml's single Console PopupWindow can anchor.window
+            // to this PanelWindow. See NotificationService.centerBar.
+            Services.NotificationService.centerBar = bar
+        }
+    }
+
+    // §4 geometry exception: bar root has no rounding (welded to screen edge).
+    // Background is transparent — Layer 2 (the sweep glow) IS the background,
+    // matching waybar's CSS where the gradient replaces the bg entirely.
+    color: "transparent"
+
+    // Z-order: 0 = glass substrate, 1-2 = tron-sweep layers,
+    // 3 = bounded specular sheen, 5 = module content, 10 = top border.
+
+    // ── Tron-sweep atmospheric animation ──────────────────────────────
+    // Phase-offset per-monitor so the crest traverses screens serially
+    // (left → center → right → repeat). Driven by SweepClock singleton.
+    property real sweepProgress: SweepClock.progressFor(modelData)
+
+    // One explicit material-strength policy for this bar only. These states are
+    // intentionally source-selected: no new settings service, process, or
+    // unrelated Quickshell surface inherits this policy.
+    readonly property string glassMaterialMode: "regular" // regular | highContrast | reducedTransparency
+    readonly property bool glassHighContrast: glassMaterialMode === "highContrast"
+    readonly property bool glassReducedTransparency: glassMaterialMode === "reducedTransparency"
+    readonly property real glassBaseAlpha: glassReducedTransparency
+        ? (bar.isCenterBar ? 0.92 : 0.94)
+        : glassHighContrast ? (bar.isCenterBar ? 0.64 : 0.72)
+        : (bar.isCenterBar ? 0.46 : 0.54)
+    readonly property real glassBodyDarkAlpha: glassReducedTransparency ? 0.04 : (glassHighContrast ? 0.20 : 0.18)
+    readonly property real glassBodyCyanPeakAlpha: glassReducedTransparency ? 0.10 : (glassHighContrast ? 0.20 : 0.24)
+    readonly property real glassSheenTopAlpha: glassReducedTransparency ? 0.04 : (glassHighContrast ? 0.12 : 0.14)
+    readonly property real glassSheenCyanAlpha: glassReducedTransparency ? 0.02 : (glassHighContrast ? 0.04 : 0.06)
+    readonly property real glassSheenLowerDarkAlpha: glassReducedTransparency ? 0.06 : (glassHighContrast ? 0.18 : 0.16)
+    readonly property real glassSheenEdgeAlpha: glassReducedTransparency ? 0.02 : (glassHighContrast ? 0.06 : 0.08)
+    readonly property real commandSpineRestAlpha: glassReducedTransparency ? 0.86 : (glassHighContrast ? 0.68 : 0.54)
+    readonly property real commandSpineSeamAlpha: glassReducedTransparency ? 0.50 : (glassHighContrast ? 0.46 : 0.42)
+
+    // Static bar background — visible during this bar's dead zone while
+    // the sweep crest is on another monitor. Layer 2 gradient stacks on
+    // top and replaces this visually when the crest is in range.
+    Rectangle {
+        anchors.fill: parent
+        // Keep enough tint for text contrast while leaving compositor blur
+        // materially visible. The previous opaque fill defeated the blur rule.
+        color: Qt.alpha(Colors.bg_dark, bar.glassBaseAlpha)
+        z: 0
+    }
+
+    // Layer 2: full-height background + sweeping cyan glow.
+    // Wider, brighter band than the original — visible enough to read as
+    // "alive" and shift pixel luminance across the bar for OLED longevity.
+    Item {
+        anchors.fill: parent
+        clip: true
+        z: 1
+
+        Rectangle {
+            width: parent.width * 3
+            height: parent.height
+            x: -(1 - bar.sweepProgress) * (width - parent.width)
+
+            gradient: Gradient {
+                orientation: Gradient.Horizontal
+                GradientStop { position: 0.00; color: Qt.alpha(Colors.bg_dark, bar.glassBodyDarkAlpha) }
+                GradientStop { position: 0.25; color: Qt.alpha(Colors.bg_dark, bar.glassBodyDarkAlpha) }
+                GradientStop { position: 0.42; color: Qt.alpha(Colors.cyan, 0.10) }
+                GradientStop { position: 0.50; color: Qt.alpha(Colors.cyan, bar.glassBodyCyanPeakAlpha) }
+                GradientStop { position: 0.58; color: Qt.alpha(Colors.cyan, 0.10) }
+                GradientStop { position: 0.75; color: Qt.alpha(Colors.bg_dark, bar.glassBodyDarkAlpha) }
+                GradientStop { position: 1.00; color: Qt.alpha(Colors.bg_dark, bar.glassBodyDarkAlpha) }
+            }
+        }
+    }
+
+    // One static material highlight, bounded to the existing Bar window. This
+    // makes the blurred substrate read as glass without adding a shader, a
+    // second compositor blur, or perpetual decorative motion.
+    Rectangle {
+        anchors.fill: parent
+        z: 3
+        gradient: Gradient {
+            orientation: Gradient.Vertical
+            GradientStop { position: 0.00; color: Qt.alpha(Colors.white, bar.glassSheenTopAlpha) }
+            GradientStop { position: 0.10; color: Qt.alpha(Colors.cyan, bar.glassSheenCyanAlpha) }
+            GradientStop { position: 0.42; color: "transparent" }
+            GradientStop { position: 0.80; color: "transparent" }
+            GradientStop { position: 0.94; color: Qt.alpha(Colors.bg_dark, bar.glassSheenLowerDarkAlpha) }
+            GradientStop { position: 1.00; color: Qt.alpha(Colors.cyan, bar.glassSheenEdgeAlpha) }
+        }
+    }
+
+    // Layer 1: 2px-tall cyan sweep band, bottom edge (edge facing into screen).
+    // Brighter than the body glow — reads as the leading edge of the sweep.
+    Item {
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: 2
+        clip: true
+        z: 2
+
+        Rectangle {
+            width: parent.width * 3
+            height: parent.height
+            x: -(1 - bar.sweepProgress) * (width - parent.width)
+
+            gradient: Gradient {
+                orientation: Gradient.Horizontal
+                GradientStop { position: 0.00; color: "transparent" }
+                GradientStop { position: 0.30; color: "transparent" }
+                GradientStop { position: 0.42; color: Qt.alpha(Colors.cyan, 0.4) }
+                GradientStop { position: 0.50; color: Qt.alpha(Colors.cyan, 0.85) }
+                GradientStop { position: 0.58; color: Qt.alpha(Colors.cyan, 0.4) }
+                GradientStop { position: 0.70; color: "transparent" }
+                GradientStop { position: 1.00; color: "transparent" }
+            }
+        }
+    }
+
+    // 1px bottom border — pulsing gradient synced with tron-sweep.
+    // Same phase as body glow, brighter peak for visible edge definition.
+    Item {
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: Geometry.borderWidth
+        clip: true
+        z: 10
+
+        Rectangle {
+            width: parent.width * 3
+            height: parent.height
+            x: -(1 - bar.sweepProgress) * (width - parent.width)
+
+            gradient: Gradient {
+                orientation: Gradient.Horizontal
+                GradientStop { position: 0.00; color: Qt.alpha(Colors.cyan, 0.20) }
+                GradientStop { position: 0.30; color: Qt.alpha(Colors.cyan, 0.20) }
+                GradientStop { position: 0.42; color: Qt.alpha(Colors.cyan, 0.5) }
+                GradientStop { position: 0.50; color: Qt.alpha(Colors.cyan, 0.8) }
+                GradientStop { position: 0.58; color: Qt.alpha(Colors.cyan, 0.5) }
+                GradientStop { position: 0.70; color: Qt.alpha(Colors.cyan, 0.20) }
+                GradientStop { position: 1.00; color: Qt.alpha(Colors.cyan, 0.20) }
+            }
+        }
+    }
+
+    // ── Popovers ──────────────────────────────────────────────────────
+    // Single full-width shelf handles all popovers — center and right
+    // groups share the same vertical alignment and coordinate space.
+    function togglePopover(popoverId) {
+        popoverShelf.toggle(popoverId)
+    }
+
+    PopoverShelf {
+        id: popoverShelf
+        screen: bar.screen
+        stats: sysStats
+        effectiveBarHeight: bar.effectiveBarHeight
+    }
+
+    // ── Module layout ─────────────────────────────────────────────────
+    // DP-3 composes as a coordinate lane, a fixed center command authority,
+    // and a right operations register. Empty chassis fields between them are
+    // deliberate negative space, not row-packing slack.
+
+    // Left cluster
+    Row {
+        id: leftCluster
+        anchors.left: parent.left
+        anchors.leftMargin: Geometry.barPaddingOuter
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        z: 5
+
+        Workspaces {
+            screen: modelData
+        }
+    }
+
+    // Center + right clusters render only on the center monitor (DP-3).
+    // Side monitors keep Workspaces only — see FEAT-workspace-ux-overhaul §Phase 0.
+    readonly property bool isCenterBar: modelData.name === "DP-3"
+    readonly property string activePopoverId: popoverShelf.activePopoverId
+    readonly property bool centerDetailOpen: activePopoverId === "power" || activePopoverId === "calendar" || activePopoverId === "mode"
+
+    // Fixed centerline command authority
+    Item {
+        id: commandSpine
+        visible: bar.isCenterBar
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        width: 260
+        z: 5
+
+        Rectangle {
+            id: commandSpineField
+            anchors.fill: parent
+            color: bar.centerDetailOpen ? Qt.alpha(Colors.blue, 0.34) : Qt.alpha(Colors.bg_inset, bar.commandSpineRestAlpha)
+            radius: 0
+        }
+
+        Rectangle {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            width: Geometry.commandSpineSeamWidth
+            color: Qt.alpha(Colors.cyan, bar.commandSpineSeamAlpha)
+        }
+
+        Rectangle {
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            width: Geometry.commandSpineSeamWidth
+            color: Qt.alpha(Colors.cyan, bar.commandSpineSeamAlpha)
+        }
+
+        Row {
+            id: commandSpineContent
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.verticalCenter: parent.verticalCenter
+            height: parent.height
+            spacing: Geometry.commandSpineGap
+
+            Hostname {
+                parentBar: bar
+                visualWeight: 1.0
+                showLeftBorder: false
+                horizontalPadding: 0
+                height: parent.height
+            }
+
+            Clock {
+                parentBar: bar
+                visualWeight: 1.0
+                showLeftBorder: false
+                horizontalPadding: 0
+                height: parent.height
+            }
+
+            ModeIndicator {
+                parentBar: bar
+                visualWeight: 1.0
+                showLeftBorder: false
+                horizontalPadding: 0
+                height: parent.height
+            }
+        }
+    }
+
+    // Right operations register. Related controls share the root glass plane and
+    // are separated only at semantic group boundaries, avoiding spreadsheet-like
+    // segmentation while preserving every module footprint and route.
+    Row {
+        id: rightCluster
+        visible: bar.isCenterBar
+        anchors.right: parent.right
+        anchors.rightMargin: Geometry.barPaddingOuter
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        spacing: Geometry.transientSurfaceGap
+        z: 5
+
+        // Media group
+        Row {
+            // Admission follows MPRIS model state directly. Binding to the
+            // child's effective visibility would latch the group hidden after
+            // its parent became invisible.
+            visible: mediaModule.hasPlayer || Services.AnchalMode.active
+            height: parent.height
+            spacing: 0
+
+            // Media normally owns this boundary. Preserve it when Anchal is
+            // the only visible member and Media is correctly collapsed.
+            Rectangle {
+                visible: !mediaModule.hasPlayer && Services.AnchalMode.active
+                width: Geometry.borderWidth
+                height: parent.height
+                color: Colors.fg_dark
+            }
+
+            Media {
+                id: mediaModule
+                parentBar: bar
+                showLeftBorder: true
+            }
+
+            // Anchal-mode amber pill — visible when anchal-mode-toggle is active in {{ .login }}'s session.
+            Item {
+                visible: Services.AnchalMode.active
+                width: anchalPillRect.width + 8
+                height: parent.height
+
+                Rectangle {
+                    id: anchalPillRect
+                    anchors.centerIn: parent
+                    width: anchalPillLabel.implicitWidth + 16
+                    height: 22
+                    color: "#ffb300"
+                    radius: 6
+
+                    Text {
+                        id: anchalPillLabel
+                        anchors.centerIn: parent
+                        text: "ANCHAL MODE"
+                        color: "#000000"
+                        font.pixelSize: 11
+                        font.bold: true
+                        font.letterSpacing: 1.5
+                    }
+                }
+            }
+        }
+
+        // Compute group
+        Row {
+            height: parent.height
+            spacing: 0
+
+            Cpu { parentBar: bar; showLeftBorder: true }
+            Memory { parentBar: bar; showLeftBorder: false; reserveLeftBorderSpace: true }
+            Gpu { parentBar: bar; showLeftBorder: false; reserveLeftBorderSpace: true }
+            Temperature { parentBar: bar; showLeftBorder: false; reserveLeftBorderSpace: true }
+        }
+
+        // Connectivity and audio group
+        Row {
+            height: parent.height
+            spacing: 0
+
+            Network { parentBar: bar; showLeftBorder: true }
+            Volume { parentBar: bar; showLeftBorder: false; reserveLeftBorderSpace: true }
+        }
+
+        // State group
+        Row {
+            height: parent.height
+            spacing: 0
+
+            Digest { parentBar: bar; showLeftBorder: true }
+            Tray { parentBar: bar; showLeftBorder: false; reserveLeftBorderSpace: true }
+            Notifications { parentBar: bar; showLeftBorder: false; reserveLeftBorderSpace: true }
+        }
+    }
+}

@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+# Clipboard history picker (FEAT-liquid-tron-desktop-polish-2 C2).
+# cliphist list is TSV: "<id>\t<preview>". fuzzel --dmenu returns the
+# selected line; cliphist decode maps it back to the full payload
+# including images which list as binary-data previews.
+set -eu
+case "${1:-pick}" in
+    pick)
+        sel=$(cliphist list | fuzzel --dmenu --prompt='CLIP // ' \
+              --placeholder='clipboard history' --lines=12 --width=72) || exit 0
+        printf '%s' "$sel" | cliphist decode | wl-copy
+        ;;
+    wipe)
+        cliphist wipe
+        notify-send -u low -i edit-paste "Clipboard" "history wiped"
+        ;;
+    *)
+        printf 'usage: %s [pick|wipe]\n' "$0" >&2
+        exit 64
+        ;;
+esac

@@ -1,0 +1,53 @@
+#!/usr/bin/env -S python3 -I
+"""ares-helm-tint HEX: write the Ares helm bar frame in one palette colour (HQ-0100 round 3).
+
+The shipped helm (liquidtron-ares/assets/helm/00.png) is a single cyan colour with an alpha mask. The bar
+instrument cannot tint images, so on a palette change it asks for ~/.cache/liquid-tron/ares-helm/<hex>/00.png:
+the same alpha mask in the new primary colour. Atomic write; an existing frame is left alone. Exit 0 on success.
+"""
+import os
+import re
+import sys
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME") or "{{ .chezmoi.homeDir }}")
+SRC = HOME / ".local/share/noctalia-primary/noctalia/plugins/liquidtron-ares/assets/helm"
+OUT = HOME / ".cache/liquid-tron/ares-helm"
+FRAMES = ("00.png",)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1 or not re.fullmatch(r"#?[0-9a-fA-F]{6}", argv[0]):
+        print("usage: ares-helm-tint RRGGBB", file=sys.stderr)
+        return 2
+    hexv = argv[0].lstrip("#").lower()
+    rgb = tuple(int(hexv[i:i + 2], 16) for i in (0, 2, 4))
+    try:
+        from PIL import Image
+    except ImportError:
+        print("ares-helm-tint: python-pillow missing", file=sys.stderr)
+        return 3
+    dest = OUT / hexv
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in FRAMES:
+        target = dest / name
+        if target.is_file():
+            continue
+        with Image.open(SRC / name) as im:
+            alpha = im.convert("RGBA").getchannel("A")
+        out = Image.new("RGBA", alpha.size, rgb + (0,))
+        out.putalpha(alpha)
+        tmp = dest / f".{name}.tmp"
+        out.save(tmp, "PNG")
+        os.replace(tmp, target)
+    # Keep the cache small: the last eight palettes.
+    dirs = sorted((d for d in OUT.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime, reverse=True)
+    for old in dirs[8:]:
+        for f in old.iterdir():
+            f.unlink()
+        old.rmdir()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

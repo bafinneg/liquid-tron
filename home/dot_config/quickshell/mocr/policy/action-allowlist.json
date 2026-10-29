@@ -1,0 +1,78 @@
+{
+  "version": 2,
+  "read_only_binaries": [
+    "journalctl",
+    "systemctl",
+    "ss",
+    "ip",
+    "cat",
+    "ls",
+    "grep",
+    "curl",
+    "wget",
+    "ping",
+    "dig",
+    "host",
+    "tailscale",
+    "nmcli",
+    "pacman",
+    "yay",
+    "ddcutil",
+    "hyprctl",
+    "kscreen-doctor",
+    "ollama"
+  ],
+  "mutating_binaries": [
+    "tailscale",
+    "systemctl",
+    "nmcli",
+    "pacman",
+    "yay",
+    "ddcutil",
+    "hyprctl"
+  ],
+  "mutating_subcommand_allowlist": {
+    "tailscale": ["set", "up", "down", "logout", "update", "status"],
+    "systemctl": ["start", "stop", "restart", "reload", "enable", "disable"],
+    "nmcli": ["connection", "device", "radio"],
+    "pacman": ["-S", "-Sy", "-Syu", "-R", "-Rs"],
+    "yay": ["-S", "-Sy", "-Syu", "-R", "-Rs"],
+    "ddcutil": ["setvcp", "getvcp"],
+    "hyprctl": ["dispatch", "keyword", "reload"]
+  },
+  "systemctl_user_subcommand_allowlist": [
+    "start",
+    "stop",
+    "restart",
+    "reload",
+    "enable",
+    "disable",
+    "status"
+  ],
+  "tailscale_set_flag_allowlist": [
+    "--auto-update",
+    "--auto-update=true",
+    "--auto-update=false",
+    "--accept-routes",
+    "--accept-routes=true",
+    "--accept-routes=false",
+    "--shields-up",
+    "--shields-up=true",
+    "--shields-up=false",
+    "--ssh",
+    "--ssh=true",
+    "--ssh=false"
+  ],
+  "root_required_binaries": [
+    "pacman",
+    "systemctl"
+  ],
+  "polkit_elevatable_binaries": [
+    "pacman",
+    "systemctl"
+  ],
+  "polkit_action_id_for_binary": {
+    "pacman": "com.brian.nostromo.pacman",
+    "systemctl": "com.brian.nostromo.systemctl-system"
+  }
+}

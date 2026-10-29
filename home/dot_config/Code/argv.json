@@ -1,0 +1,15 @@
+// Electron runtime args for VS Code.
+// password-store: "basic" = unencrypted plaintext file under ~/.config/Code.
+// Chosen explicitly over gnome-libsecret because gnome-keyring 50's V0
+// collection-exposure bug (see fixes/vscode-keyring-gnome-keyring-50.md)
+// causes Electron's libsecret probe to fail on this machine even with
+// the daemon running and PAM-unlocked. Setting "basic" here pre-empts the
+// auto-detect failure dialog.
+//
+// The secrets VS Code stores (OAuth session tokens for GitHub / Copilot,
+// MCP creds) are all revocable and already live in memory plaintext
+// while VS Code runs — encryption at rest would defend against offline
+// disk access only.
+{
+  "password-store": "basic"
+}

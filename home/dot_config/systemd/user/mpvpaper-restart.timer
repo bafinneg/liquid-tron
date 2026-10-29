@@ -1,0 +1,12 @@
+[Unit]
+Description=Restart mpvpaper every 4 hours to shed leaked memory
+
+[Timer]
+# OnActiveSec (not OnBootSec): starting the timer after boot+4h must not fire an immediate
+# second wallpaper restart on top of the one that just started the renderer.
+OnActiveSec=4h
+OnUnitActiveSec=4h
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,506 @@
+-- Ares instrument (FEAT-lt29 C2): one ring glyph and an uppercase label on the bar.
+-- v2 payloads (FEAT-ares-bar-ai-clients) render one segment per AI client with chats, `HERMES 2·1  CLAUDE 1`
+-- (chats·subagents), each in its own state colour, with a per-chat hover tooltip; v1 payloads keep the aggregate.
+--
+-- State is pushed by the ares-bar-state Hermes plugin over IPC
+-- (`noctalia-primary-msg plugin liquidtron/ares:instrument all state <json>`); presence.json seeds it once at load.
+-- update() only does work while animating: every static state parks the timer at one tick per hour.
+-- The label inherits the bar's font; only its size is set.
+-- Owner round 6 (FEAT-lt32): the Hermes segment and the idle state show the Ares helm (assets/helm/00.png, the panel
+-- header's first frame) instead of the words HERMES / ARES; the count keeps its state colour.
+--
+-- Colour literals (everything else is a palette role):
+--   #ff8c00  NEEDS YOU amber
+--   #00ff9f  DONE green
+
+local PARK_MS = 3600000
+local THINK_MS = 120
+local PULSE_MS = 250
+local PULSE_TICKS = 6 -- three on/off pulses at 250 ms = 1.5 s
+local DONE_MS = 8000
+
+local AMBER = "#ff8c00"
+local GREEN = "#00ff9f"
+local THINK_GLYPHS = { "loader-quarter", "loader-2", "loader-3", "progress" }
+local DOT = "\u{00B7}"
+local CLIENTS = { { key = "hermes", word = "HERMES", logo = true }, { key = "claude", word = "CLAUDE" } }
+local LOGO = "assets/helm/00.png"
+local LOGO_PX = 20
+
+-- HQ-0100 round 3: the helm follows the desktop theme. ares-helm-tint writes the frames in the palette primary to
+-- ~/.cache/liquid-tron/ares-helm/<hex>/; the shipped cyan frames (the Liquid-Tron primary) are the fallback.
+local TINT = "{{ .chezmoi.homeDir }}/.local/bin/ares-helm-tint"
+local SHIPPED_HEX = "0abdc6"
+local tintHex = nil
+
+local function tintPath(hex)
+  return "{{ .chezmoi.homeDir }}/.cache/liquid-tron/ares-helm/" .. hex .. "/00.png"
+end
+
+local function logo()
+  local path = LOGO
+  if tintHex ~= nil then
+    path = tintPath(tintHex)
+  end
+  return ui.image({ path = path, width = LOGO_PX, height = LOGO_PX, fit = "contain" })
+end
+local MAX_TIP = 8
+local MAX_TIP_TITLE = 40
+
+local KNOWN = {
+  idle = true,
+  listening = true,
+  thinking = true,
+  working = true,
+  needs_you = true,
+  done = true,
+  error = true,
+}
+
+local runtimeDir = noctalia.getenv("XDG_RUNTIME_DIR")
+if runtimeDir == nil or runtimeDir == "" then
+  runtimeDir = "/run/user/1000"
+end
+local PRESENCE = runtimeDir .. "/ares/presence.json"
+local SYSTEM_MODE = "~/.local/state/system-mode"
+local PANEL = "liquidtron/ares:panel"
+
+local current = nil -- last good payload
+local shown = "idle" -- state on screen (done decays to idle)
+local anim = nil -- "thinking" | "needs_you" | "done" while update() has work
+local tick = 0
+local doneDeadline = 0
+local gen = 0 -- bumped on every state change; stale async checks are dropped
+local gotIpc = false
+local segs = nil -- v2: { { text, state }, ... } per client with chats; nil = aggregate render
+local lastSig = nil -- visible text/colour/tooltip signature of the v2 render on screen
+local pulseStart = 0 -- amber pulse origin for the v2 NEEDS YOU segment
+
+local function park()
+  anim = nil
+  noctalia.setUpdateInterval(PARK_MS)
+end
+
+local function draw(glyph, color, text)
+  barWidget.render(ui.row({ gap = 6, align = "center" }, {
+    ui.glyph({ name = glyph, size = 16, color = color }),
+    ui.label({ text = text, fontSize = 12, color = color }),
+  }))
+end
+
+local function workingLabel()
+  local n = 0
+  if current ~= nil then
+    n = math.max(0, math.floor(tonumber(current.workers) or 0))
+    if type(current.sessions) == "table" then
+      for _, s in ipairs(current.sessions) do
+        if type(s) == "table" and s.state == "working" then
+          n += 1
+          break
+        end
+      end
+    end
+  end
+  if n > 0 then
+    return "WORKING " .. tostring(n)
+  end
+  return "WORKING"
+end
+
+local function segColor(state)
+  if state == "needs_you" then
+    return AMBER
+  elseif state == "working" then
+    return "secondary"
+  elseif state == "error" then
+    return "error"
+  end
+  return "primary"
+end
+
+local function pulsing()
+  return math.floor((noctalia.nowMs() - pulseStart) / PULSE_MS) < PULSE_TICKS
+end
+
+local function hasState(state)
+  if segs ~= nil then
+    for _, sg in ipairs(segs) do
+      if sg.state == state then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function drawClients()
+  local kids = {}
+  for _, sg in ipairs(segs) do
+    local color = segColor(sg.state)
+    local parts = {}
+    if sg.logo then
+      table.insert(parts, logo())
+    end
+    if sg.state == "thinking" then
+      table.insert(parts, ui.glyph({ name = THINK_GLYPHS[tick % #THINK_GLYPHS + 1], size = 16, color = color }))
+    elseif sg.state == "needs_you" then
+      local phase = math.floor((noctalia.nowMs() - pulseStart) / PULSE_MS)
+      local glyph = "point-filled"
+      if phase < PULSE_TICKS and phase % 2 == 1 then
+        glyph = "circle-dot"
+      end
+      table.insert(parts, ui.glyph({ name = glyph, size = 16, color = color }))
+    end
+    table.insert(parts, ui.label({ text = sg.text, fontSize = 12, color = color }))
+    table.insert(kids, ui.row({ gap = 4, align = "center" }, parts))
+  end
+  barWidget.render(ui.row({ gap = 10, align = "center" }, kids))
+end
+
+local function drawState(state)
+  if segs ~= nil then
+    drawClients()
+  elseif state == "listening" then
+    barWidget.render(ui.row({ gap = 6, align = "center" }, { logo() }))
+  elseif state == "thinking" then
+    draw(THINK_GLYPHS[1], "primary", "THINKING")
+  elseif state == "working" then
+    draw("progress", "secondary", workingLabel())  -- Liquid-Tron secondary is blue; tertiary is amber (NEEDS YOU)
+  elseif state == "needs_you" then
+    draw("point-filled", AMBER, "NEEDS YOU")
+  elseif state == "done" then
+    draw("circle-dot", GREEN, "DONE")
+  elseif state == "error" then
+    draw("circle-dot", "error", "ERROR")
+  else
+    -- Owner check 1: grey ARES read as absent. Owner round 6: the cyan helm replaces the word.
+    barWidget.render(ui.row({ gap = 6, align = "center" }, { logo() }))
+  end
+end
+
+-- Starts the timer policy for the state on screen, once suppression checks have passed.
+local function animate()
+  barWidget.setVisible(true)
+  tick = 0
+  if segs ~= nil then
+    if hasState("thinking") then
+      anim = "clients"
+      noctalia.setUpdateInterval(THINK_MS)
+    elseif hasState("needs_you") and pulsing() then
+      anim = "clients"
+      noctalia.setUpdateInterval(PULSE_MS)
+    else
+      park()
+    end
+  elseif shown == "thinking" then
+    anim = "thinking"
+    noctalia.setUpdateInterval(THINK_MS)
+  elseif shown == "needs_you" then
+    anim = "needs_you"
+    noctalia.setUpdateInterval(PULSE_MS)
+  elseif shown == "done" then
+    anim = "done"
+    noctalia.setUpdateInterval(DONE_MS)
+  else
+    park()
+  end
+end
+
+-- Suppression parks the animation but keeps the capsule visible: gaming mode already hides the bar and a
+-- fullscreen window covers it, and a hidden capsule would stay hidden until the next Ares state change.
+local function hide()
+  park()
+end
+
+local function checkFullscreen(myGen)
+  local launched = noctalia.runAsync({ "hyprctl", "-j", "activeworkspace" }, function(result)
+    if myGen ~= gen then
+      return
+    end
+    local ws = nil
+    if result.exitCode == 0 then
+      ws = noctalia.json.decode(result.stdout)
+    end
+    -- Hyprland emits `hasfullscreen`; accept either spelling.
+    if type(ws) == "table" and (ws.hasfullscreen == true or ws.hasFullscreen == true) then
+      hide()
+    else
+      animate()
+    end
+  end)
+  if not launched then
+    animate()
+  end
+end
+
+local function afterMode(myGen, contents)
+  if myGen ~= gen then
+    return
+  end
+  if contents ~= nil and noctalia.string.trim(contents) == "gaming" then
+    hide()
+  elseif shown == "thinking" or shown == "needs_you" or hasState("thinking") or hasState("needs_you") then
+    -- v2: a client segment can animate while the aggregate does not; suppress it under fullscreen too.
+    checkFullscreen(myGen)
+  else
+    animate()
+  end
+end
+
+local function enter(state)
+  gen += 1
+  local myGen = gen
+  park()
+  shown = state
+  pulseStart = noctalia.nowMs()
+  if state == "done" and segs == nil then
+    local now = noctalia.nowMs()
+    local since = tonumber(current.since_ms) or now
+    if since > now then
+      since = now
+    end
+    doneDeadline = since + DONE_MS
+    if doneDeadline <= now then
+      shown = "idle"
+    end
+  end
+  drawState(shown)
+  local queued = noctalia.readFileAsync(SYSTEM_MODE, function(contents, _err)
+    afterMode(myGen, contents)
+  end)
+  if not queued then
+    afterMode(myGen, nil)
+  end
+end
+
+local function valid(p)
+  return type(p) == "table" and type(p.state) == "string" and KNOWN[p.state] == true
+end
+
+local function clip(text, n)
+  local len = utf8.len(text)
+  if len == nil then
+    return string.sub(text, 1, n)
+  end
+  if len <= n then
+    return text
+  end
+  return string.sub(text, 1, utf8.offset(text, n + 1) - 1)
+end
+
+local function count(v)
+  return math.max(0, math.floor(tonumber(v) or 0))
+end
+
+local function segmentsOf(p)
+  if p.v ~= 2 or type(p.clients) ~= "table" then
+    return nil
+  end
+  local out = {}
+  for _, c in ipairs(CLIENTS) do
+    local info = p.clients[c.key]
+    if type(info) == "table" and count(info.chats) > 0 then
+      local text = c.word .. " " .. tostring(count(info.chats))
+      if c.logo then
+        text = tostring(count(info.chats))
+      end
+      if count(info.subagents) > 0 then
+        text = text .. DOT .. tostring(count(info.subagents))
+      end
+      local state = "idle"
+      if type(info.state) == "string" and KNOWN[info.state] == true then
+        state = info.state
+      end
+      table.insert(out, { text = text, state = state, logo = c.logo == true })
+    end
+  end
+  if #out == 0 then
+    return nil
+  end
+  return out
+end
+
+-- One row per chat (up to MAX_TIP), then "+k more".
+local function tooltipRows(p)
+  local rows = {}
+  if type(p.chats) ~= "table" then
+    return rows
+  end
+  local total = 0
+  for _, c in ipairs(p.chats) do
+    if type(c) == "table" then
+      total += 1
+      if total <= MAX_TIP then
+        local title = type(c.title) == "string" and c.title or ""
+        if title == "" then
+          title = "untitled"
+        end
+        local state = type(c.state) == "string" and string.upper(string.gsub(c.state, "_", " ")) or "IDLE"
+        table.insert(rows, {
+          key = clip(title, MAX_TIP_TITLE),
+          value = state .. " " .. DOT .. " " .. tostring(count(c.subagents)) .. " sub",
+        })
+      end
+    end
+  end
+  if total > MAX_TIP then
+    table.insert(rows, { key = "+" .. tostring(total - MAX_TIP) .. " more", value = "" })
+  end
+  return rows
+end
+
+local function signature(list, rows)
+  local parts = {}
+  for _, sg in ipairs(list) do
+    table.insert(parts, sg.text .. ":" .. sg.state)
+  end
+  for _, r in ipairs(rows) do
+    table.insert(parts, r.key .. "=" .. r.value)
+  end
+  return table.concat(parts, "|")
+end
+
+local function apply(p)
+  local newSegs = segmentsOf(p)
+  if newSegs ~= nil then
+    local rows = tooltipRows(p)
+    local sig = signature(newSegs, rows)
+    current = p
+    if segs ~= nil and sig == lastSig then
+      return
+    end
+    segs, lastSig = newSegs, sig
+    if #rows > 0 then
+      barWidget.setTooltip(rows)
+    else
+      barWidget.setTooltip(nil)
+    end
+    enter(p.state)
+    return
+  end
+  local wasClients = segs ~= nil
+  segs, lastSig = nil, nil
+  if wasClients then
+    barWidget.setTooltip(nil)
+  end
+  local changed = wasClients or current == nil or p.state ~= current.state or p.since_ms ~= current.since_ms
+  current = p
+  if changed then
+    enter(p.state)
+  elseif shown == "working" then
+    drawState("working")
+  end
+end
+
+function update()
+  if anim == "clients" then
+    tick += 1
+    drawClients()
+    if not hasState("thinking") and not pulsing() then
+      park()
+    end
+  elseif anim == "thinking" then
+    tick += 1
+    draw(THINK_GLYPHS[tick % #THINK_GLYPHS + 1], "primary", "THINKING")
+  elseif anim == "needs_you" then
+    tick += 1
+    if tick >= PULSE_TICKS then
+      draw("point-filled", AMBER, "NEEDS YOU")
+      park()
+    else
+      draw(tick % 2 == 1 and "circle-dot" or "point-filled", AMBER, "NEEDS YOU")
+    end
+  elseif anim == "done" then
+    local left = doneDeadline - noctalia.nowMs()
+    if left <= 0 then
+      shown = "idle"
+      drawState("idle")
+      park()
+    else
+      -- The interval timer may not restart on set; finish the remainder.
+      noctalia.setUpdateInterval(math.max(16, left))
+    end
+  end
+end
+
+local function redraw()
+  if segs ~= nil then
+    drawClients()
+  else
+    drawState(shown)
+  end
+end
+
+-- Palette primary -> helm colour. Runs at load and on the colors_changed hook (IPC event "theme").
+local function retint()
+  local hex = noctalia.getColor("primary")
+  if type(hex) ~= "string" then
+    return
+  end
+  hex = string.lower((string.gsub(hex, "#", "")))
+  if string.match(hex, "^%x%x%x%x%x%x$") == nil then
+    return
+  end
+  if hex == SHIPPED_HEX then
+    tintHex = nil
+    redraw()
+    return
+  end
+  local path = tintPath(hex)
+  if noctalia.fileExists(path) then
+    tintHex = hex
+    redraw()
+    return
+  end
+  noctalia.runAsync({ TINT, hex }, function(_result)
+    if noctalia.fileExists(path) then
+      tintHex = hex
+      redraw()
+    end
+  end)
+end
+
+function onIpc(event, payload)
+  if event == "theme" then
+    retint()
+    return
+  end
+  if event ~= "state" or type(payload) ~= "string" then
+    return
+  end
+  local p = noctalia.json.decode(payload)
+  if not valid(p) then
+    return
+  end
+  gotIpc = true
+  apply(p)
+end
+
+function onClick()
+  noctalia.togglePanel(PANEL)
+end
+
+drawState("idle")
+park()
+retint()
+
+local function seed(contents)
+  if gotIpc then
+    return
+  end
+  local p = nil
+  if contents ~= nil then
+    p = noctalia.json.decode(contents)
+  end
+  if valid(p) then
+    apply(p)
+  else
+    apply({ state = "idle" })
+  end
+end
+
+if not noctalia.readFileAsync(PRESENCE, function(contents, _err)
+  seed(contents)
+end) then
+  seed(nil)
+end

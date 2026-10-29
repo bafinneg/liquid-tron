@@ -1,0 +1,170 @@
+/* Tron Compute — Rofi theme */
+/* Managed by apply-theme.sh — do not edit directly */
+
+* {
+    bg:              #06060c;
+    bg-alt:          #0d0d1a;
+    bg-deep:         #06060cf2;
+    panel:           #0d0d1ad9;
+    panel-strong:    #0e0e1c;
+    row:             #0e0e1c;
+    row-alt:         #0e0e1c;
+    fg:              #c0c0d0;
+    fg-dim:          #707080;
+    accent:          #0abdc6;
+    accent-soft:     #0abdc633;
+    urgent:          #ff003c;
+    blue:            #0072ff;
+    blue-soft:       #0072ff55;
+    amber:           #ff8c00;
+    border-dark:     #1a1a2a;
+    white:           #e0e0f0;
+    shadow:          #000000aa;
+}
+
+window {
+    width: 760px;
+    background-color: @bg-deep;
+    border: 2px solid;
+    border-color: @accent;
+    border-radius: 10px;
+    padding: 3px;
+}
+
+mainbox {
+    background-color: @panel;
+    border: 1px solid;
+    border-color: @accent-soft;
+    border-radius: 8px;
+    padding: 12px;
+    spacing: 8px;
+}
+
+inputbar {
+    children: [ prompt, entry ];
+    spacing: 14px;
+    padding: 12px 14px;
+    background-color: @panel-strong;
+    border: 1px solid;
+    border-color: @accent;
+    border-radius: 6px;
+}
+
+prompt {
+    background-color: transparent;
+    text-color: @accent;
+    padding: 0 8px 0 0;
+}
+
+entry {
+    background-color: transparent;
+    text-color: @white;
+    placeholder: "filter installed applications";
+    placeholder-color: @fg-dim;
+}
+
+listbox {
+    background-color: transparent;
+    spacing: 8px;
+    padding: 0;
+}
+
+listview {
+    background-color: transparent;
+    lines: 10;
+    columns: 1;
+    fixed-height: true;
+    spacing: 8px;
+    border-radius: 8px;
+}
+
+message {
+    margin: 0;
+    padding: 10px 12px;
+    background-color: @blue;
+    border: 1px solid;
+    border-color: @accent;
+    border-radius: 6px;
+}
+
+textbox {
+    background-color: transparent;
+    text-color: @white;
+}
+
+/* ── Element states (explicit token bindings) ───────────── */
+element {
+    padding: 10px 12px;
+    border: 1px solid;
+    border-color: transparent;
+    border-radius: 6px;       /* design doc §4: interactive elements = 6px */
+    background-color: @row;
+    text-color: @fg;
+}
+
+element normal.normal {
+    background-color: @row;
+    text-color: @fg;
+}
+
+element normal.urgent {
+    background-color: @row;
+    text-color: @urgent;
+}
+
+element normal.active {
+    background-color: @row;
+    text-color: @amber;
+}
+
+element selected.normal {
+    background-color: @blue;
+    text-color: @white;       /* white text on blue — locked contrast */
+    border-color: @accent;
+}
+
+element selected.urgent {
+    background-color: @urgent;
+    text-color: @bg;
+    border-color: @amber;
+}
+
+element selected.active {
+    background-color: @amber;
+    text-color: @bg;
+    border-color: @accent;
+}
+
+element alternate.normal {
+    background-color: @row-alt;
+    text-color: @fg;
+}
+
+element alternate.urgent {
+    background-color: @row-alt;
+    text-color: @urgent;
+}
+
+element alternate.active {
+    background-color: @row-alt;
+    text-color: @amber;
+}
+
+element-icon {
+    size: 28px;
+    margin: 0 12px 0 0;
+    background-color: transparent;
+}
+
+element-text {
+    background-color: transparent;
+    text-color: inherit;
+    vertical-align: 0.5;
+}
+
+scrollbar {
+    border-radius: 6px;
+    background-color: @border-dark;
+    handle-color: @accent;
+    handle-width: 4px;
+}

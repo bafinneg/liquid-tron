@@ -1,0 +1,10 @@
+[Unit]
+Description=Rotate OLED-safe wallpaper via waypaper + awww
+After=graphical-session.target
+PartOf=graphical-session.target
+# awww-daemon is the backend waypaper drives. If it's not up yet the
+# timer's next fire will pick up the slack.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/wallpaper-rotate.sh

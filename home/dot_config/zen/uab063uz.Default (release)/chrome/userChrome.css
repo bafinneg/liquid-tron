@@ -1,0 +1,71 @@
+/* ── Tron Liquid theme for Zen Browser ────────────────────────────────
+ * Palette:
+ *   --tron-bg:      #0a0a14  (Kitty/Hyprland base)
+ *   --tron-cyan:    #0abdc6  (accent)
+ *   --tron-select:  rgba(10, 189, 198, 0.3)  (selection — darkened cyan)
+ *   --tron-fg:      #e9e9ed  (text)
+ * ──────────────────────────────────────────────────────────────────── */
+
+/* ── Background — match Kitty terminal at 80% opacity ──────────────── */
+
+:root {
+  --zen-main-browser-background: rgba(10, 10, 20, 0.8) !important;
+}
+
+#navigator-toolbox {
+  background: rgba(10, 10, 20, 0.8) !important;
+}
+
+#zen-sidebar-web-panel {
+  background: rgba(10, 10, 20, 0.8) !important;
+}
+
+/* ── Text selection — darkened cyan bg, white text ─────────────────── */
+
+*::selection {
+  background: rgba(10, 189, 198, 0.3) !important;
+  color: #e9e9ed !important;
+}
+
+/* ── Selected/multiselected tab border ─────────────────────────────── */
+
+.tabbrowser-tab[selected] .tab-background,
+.tabbrowser-tab[multiselected="true"] .tab-background {
+  box-shadow: inset 0 0 0 2px #0abdc6 !important;
+}
+
+/* ── Tab context line — cyan indicator on selected tabs ────────────── */
+
+.tabbrowser-tab[selected] .tab-context-line {
+  background: #0abdc6 !important;
+  height: 3px !important;
+  display: block !important;
+  opacity: 1 !important;
+}
+
+/* ── Tab hover — subtle cyan glow ──────────────────────────────────── */
+
+.tabbrowser-tab:not([selected]):hover .tab-background {
+  box-shadow: inset 0 0 0 1px rgba(10, 189, 198, 0.4) !important;
+}
+
+/* ── URL bar — cyan border when focused ────────────────────────────── */
+
+#urlbar[focused] > #urlbar-background {
+  border-color: #0abdc6 !important;
+  box-shadow: 0 0 4px rgba(10, 189, 198, 0.4) !important;
+}
+
+/* ── Find bar — cyan highlight on matches ──────────────────────────── */
+
+.findbar-textbox:focus {
+  border-color: #0abdc6 !important;
+  box-shadow: 0 0 4px rgba(10, 189, 198, 0.4) !important;
+}
+
+/* ── Scrollbar — dark track, cyan thumb ────────────────────────────── */
+
+* {
+  scrollbar-color: #0abdc6 rgba(10, 10, 20, 0.4) !important;
+  scrollbar-width: thin !important;
+}

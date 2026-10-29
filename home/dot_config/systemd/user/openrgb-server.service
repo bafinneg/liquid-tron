@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenRGB (GUI minimized, SDK server + Effects plugin)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Full GUI launch (not --server-only). This loads plugins including the
+# Effects plugin and applies its startup effect profile. --startminimized
+# sends the window straight to the tray. --server exposes the SDK on 6742
+# so other clients can still connect.
+ExecStart=/usr/bin/openrgb --startminimized --server --server-port 6742 --profile tron-compute
+# To temporarily open the GUI window for configuration: systemctl --user stop this service,
+# then run `openrgb --server --server-port 6742 --profile tron-compute &` in terminal.
+Restart=always
+RestartSec=5
+# Qt needs these to attach to the running Wayland/X11 session
+PassEnvironment=WAYLAND_DISPLAY XDG_RUNTIME_DIR DISPLAY XAUTHORITY
+
+[Install]
+WantedBy=graphical-session.target

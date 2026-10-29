@@ -1,0 +1,14 @@
+[Unit]
+Description=Final Hyprland session snapshot at logout
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=%h/.config/hypr/scripts/session-snapshot.sh
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

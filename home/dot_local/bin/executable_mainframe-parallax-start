@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Mainframe Parallax Wallpaper — Start Script
+# Launches mpvpaper on all three monitors with the Mainframe set.
+
+# Every direct, timer, startup, and system-mode route goes through the wallpaper
+# control plane (state + lock owner). The controller re-enters this body with
+# WALLPAPER_CONTROL_INTERNAL=1.
+if [[ "${WALLPAPER_CONTROL_INTERNAL:-}" != "1" ]]; then
+    exec "$HOME/.local/bin/wallpaper-control" apply-mainframe mainframe-parallax
+fi
+
+WALLPAPER_DIR="$HOME/Pictures/Wallpapers/parallax"
+PID_FILE="/tmp/tron-parallax.pid"
+LOG_DIR="/tmp/tron-parallax-logs"
+PID_MAP_FILE="$LOG_DIR/pids.tsv"
+PARALLAX_UNIT_PREFIX="mpvpaper-parallax"
+
+# mpvpaper 1.8 renders through libmpv and rejects explicit --vo overrides on
+# some outputs. Keep renderer selection under mpvpaper control so all three
+# monitor instances survive startup. --image-display-duration=inf lets scene
+# stills ride the same mpvpaper path as videos.
+MPV_OPTS="--loop --image-display-duration=inf --no-audio --hwdec=auto --panscan=1.0 --demuxer-max-bytes=256MiB --demuxer-max-back-bytes=64MiB --terminal=no"
+
+declare -A MONITOR_VIDEO
+declare -a MONITOR_ORDER
+
+resolve_monitors() {
+    local monitors
+    monitors=$(hyprctl monitors -j)
+
+    local center left right
+    center=$(echo "$monitors" | python3 -c "
+import json,sys
+for m in json.load(sys.stdin):
+    if 'PG42UQ' in m.get('description',''):
+        print(m['name']); break
+")
+    left=$(echo "$monitors" | python3 -c "
+import json,sys
+ms = [m for m in json.load(sys.stdin) if 'AW2725Q' in m.get('description','')]
+if len(ms) >= 2:
+    ms.sort(key=lambda m: m['x'])
+    print(ms[0]['name'])
+elif len(ms) == 1:
+    print(ms[0]['name'])
+")
+    right=$(echo "$monitors" | python3 -c "
+import json,sys
+ms = [m for m in json.load(sys.stdin) if 'AW2725Q' in m.get('description','')]
+if len(ms) >= 2:
+    ms.sort(key=lambda m: m['x'])
+    print(ms[1]['name'])
+")
+
+    if [[ -z "$center" || -z "$left" || -z "$right" ]]; then
+        echo "ERROR: Expected center PG42UQ plus two AW2725Q side monitors."
+        echo "Resolved center='${center:-}' left='${left:-}' right='${right:-}'"
+        return 1
+    fi
+    if [[ "$center" == "$left" || "$center" == "$right" || "$left" == "$right" ]]; then
+        echo "ERROR: Monitor resolver returned duplicate outputs."
+        echo "Resolved center='$center' left='$left' right='$right'"
+        return 1
+    fi
+
+    MONITOR_ORDER=("$left" "$center" "$right")
+    # The mainframe source file names describe the original art assets, not the
+    # physical monitor roles. The production triptych is intentionally arranged
+    # as: left=mainframe-center, center=mainframe-left, right=mainframe-right.
+    MONITOR_VIDEO["$left"]="$WALLPAPER_DIR/mainframe-center-parallax.mp4"
+    MONITOR_VIDEO["$center"]="$WALLPAPER_DIR/mainframe-left-parallax.mp4"
+    MONITOR_VIDEO["$right"]="$WALLPAPER_DIR/mainframe-right-parallax.mp4"
+
+    # Scene mode: the controller passes one file (video or still) per role.
+    if [[ -n "${WALLPAPER_SCENE_LEFT:-}" && -n "${WALLPAPER_SCENE_CENTER:-}" && -n "${WALLPAPER_SCENE_RIGHT:-}" ]]; then
+        MONITOR_VIDEO["$left"]="$WALLPAPER_SCENE_LEFT"
+        MONITOR_VIDEO["$center"]="$WALLPAPER_SCENE_CENTER"
+        MONITOR_VIDEO["$right"]="$WALLPAPER_SCENE_RIGHT"
+    fi
+}
+
+is_video_file() {
+    case "${1,,}" in
+        *.mp4|*.webm|*.mkv|*.mov) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+any_video_assigned() {
+    local mon
+    for mon in "${MONITOR_ORDER[@]}"; do
+        if is_video_file "${MONITOR_VIDEO[$mon]}"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+unit_name_for_monitor() {
+    local mon="$1"
+    printf '%s-%s.service' "$PARALLAX_UNIT_PREFIX" "$mon"
+}
+
+cleanup_existing() {
+    echo "Cleaning up existing mpvpaper instances..."
+
+    # Stop the managed transient units first. This keeps the periodic restart
+    # oneshot's cgroup empty, so future timer cycles do not start with
+    # systemd's "Found left-over process" warnings.
+    local mon unit
+    for mon in "${MONITOR_ORDER[@]}" DP-2 DP-3 DP-4; do
+        unit=$(unit_name_for_monitor "$mon")
+        systemctl --user stop "$unit" 2>/dev/null || true
+        systemctl --user reset-failed "$unit" 2>/dev/null || true
+    done
+
+    if [[ -f "$PID_FILE" ]]; then
+        while IFS= read -r pid; do
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+            fi
+        done < "$PID_FILE"
+    fi
+
+    # Fallback for older manual launches or pre-transient-unit generations.
+    killall mpvpaper 2>/dev/null || true
+    rm -f "$PID_FILE" "$PID_MAP_FILE"
+    sleep 0.8
+}
+
+kill_wallpaper_daemon() {
+    killall awww 2>/dev/null || true
+    killall awww-daemon 2>/dev/null || true
+    sleep 0.3
+}
+
+start_mpvpaper_unit() {
+    local mon="$1"
+    local video="$2"
+    local unit
+    unit=$(unit_name_for_monitor "$mon")
+
+    rm -f "$LOG_DIR/$mon.log"
+    systemctl --user reset-failed "$unit" 2>/dev/null || true
+
+    systemd-run --user \
+        --unit="${unit%.service}" \
+        --collect \
+        --description="mpvpaper parallax wallpaper on $mon" \
+        --property=Restart=no \
+        --property="StandardOutput=append:$LOG_DIR/$mon.log" \
+        --property="StandardError=append:$LOG_DIR/$mon.log" \
+        -- mpvpaper -v -o "$MPV_OPTS" "$mon" "$video" \
+        >/dev/null
+
+    local pid=""
+    for _ in {1..30}; do
+        pid=$(systemctl --user show "$unit" --property=MainPID --value 2>/dev/null || true)
+        if [[ "$pid" =~ ^[0-9]+$ && "$pid" != "0" ]]; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [[ ! "$pid" =~ ^[0-9]+$ || "$pid" == "0" ]]; then
+        echo "ERROR: $unit did not report a MainPID"
+        systemctl --user --no-pager --full status "$unit" || true
+        return 1
+    fi
+
+    echo "$pid" >> "$PID_FILE"
+    printf '%s\t%s\t%s\n' "$mon" "$pid" "$video" >> "$PID_MAP_FILE"
+    echo "  PID: $pid ($unit)"
+}
+
+start_mpvpaper_instances() {
+    mkdir -p "$LOG_DIR"
+    : > "$PID_FILE"
+    : > "$PID_MAP_FILE"
+
+    for mon in "${MONITOR_ORDER[@]}"; do
+        local video="${MONITOR_VIDEO[$mon]}"
+        echo "Starting mpvpaper on $mon with $(basename "$video")..."
+        start_mpvpaper_unit "$mon" "$video"
+    done
+
+    # Verify every monitor-specific process survived startup. A per-monitor map
+    # is more useful than a raw PID count when one output, especially DP-3, fails.
+    sleep 3
+    local alive=0
+    local failed=0
+    local mon pid video unit active
+    while IFS=$'\t' read -r mon pid video; do
+        unit=$(unit_name_for_monitor "$mon")
+        active=$(systemctl --user show "$unit" --property=ActiveState --value 2>/dev/null || true)
+        if kill -0 "$pid" 2>/dev/null && [[ "$active" == "active" ]]; then
+            (( alive++ )) || true
+        else
+            (( failed++ )) || true
+            echo "ERROR: mpvpaper for $mon is not healthy: $(basename "$video")"
+            echo "  PID=$pid active=$active unit=$unit"
+            if [[ -s "$LOG_DIR/$mon.log" ]]; then
+                echo "--- tail $LOG_DIR/$mon.log ---"
+                tail -n 40 "$LOG_DIR/$mon.log"
+                echo "--- end $mon log ---"
+            fi
+            systemctl --user --no-pager --full status "$unit" || true
+        fi
+    done < "$PID_MAP_FILE"
+
+    local total=${#MONITOR_ORDER[@]}
+    if [[ "$failed" -gt 0 || "$alive" -lt "$total" ]]; then
+        echo "WARNING: only $alive/$total mpvpaper instances survived after 3s"
+        echo "Check logs in $LOG_DIR/ and transient unit journals for errors"
+        return 1
+    fi
+
+    echo "Health check OK: $alive/$total instances running"
+}
+
+restart_quickshell_for_z_order() {
+    # The internal-entry flag must not leak into long-lived children spawned below.
+    unset WALLPAPER_CONTROL_INTERNAL
+    local uid
+    uid=$(id -u)
+
+    # Noctalia is the primary shell. Its System Map is an on-demand Quickshell
+    # companion, not MOCR-Q. Wallpaper layers already remain below the Noctalia
+    # surfaces, so preserve both owners and never launch a second shell.
+    if pgrep -u "$uid" -x noctalia > /dev/null 2>&1; then
+        echo "Preserving active Noctalia and Quickshell companions"
+        return 0
+    fi
+
+    # The exact MOCR-Q fallback still needs a bounce after wallpaper recreation so
+    # its ambient layers reclaim their established z-order. Do not generalize this
+    # to arbitrary Quickshell processes: noctalia-map and future companions are
+    # independent owners and must survive wallpaper reconciliation.
+    if ! command -v qs > /dev/null 2>&1 \
+        || ! qs list --all 2>/dev/null | grep -q 'Config path: .*/mocr/shell.qml'; then
+        echo "No managed MOCR-Q instance requires a z-order restart"
+        return 0
+    fi
+
+    echo "Bouncing MOCR-Q to restore ambient z-order..."
+    qs kill -c mocr 2>/dev/null || true
+    pkill -f '/quickshell/mocr/bin/presence-monitor.sh' || true
+    sleep 2
+
+    if command -v hyprctl > /dev/null 2>&1 \
+        && hyprctl dispatch 'hl.dsp.exec_cmd("qs -c mocr -d")' > /dev/null 2>&1; then
+        echo "MOCR-Q restarted via Hyprland"
+        return 0
+    fi
+
+    qs -c mocr -d &
+    disown
+    echo "MOCR-Q restarted"
+}
+
+start_restart_timer() {
+    systemctl --user start mpvpaper-restart.timer
+    if ! systemctl --user is-active --quiet mpvpaper-restart.timer; then
+        echo "ERROR: mpvpaper-restart.timer did not become active" >&2
+        return 1
+    fi
+    echo "mpvpaper restart timer active"
+}
+
+main() {
+    echo "=== Mainframe Parallax Wallpaper Start ==="
+
+    resolve_monitors
+
+    if [[ ${#MONITOR_VIDEO[@]} -eq 0 ]]; then
+        echo "ERROR: No monitors resolved. Check hyprctl monitors."
+        exit 1
+    fi
+
+    echo "Resolved monitors:"
+    for mon in "${MONITOR_ORDER[@]}"; do
+        echo "  $mon → ${MONITOR_VIDEO[$mon]}"
+    done
+
+    for mon in "${MONITOR_ORDER[@]}"; do
+        if [[ ! -f "${MONITOR_VIDEO[$mon]}" ]]; then
+            echo "ERROR: Video not found: ${MONITOR_VIDEO[$mon]}"
+            exit 1
+        fi
+    done
+
+    cleanup_existing
+    kill_wallpaper_daemon
+
+    if ! start_mpvpaper_instances; then
+        echo "Retrying mpvpaper startup once..."
+        cleanup_existing
+        sleep 1
+        if ! start_mpvpaper_instances; then
+            echo "ERROR: mpvpaper startup failed after retry"
+            exit 1
+        fi
+    fi
+
+    # Keep the known mpvpaper memory growth bounded while motion is shown. Stills
+    # do not leak, so a video-free scene leaves the timer to the controller.
+    if any_video_assigned; then
+        start_restart_timer
+    fi
+
+    # MOCR-Q needs a z-order bounce after wallpaper recreation. Noctalia does not:
+    # preserve its primary process and the on-demand System Map companion.
+    restart_quickshell_for_z_order
+
+    echo ""
+    echo "All mpvpaper instances started. PIDs in $PID_FILE"
+    echo "Logs in $LOG_DIR/"
+    echo "Managed units: ${PARALLAX_UNIT_PREFIX}-{DP-2,DP-3,DP-4}.service"
+    echo "To stop: systemctl --user stop '${PARALLAX_UNIT_PREFIX}-DP-2.service' '${PARALLAX_UNIT_PREFIX}-DP-3.service' '${PARALLAX_UNIT_PREFIX}-DP-4.service'"
+}
+
+main "$@"

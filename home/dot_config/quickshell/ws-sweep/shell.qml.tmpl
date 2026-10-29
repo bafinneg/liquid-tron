@@ -1,0 +1,72 @@
+import Quickshell
+import Quickshell.Io
+import QtQuick
+
+// ws-sweep: "Depth Sweep" workspace-transition feedback on the desktop background.
+// One click-through WlrLayer.Bottom surface per monitor (above the wallpaper, below windows).
+ShellRoot {
+    id: root
+
+    // ---- config (~/.config/ws-sweep/config.json, optional, clamped) ----
+    property var cfg: ({})
+    readonly property string home: Quickshell.env("HOME") || "{{ .chezmoi.homeDir }}"
+    function num(v, d, lo, hi) {
+        return (typeof v === "number" && isFinite(v)) ? Math.max(lo, Math.min(hi, v)) : d
+    }
+    function flag(v, d) { return (typeof v === "boolean") ? v : d }
+    // Owner send-back (HQ-0185): the full-screen band, the giant numeral and the empty-workspace numeral changed the
+    // backdrop on every swipe. They are now opt-in (config.json "band": true etc.). The tick ladder sits 36 px from each
+    // monitor's right edge, which on the left and centre monitors is the join with the next screen: it drew a line of
+    // ticks at the seam on every swipe (owner send-back 2, HQ-0185), so it was opt-in. Owner send-back 3: "i saw them before but now its gone" - the ticks are wanted. They are back on by
+    // default ("ladder": false turns them off), drawn past the feather band on any edge that touches another screen.
+    readonly property bool partBand: flag(cfg.band, false)
+    readonly property bool partNumeral: flag(cfg.numeral, false)
+    readonly property bool partLadder: flag(cfg.ladder, true)
+    readonly property bool emptyHold: flag(cfg.empty_hold, false)
+    readonly property bool partFeather: flag(cfg.feather, true)
+    readonly property real featherWidth: num(cfg.feather_width, 0.10, 0.02, 0.30)
+    readonly property real featherAlpha: num(cfg.feather_alpha, 0.92, 0.0, 1.0)
+    readonly property bool enabled: flag(cfg.enabled, true)
+    readonly property real bandAlpha: num(cfg.band_alpha, 0.30, 0.0, 1.0)
+    readonly property real numeralAlpha: num(cfg.numeral_alpha, 0.55, 0.0, 1.0)
+    readonly property real ladderAlpha: num(cfg.ladder_alpha, 0.9, 0.0, 1.0)
+    readonly property real emptyAlpha: num(cfg.empty_alpha, 0.35, 0.0, 1.0)
+    readonly property int beatMs: Math.round(num(cfg.duration_ms, 900, 400, 3000))
+    readonly property bool globalNumbers: cfg.numbers === "global"
+    readonly property int slots: 6
+
+    function applyCfg(text) {
+        try {
+            var o = JSON.parse(text)
+            cfg = (o && typeof o === "object" && !Array.isArray(o)) ? o : ({})
+        } catch (e) { cfg = ({}) }
+    }
+    FileView {
+        path: root.home + "/.config/ws-sweep/config.json"
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: root.applyCfg(text())
+        onLoadFailed: root.cfg = ({})
+    }
+
+    // ---- gaming mode: suppress everything ----
+    property bool gaming: false
+    FileView {
+        path: root.home + "/.local/state/system-mode"
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: root.gaming = text().trim() === "gaming"
+        onLoadFailed: root.gaming = false
+    }
+
+    Variants {
+        model: Quickshell.screens
+        SweepScreen {
+            required property var modelData
+            screen: modelData
+            ctl: root
+        }
+    }
+}

@@ -1,0 +1,637 @@
+#!/usr/bin/python3 -I
+"""ares-presence: webcam presence for the Ares lock screen (FEAT-ares-sentinel-lock, optical presence).
+
+The Ares lock client starts this helper while the screen is locked and reads one JSON line per frame from its
+stdout. Each line carries only numbers: where the main subject is (as a helm yaw/pitch), how near they are, how
+many people are in view, the bearings of the others, and how much of the scene is moving.
+
+Privacy: frames stay in memory. Nothing is written to disk and nothing leaves the machine. Only the numbers below
+reach the lock client. This helper has no influence on authentication; the lock client uses it to steer the helm.
+
+Output line (one per processed frame, about 15 per second; "trk":1 when the tracker bridged a detector miss,
+"body":1 when the face was lost and the subject is held by their shoulders):
+  {"v":1,"st":"ok","n":1,"yaw":-0.21,"pitch":0.05,"near":0.12,"conf":0.91,"others":[0.6],"motion":0.03,"myaw":null}
+Status lines: {"st":"start"}, {"st":"nocam"}, {"st":"lost"}, {"st":"disabled"}, {"st":"nomodel"}.
+
+Usage:
+  ares-presence [--device DEV] [--model ONNX] [--fps N] [--config PATH]   stream (used by the lock client)
+  ares-presence --calibrate                                                  20-second calibration, sitting at the desk
+  ares-presence --probe [SECONDS]                                            print a readable live readout
+
+Calibration (~/.config/ares-lock/camera.json) records where your face sits in the camera image when you sit
+centred, lean left and lean right. The camera can therefore sit anywhere (for example on the right monitor, angled
+inward); the mapping from image to helm direction comes from these three samples.
+"""
+import argparse
+import ctypes
+import glob
+import json
+import math
+import os
+import signal
+import stat
+import sys
+import threading
+import time
+
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+
+CONFIG = os.path.expanduser("~/.config/ares-lock/camera.json")
+DEFAULT_MODEL = os.path.expanduser("~/.config/quickshell/ares-lock/assets/face_detection_yunet_2023mar.onnx")
+# MoveNet SinglePose Lightning (Apache-2.0, Xenova/movenet-singlepose-lightning onnx/model.onnx), shoulders only.
+POSE_MODEL = os.path.expanduser("~/.config/quickshell/ares-lock/assets/movenet_singlepose_lightning.onnx")
+CAPTURE_W, CAPTURE_H = 640, 360
+CAPTURE_FPS = 30       # sensor rate: caps exposure at 33 ms (less motion blur in a dark room); frames are processed at --fps
+TRACK_HOLD = 1.5       # s: while the face was detected this recently, a tracker bridges frames the detector misses
+ROI_MIN = 0.55         # keep-lock score inside the window around a tracked face (a new subject still needs SCORE_MIN)
+ROI_FACE_PX = 64       # the window is scaled so the tracked face is about this wide (a leaning-back face is ~20 px)
+DETECT_W = 320
+SCORE_MIN = 0.70
+LEAN_YAW = 0.5          # helm yaw when you lean left/right at the desk (calibration points)
+YAW_LIMIT = 1.2
+BODY_MIN = 0.30         # both shoulder keypoint scores must reach this
+BODY_MIN_PX = 40        # shoulder span in frame pixels (a smaller span is noise or a distant person)
+BODY_HOLD = 8.0         # s: shoulders may continue a subject whose face was seen this recently
+BODY_MAX = 30.0         # s: longest body-only stretch without a face (an empty chair must not hold a lock)
+BODY_LEARN_EVERY = 5    # while a face is seen, every 5th frame also runs the pose pass to learn face-vs-shoulders
+# Face relative to the shoulders, in shoulder spans: centre offset x/y and face width (measured at the desk).
+DEFAULT_BODY = {"dx": 0.0, "dy": -0.55, "w": 0.47}
+
+# Defaults before calibration: camera roughly in front, image mirrored (your left appears on the image's right).
+DEFAULT_CALIB = {"left": 0.66, "center": 0.5, "right": 0.34, "centerY": 0.42, "centerSize": 0.09}
+
+
+def load_config(path=CONFIG):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def calib_from(cfg):
+    c = dict(DEFAULT_CALIB)
+    for k in DEFAULT_CALIB:
+        v = cfg.get(k)
+        if isinstance(v, (int, float)) and math.isfinite(v):
+            c[k] = float(v)
+    # Degenerate calibration (points too close together) falls back to the defaults for the yaw axis.
+    if abs(c["left"] - c["center"]) < 0.02 or abs(c["right"] - c["center"]) < 0.02:
+        for k in ("left", "center", "right"):
+            c[k] = DEFAULT_CALIB[k]
+    if c["centerSize"] <= 0.005:
+        c["centerSize"] = DEFAULT_CALIB["centerSize"]
+    return c
+
+
+def clamp(v, a, b):
+    return max(a, min(b, v))
+
+
+def yaw_for(x, c):
+    """Normalised image x (0..1, raw camera orientation) -> helm yaw (-1 viewer-left .. +1 viewer-right).
+
+    Piecewise linear through the three calibration points (left -> -LEAN_YAW, center -> 0, right -> +LEAN_YAW),
+    extrapolated beyond them, so the mapping works whatever side the camera is mounted on and whether or not
+    the image is mirrored.
+    """
+    ref = c["left"] if (x - c["center"]) * (c["left"] - c["center"]) > 0 else c["right"]
+    sign = -1.0 if ref == c["left"] else 1.0
+    span = ref - c["center"]
+    return clamp(sign * LEAN_YAW * (x - c["center"]) / span, -YAW_LIMIT, YAW_LIMIT)
+
+
+def subject(face, fw, fh, c):
+    """face = (x, y, w, h, score) in pixels -> dict of yaw, pitch, near, conf."""
+    x, y, w, h, s = (float(v) for v in face[:5])   # numpy scalars (MoveNet float32) are not JSON-serialisable
+    cx = (x + w / 2) / fw
+    cy = (y + h / 2) / fh
+    size = w / fw
+    return {
+        "yaw": round(yaw_for(cx, c), 3),
+        "pitch": round(clamp((cy - c["centerY"]) / 0.3, -1, 1), 3),
+        "near": round(clamp(math.log2(max(size, 1e-4) / c["centerSize"]), -1, 1), 3),
+        "conf": round(float(s), 2),
+    }
+
+
+def frame_message(faces, fw, fh, c, motion=0.0, myaw=None, tracked=False, main_first=False):
+    """Build one output line from detections; up to 3 others follow the main subject.
+    The main subject is the largest face, or faces[0] when main_first (the stream has chosen it by continuity).
+    tracked=True marks a main subject that came from the tracker (the detector missed it this frame)."""
+    faces = [f for f in faces if f[4] >= SCORE_MIN]
+    if main_first and faces:
+        faces = faces[:1] + sorted(faces[1:], key=lambda f: f[2] * f[3], reverse=True)
+    else:
+        faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+    msg = {"v": 1, "st": "ok", "n": len(faces), "motion": round(float(motion), 3),
+           "myaw": None if myaw is None else round(float(myaw), 3)}
+    if faces and tracked:
+        msg["trk"] = 1
+    if faces:
+        msg.update(subject(faces[0], fw, fh, c))
+        msg["others"] = [subject(f, fw, fh, c)["yaw"] for f in faces[1:4]]
+    return msg
+
+
+def roi_box(box, fw, fh):
+    """Square window around a tracked face (x, y, w, h in frame pixels): 4x the face size, at least 128 px,
+    kept inside the frame. Returns (x0, y0, side)."""
+    x, y, w, h = box
+    side = int(min(fw, fh, max(128, 4 * max(w, h))))
+    cx, cy = x + w / 2, y + h / 2
+    x0 = int(clamp(cx - side / 2, 0, fw - side))
+    y0 = int(clamp(cy - side / 2, 0, fh - side))
+    return x0, y0, side
+
+
+def overlaps(a, b):
+    """Intersection over union of two (x, y, w, h, ...) boxes."""
+    ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def find_device(cfg):
+    dev = cfg.get("device")
+    if isinstance(dev, str) and os.path.exists(dev):
+        return dev
+    for p in sorted(glob.glob("/dev/v4l/by-id/*-video-index0")):
+        return p
+    return None
+
+
+def emit(obj):
+    try:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":"), default=float) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        os._exit(0)
+
+
+def die_with_parent():
+    """Exit when the lock client goes away: parent-death signal plus stdin EOF."""
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+    except OSError:
+        pass
+
+    def watch_stdin():
+        try:
+            while sys.stdin.buffer.read(4096):
+                pass
+        except (OSError, ValueError):
+            pass
+        os._exit(0)
+
+    # Only a pipe signals the parent's exit by EOF; /dev/null or a terminal would end the stream at once.
+    try:
+        is_pipe = stat.S_ISFIFO(os.fstat(sys.stdin.fileno()).st_mode)
+    except (OSError, ValueError):
+        is_pipe = False
+    if is_pipe:
+        threading.Thread(target=watch_stdin, daemon=True).start()
+
+
+class Camera:
+    def __init__(self, cv2, device, fps):
+        self.cv2, self.device, self.fps = cv2, device, fps
+        self.cap = None
+
+    def open(self):
+        cv2 = self.cv2
+        cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            return False
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_H)
+        cap.set(cv2.CAP_PROP_FPS, CAPTURE_FPS)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap = cap
+        return True
+
+    def read(self):
+        if self.cap is None:
+            return None
+        ok, frame = self.cap.read()
+        return frame if ok else None
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+
+class Follower:
+    """Keeps the main subject while the detector misses it (motion blur, a turned head) for up to TRACK_HOLD s.
+
+    Each detection stores the 320 px frame and the face box. On the first miss a KCF tracker starts from that stored
+    frame and box; later misses update it. A tracker box that jumps or changes size implausibly is dropped. Frames
+    stay in memory only.
+    """
+
+    def __init__(self, make_tracker, clock=time.monotonic):
+        self.make = make_tracker
+        self.clock = clock
+        self.trk = None
+        self.seen = None        # time of the last detection
+        self.box = None         # last box in small-frame pixels
+        self.frame = None       # small frame of the last detection
+
+    def update(self, small, faces, k):
+        """faces in full-frame pixels; k = full width / small width. Returns (faces, tracked)."""
+        now = self.clock()
+        good = [f for f in faces if f[4] >= SCORE_MIN]
+        if good:
+            x, y, w, h, _ = max(good, key=lambda f: f[2] * f[3])
+            self.box = (x / k, y / k, w / k, h / k)
+            self.frame = small
+            self.seen = now
+            self.trk = None
+            return faces, False
+        if self.seen is None or now - self.seen > TRACK_HOLD or self.box is None:
+            self.trk = None
+            return faces, False
+        try:
+            if self.trk is None:
+                self.trk = self.make()
+                self.trk.init(self.frame, tuple(int(round(v)) for v in self.box))
+            ok, b = self.trk.update(small)
+        except Exception:
+            ok = False
+        if not ok:
+            self.trk = None
+            return faces, False
+        bx, by, bw, bh = (float(v) for v in b)
+        px, py, pw, ph = self.box
+        jump = math.hypot((bx + bw / 2) - (px + pw / 2), (by + bh / 2) - (py + ph / 2))
+        if bw <= 0 or jump > 1.5 * pw or not 0.6 < bw / pw < 1.6:
+            self.trk = None
+            return faces, False
+        self.box = (bx, by, bw, bh)
+        return [(bx * k, by * k, bw * k, bh * k, SCORE_MIN)] + list(faces), True
+
+
+def body_face(sh, geo, conf=SCORE_MIN):
+    """Shoulders (mid x, mid y, span) in frame pixels -> a face-like box (x, y, w, h, score) where the face would be."""
+    mx, my, span = sh
+    w = max(4.0, geo["w"] * span)
+    cx, cy = mx + geo["dx"] * span, my + geo["dy"] * span
+    return (cx - w / 2, cy - w / 2, w, w, conf)
+
+
+def learn_body(geo, face, sh, rate=0.1):
+    """Update the face-vs-shoulders geometry from a frame where both were seen (implausible pairs are ignored)."""
+    mx, my, span = sh
+    x, y, w, h = face[:4]
+    dx, dy, r = (x + w / 2 - mx) / span, (y + h / 2 - my) / span, w / span
+    if abs(dx) > 0.8 or not -1.5 < dy < 0.0 or not 0.2 < r < 1.0:
+        return geo
+    return {"dx": geo["dx"] + rate * (dx - geo["dx"]), "dy": geo["dy"] + rate * (dy - geo["dy"]),
+            "w": geo["w"] + rate * (r - geo["w"])}
+
+
+class Body:
+    """MoveNet Lightning on the whole frame (letterboxed square, 192 px), shoulders only (keypoints 5 and 6).
+    Holds the subject when the face detector cannot see a face: head turned away, swivelled side-on. It only
+    continues a subject whose face was seen recently, and never starts one, so a chair back cannot become a person.
+    About 15 ms per pass on one core, so it runs only while the face is missing (plus a sparse learning pass)."""
+
+    def __init__(self, cv2, model, net=None):
+        self.cv2, self.model, self.net = cv2, model, net
+
+    def shoulders(self, frame):
+        """-> (mid x, mid y, span) in frame pixels, or None."""
+        import numpy as np
+        cv2 = self.cv2
+        if self.net is None:
+            self.net = cv2.dnn.readNet(self.model)
+        fh, fw = frame.shape[:2]
+        side = max(fh, fw)
+        y0, x0 = (side - fh) // 2, (side - fw) // 2
+        sq = np.zeros((side, side, 3), np.uint8)
+        sq[y0:y0 + fh, x0:x0 + fw] = frame
+        blob = cv2.resize(sq, (192, 192), interpolation=cv2.INTER_AREA)[:, :, ::-1].astype(np.int32)[None]
+        self.net.setInput(blob)
+        k = np.asarray(self.net.forward()).reshape(17, 3)        # rows: y, x, score (0..1 of the square)
+        (ly, lx, ls), (ry, rx, rs) = k[5], k[6]
+        if min(ls, rs) < BODY_MIN:
+            return None
+        lx, rx = lx * side - x0, rx * side - x0
+        ly, ry = ly * side - y0, ry * side - y0
+        span = math.hypot(lx - rx, ly - ry)
+        if span < BODY_MIN_PX:
+            return None
+        return (float(lx + rx) / 2, float(ly + ry) / 2, float(span))
+
+
+class Detector:
+    """YuNet at 320 px wide every frame (new and extra people). While a subject is tracked, a native-resolution
+    window around them, scaled so their face is about 64 px, keeps the lock when they lean back or turn (the 320 px
+    pass loses a face below about 25 px). When nobody is found, a 640 px pass every third frame finds distant faces."""
+
+    def __init__(self, cv2, model):
+        self.cv2 = cv2
+        self.small = None
+        self.full = None
+        self.model = model
+        self.i = 0
+        self.prev = None
+
+    def _det(self, which, img, thr=0.6):
+        cv2 = self.cv2
+        h, w = img.shape[:2]
+        d = getattr(self, which, None)
+        if d is None:
+            d = cv2.FaceDetectorYN.create(self.model, "", (w, h), thr, 0.3, 8)
+            setattr(self, which, d)
+        else:
+            d.setInputSize((w, h))
+        _, faces = d.detect(img)
+        if faces is None:
+            return []
+        return [(float(f[0]), float(f[1]), float(f[2]), float(f[3]), float(f[14])) for f in faces]
+
+    def faces(self, frame, search=True, track=None):
+        """search=False skips the 640 px pass (used when the scene has been still: nobody new can be there).
+        track = the main subject's last box (frame pixels) while it is fresh; its window is checked first."""
+        cv2 = self.cv2
+        self.i += 1
+        fh, fw = frame.shape[:2]
+        sh = round(DETECT_W * fh / fw)
+        small = cv2.resize(frame, (DETECT_W, sh), interpolation=cv2.INTER_AREA)
+        k = fw / DETECT_W
+        main = None
+        if track is not None and track[2] > 0:
+            x0, y0, side = roi_box(track, fw, fh)
+            z = clamp(ROI_FACE_PX / track[2], 0.5, 3.0)
+            crop = cv2.resize(frame[y0:y0 + side, x0:x0 + side], None, fx=z, fy=z,
+                              interpolation=cv2.INTER_LINEAR if z > 1 else cv2.INTER_AREA)
+            hits = [(x0 + x / z, y0 + y / z, w / z, h / z, s) for x, y, w, h, s in self._det("roi", crop, 0.45)]
+            hits = [f for f in hits if f[4] >= ROI_MIN]
+            if hits:
+                tx, ty = track[0] + track[2] / 2, track[1] + track[3] / 2
+                best = min(hits, key=lambda f: math.hypot(f[0] + f[2] / 2 - tx, f[1] + f[3] / 2 - ty))
+                main = best[:4] + (max(best[4], SCORE_MIN),)
+        # While the subject is held by its window, the room-wide pass (other people) runs every third frame.
+        got = []
+        if main is None or self.i % 3 == 0:
+            got = [(x * k, y * k, w * k, h * k, s) for x, y, w, h, s in self._det("small", small)]
+        if main is not None:
+            got = [main] + [f for f in got if overlaps(f, main) < 0.3]
+        elif search and not any(f[4] >= SCORE_MIN for f in got) and self.i % 3 == 0:
+            got = self._det("full", frame)
+        return got, small
+
+    def motion(self, small):
+        """Fraction of the scene that changed since the last frame, and the change's horizontal centre (0..1)."""
+        cv2 = self.cv2
+        g = cv2.cvtColor(cv2.resize(small, (80, 45), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        g = cv2.GaussianBlur(g, (5, 5), 0)
+        prev, self.prev = self.prev, g
+        if prev is None:
+            return 0.0, None
+        diff = cv2.absdiff(g, prev)
+        _, mask = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+        frac = cv2.countNonZero(mask) / mask.size
+        if frac < 0.01:
+            return frac, None
+        m = cv2.moments(mask, binaryImage=True)
+        return frac, (m["m10"] / m["m00"]) / 80 if m["m00"] else None
+
+
+def stream(args):
+    cfg = load_config(args.config)
+    if cfg.get("enabled") is False:
+        emit({"v": 1, "st": "disabled"})
+        return 0
+    model = args.model or DEFAULT_MODEL
+    if not os.path.exists(model):
+        emit({"v": 1, "st": "nomodel"})
+        return 0
+    device = args.device or find_device(cfg)
+    if not device:
+        emit({"v": 1, "st": "nocam"})
+        return 0
+    try:
+        os.nice(5)
+    except OSError:
+        pass
+    import cv2
+    cv2.setNumThreads(1)
+    cam = Camera(cv2, device, args.fps)
+    if not cam.open():
+        emit({"v": 1, "st": "nocam"})
+        return 0
+    calib = calib_from(cfg)
+    det = Detector(cv2, model)
+    follow = Follower(cv2.TrackerKCF_create)
+    track, track_at = None, 0.0
+    pose_model = POSE_MODEL if args.model is None else os.path.join(os.path.dirname(model), os.path.basename(POSE_MODEL))
+    body = Body(cv2, pose_model) if os.path.exists(pose_model) else None
+    geo = dict(DEFAULT_BODY)
+    face_at, body_at, body_since, n_frame = -1e9, -1e9, None, 0
+    emit({"v": 1, "st": "start"})
+    period = 1.0 / args.fps
+    fails = 0
+    last_active = time.monotonic()
+    deadline = time.monotonic() + args.seconds if args.seconds else None
+    while deadline is None or time.monotonic() < deadline:
+        t0 = time.monotonic()
+        frame = cam.read()
+        if frame is None:
+            fails += 1
+            if fails == 5:
+                emit({"v": 1, "st": "lost"})
+                cam.close()
+            if fails >= 5:
+                time.sleep(3)
+                if cam.open():
+                    fails = 0
+                    emit({"v": 1, "st": "start"})
+            continue
+        fails = 0
+        # The distant-face pass runs only while the scene moved in the last 4 s or a face was seen recently.
+        now = time.monotonic()
+        faces, small = det.faces(frame, search=now - last_active < 4.0,
+                                 track=track if now - track_at < TRACK_HOLD else None)
+        faces, tracked = follow.update(small, faces, frame.shape[1] / small.shape[1])
+        good = [f for f in faces if f[4] >= SCORE_MIN]
+        n_frame += 1
+        held_by_body = False
+        if good and not tracked:
+            face_at, body_since = now, None
+            if body is not None and n_frame % BODY_LEARN_EVERY == 0:
+                try:
+                    sh = body.shoulders(frame)
+                except Exception:
+                    body, sh = None, None
+                if sh is not None:
+                    geo = learn_body(geo, max(good, key=lambda f: f[2] * f[3]), sh)
+        elif not good and body is not None and (now - face_at < BODY_HOLD
+                                                or (body_since is not None and now - body_at < TRACK_HOLD)):
+            # Face lost (turned away, side-on): hold the subject by their shoulders, near where it was.
+            try:
+                sh = body.shoulders(frame)
+            except Exception:
+                body, sh = None, None
+            pf = body_face(sh, geo) if sh is not None else None
+            near = pf is not None and (track is None or math.hypot(
+                pf[0] + pf[2] / 2 - (track[0] + track[2] / 2), pf[1] + pf[3] / 2 - (track[1] + track[3] / 2))
+                < 2.5 * sh[2])
+            if near and (body_since is None or now - body_since < BODY_MAX):
+                body_since = body_since if body_since is not None else now
+                body_at = now
+                faces, good, held_by_body = [pf] + list(faces), [pf], True
+            else:
+                body_since = None
+        if good:
+            # Main subject: the face nearest the last tracked one (no hopping to a bigger face in the room).
+            if track is not None and now - track_at < TRACK_HOLD:
+                tx, ty = track[0] + track[2] / 2, track[1] + track[3] / 2
+                m = min(good, key=lambda f: math.hypot(f[0] + f[2] / 2 - tx, f[1] + f[3] / 2 - ty))
+            else:
+                m = max(good, key=lambda f: f[2] * f[3])
+            track, track_at = m[:4], now
+            faces = [m] + [f for f in faces if f is not m]
+        frac, mx = det.motion(small)
+        if frac >= 0.01 or any(f[4] >= SCORE_MIN for f in faces):
+            last_active = time.monotonic()
+        myaw = yaw_for(mx, calib) if mx is not None else None
+        msg = frame_message(faces, frame.shape[1], frame.shape[0], calib, frac, myaw, tracked, main_first=True)
+        if held_by_body and msg.get("n"):
+            msg["body"] = 1
+            msg.pop("trk", None)
+        emit(msg)
+        rest = period - (time.monotonic() - t0)
+        if rest > 0:
+            time.sleep(rest)
+    cam.close()
+    return 0
+
+
+def _median(vals):
+    vals = sorted(vals)
+    return vals[len(vals) // 2] if vals else None
+
+
+def calibrate(args):
+    cfg = load_config(args.config)
+    model = args.model or DEFAULT_MODEL
+    device = args.device or find_device(cfg)
+    if not device or not os.path.exists(model):
+        print("ares-presence: no camera or no face model found", file=sys.stderr)
+        return 1
+    import cv2
+    cv2.setNumThreads(1)
+    cam = Camera(cv2, device, 15)
+    if not cam.open():
+        print("ares-presence: the camera did not open (is another program using it?)", file=sys.stderr)
+        return 1
+    det = Detector(cv2, model)
+    for _ in range(10):
+        cam.read()
+
+    def sample(prompt):
+        input(prompt + "  Press Enter, then hold still for 2 seconds.")
+        xs, ys, ss = [], [], []
+        end = time.monotonic() + 2.0
+        while time.monotonic() < end:
+            frame = cam.read()
+            if frame is None:
+                continue
+            faces = [f for f in det.faces(frame)[0] if f[4] >= SCORE_MIN]
+            if faces:
+                x, y, w, h, _ = max(faces, key=lambda f: f[2] * f[3])
+                xs.append((x + w / 2) / frame.shape[1])
+                ys.append((y + h / 2) / frame.shape[0])
+                ss.append(w / frame.shape[1])
+        if len(xs) < 5:
+            print("  No face seen. Check that the camera points at you and the room is lit, then try again.")
+            return None
+        print(f"  ok ({len(xs)} frames)")
+        return _median(xs), _median(ys), _median(ss)
+
+    print("Ares camera calibration. Sit where you normally sit and look at the centre monitor.")
+    c = l = r = None
+    try:
+        while c is None:
+            c = sample("1/3  Sit centred in front of the centre monitor.")
+        while l is None:
+            l = sample("2/3  Lean to your LEFT, about a shoulder width.")
+        while r is None:
+            r = sample("3/3  Lean to your RIGHT, about a shoulder width.")
+    except (EOFError, KeyboardInterrupt):
+        print("\nCalibration cancelled; nothing saved.")
+        return 1
+    finally:
+        cam.close()
+    if abs(l[0] - c[0]) < 0.02 or abs(r[0] - c[0]) < 0.02:
+        print("Leaning moved your face too little in the image. Lean further and run --calibrate again.")
+        return 1
+    if (l[0] - c[0]) * (r[0] - c[0]) > 0:
+        print("Left and right landed on the same side of centre. Run --calibrate again.")
+        return 1
+    cfg.update({"device": device, "center": round(c[0], 4), "left": round(l[0], 4), "right": round(r[0], 4),
+                "centerY": round(c[1], 4), "centerSize": round(c[2], 4), "calibrated": time.strftime("%F %T")})
+    os.makedirs(os.path.dirname(args.config), exist_ok=True)
+    tmp = args.config + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=1)
+    os.replace(tmp, args.config)
+    print(f"Saved {args.config}. Ares uses it at the next lock.")
+    return 0
+
+
+def probe(args):
+    """Human-readable readout, for checking placement. Same pipeline as the stream."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        os.dup2(w, 1)
+        args.seconds = args.probe
+        os._exit(stream(args))
+    os.close(w)
+    with os.fdopen(r) as f:
+        for line in f:
+            d = json.loads(line)
+            if d.get("st") != "ok":
+                print("status:", d.get("st"))
+            elif d["n"]:
+                print(f"people {d['n']}  yaw {d['yaw']:+.2f}  pitch {d['pitch']:+.2f}  near {d['near']:+.2f}  "
+                      f"conf {d['conf']:.2f}  others {d.get('others', [])}"
+                      + ("  [shoulders]" if d.get("body") else "  [tracker]" if d.get("trk") else ""))
+            else:
+                print(f"people 0  motion {d['motion']:.3f}  motion-yaw {d['myaw']}")
+    os.waitpid(pid, 0)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device")
+    ap.add_argument("--model")
+    ap.add_argument("--fps", type=int, default=15)
+    ap.add_argument("--config", default=CONFIG)
+    ap.add_argument("--seconds", type=float, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--calibrate", action="store_true")
+    ap.add_argument("--probe", type=float, nargs="?", const=10.0)
+    args = ap.parse_args(argv)
+    args.fps = clamp(args.fps, 2, 15)
+    if args.calibrate:
+        return calibrate(args)
+    if args.probe is not None:
+        args.probe = max(1.0, args.probe)
+        return probe(args)
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    die_with_parent()
+    return stream(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

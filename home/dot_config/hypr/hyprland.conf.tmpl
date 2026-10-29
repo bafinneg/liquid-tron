@@ -1,0 +1,403 @@
+# Monitors - Alienware left 4K, ASUS center 4K, Alienware right 4K
+# Matched by description (EDID) so layout survives cable/port swaps
+# bitdepth 10: both panel models are 10-bit; reduces banding in blur/gradient chrome (FEAT-liquid-tron-desktop-polish-2 C7).
+monitor = desc:Dell Inc. AW2725Q {{ .monitors.left.serial }}, 3840x2160@144, 0x360, 1, bitdepth, 10
+monitor = desc:ASUSTek COMPUTER INC PG42UQ {{ .monitors.center.serial }}, 3840x2160@120, 3840x0, 1, bitdepth, 10
+monitor = desc:Dell Inc. AW2725Q {{ .monitors.right.serial }}, 3840x2160@144, 7680x360, 1, bitdepth, 10
+# NVIDIA environment variables
+env = LIBVA_DRIVER_NAME,nvidia
+env = XDG_SESSION_TYPE,wayland
+env = GBM_BACKEND,nvidia-drm
+env = __GLX_VENDOR_LIBRARY_NAME,nvidia
+env = NVD_BACKEND,direct
+env = AQ_NO_WAYLAND,1
+env = XCURSOR_THEME,Bibata-Original-Tron
+env = XCURSOR_SIZE,24
+# Qt theming via qt5ct (spec 5c) — Qt5 apps use Tokyonight color scheme
+env = QT_QPA_PLATFORMTHEME,qt5ct
+
+
+
+# Monitor config - ASUS PG42UQ center, Alienware AW2725Q flanking
+# Adjust positions based on your physical layout
+# Fallback for any monitor
+
+# Input
+input {
+    kb_layout = us
+    follow_mouse = 1
+    sensitivity = 1.0 # Maximum mouse speed (-1.0 to 1.0)
+}
+
+# General appearance
+general {
+    gaps_in = 4
+    gaps_out = 8
+    border_size = 2
+    layout = dwindle
+}
+
+# Cursor — keep cursor put on cross-monitor focus changes.
+cursor {
+    no_warps = true
+}
+
+# Decoration - Sweet-Ambar-Blue style
+decoration {
+    rounding = 8
+    blur {
+        enabled = true
+        size = 8
+        passes = 3
+        new_optimizations = true
+        noise = 0.02
+        xray = true
+        vibrancy = 0.15
+        vibrancy_darkness = 0.5
+        contrast = 1.1
+        brightness = 0.85
+    }
+    shadow {
+        enabled = true
+        range = 52
+        render_power = 3
+        color = rgba(00e5ff60)
+        color_inactive = rgba(00000077)
+    }
+    active_opacity = 0.95
+    inactive_opacity = 0.88
+    fullscreen_opacity = 1.0
+    dim_inactive = true
+    dim_strength = 0.06
+}
+
+# ── Animation curves ────────────────────────────────────
+animations {
+    enabled = true
+
+    # Curve vocabulary — each has a defined role
+    bezier = linear,   0.00, 0.00, 1.00, 1.00   # constant speed (borderangle)
+    bezier = sweep,    0.22, 1.00, 0.36, 1.00   # workspace slides (deliberate)
+    bezier = snap,     0.05, 0.90, 0.10, 1.00   # window open/close (responsive)
+    bezier = decay,    0.40, 0.00, 0.20, 1.00   # fade out (settling)
+    bezier = inflate,  0.25, 0.46, 0.45, 1.00   # window resize/move (elastic)
+
+    # Windows — snappy but visible
+    animation = windows,         1, 2.5, snap
+    animation = windowsOut,      1, 2,   decay, popin 85%
+    animation = windowsMove,     1, 3,   inflate
+    animation = fade,            1, 2,   decay
+    animation = fadeIn,          1, 1.5, snap
+
+    # Workspaces — deliberate vertical sweep
+    animation = workspaces,       1, 3.5, sweep, slidevert
+    animation = specialWorkspace, 1, 3,   sweep, slidefadevert -50%
+
+    # Borders — snappy color changes, slow rotating gradient loop
+    animation = border,          1, 1, snap
+    animation = borderangle,     1, 80, linear, loop
+}
+
+# Ecosystem — silence upstream nag popups
+ecosystem {
+    no_update_news = true
+    no_donation_nag = true
+}
+
+# Misc
+misc {
+    disable_splash_rendering = true
+    disable_hyprland_logo = true
+    background_color = rgb(000000)
+    vfr = true
+    # Allows a replacement lock client after hyprlock crashes, avoiding a stuck
+    # Hyprland session-lock state.
+    allow_session_lock_restore = true
+}
+
+# Layout
+dwindle {
+    pseudotile = true
+    preserve_split = true
+}
+
+# Autostart
+# The selector starts Noctalia by default and falls back to MOCR-Q after a
+# startup failure, unexpected exit, or persistent explicit rollback.
+# exec-once = waybar   # archived emergency fallback
+exec-once = {{ .chezmoi.homeDir }}/.local/bin/desktop-shell-primary
+exec-once = systemctl --user start hyprpolkitagent.service
+exec-once = xhost +SI:localuser:root
+# Wallpaper — wallpaper-reconcile is the single startup producer: it restores the committed
+# wallpaper-control mode (animated Mainframe triptych by default, or a selected still).
+# mainframe-static-start remains the explicit low-overhead rollback path.
+# exec-once = hyprpaper   # superseded by INFRA-003 (kept commented for rollback)
+# edid-wallpaper-resolve.sh is retained for history/manual rollback only; it no longer autostarts.
+# exec-once = ~/.local/bin/parallax-rotate 3600   # superseded: rotation disabled, mainframe pinned as default
+exec-once = ~/.local/bin/wallpaper-reconcile
+exec-once = hypridle
+exec-once = solaar --window=hide  # tray-only; manages battery/haptic/scroll (DPI+buttons owned by logid)
+exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR DISPLAY HYPRLAND_INSTANCE_SIGNATURE && systemctl --user start openrgb-server.service
+# Reconcile hyprpm state at startup. split-monitor-workspaces is loaded at
+# parse time below because static binds reference split-* dispatchers; this
+# exec-once remains useful for plugins without dispatcher parse-order needs.
+# See machines/7800x/fixes/hyprpm-plugins-not-loaded-on-reboot.md.
+exec-once = hyprpm reload -n
+
+# ── Plugin: dynamic-cursors ──────────────────────────────────────────
+# hypr-dynamic-cursors — tilt mode for liquid-tron cursor feedback
+plugin {
+    dynamic-cursors {
+        mode = tilt
+
+        tilt {
+            limit = 1200
+            function = negative_quadratic
+            window = 150
+        }
+
+        shake {
+            enabled = false
+            nearest = true
+        }
+
+        # Bibata-Original-Tron is X-cursor only (no hyprcursor format),
+        # so disable hyprcursor upscaling to avoid blurry fallback rendering.
+        hyprcursor {
+            enabled = false
+        }
+    }
+}
+
+# ── Plugin: hyprexpo — REMOVED 2026-05-02 ───────────────────────────
+# hyprexpo is no longer in use. The DP-3 workspace scene is the managed
+# Noctalia Liquid Tron System Map invoked through hypr-overview-trigger.
+# The plugin .so remains installed via hyprpm but is not loaded.
+
+# ── Plugin: split-monitor-workspaces ─────────────────────────────────
+# Loaded at parse time because workspace binds below reference split-* dispatchers.
+# Pin: machines/7800x/hyprpm-plugins.yaml records the Hyprland/plugin commits.
+plugin = /var/cache/hyprpm/{{ .login }}/split-monitor-workspaces/split-monitor-workspaces.so
+
+plugin {
+    split-monitor-workspaces {
+        count = 3
+        keep_focused = 1
+        enable_notifications = 0
+        enable_persistent_workspaces = 1
+        enable_wrapping = 1
+        link_monitors = 0
+        monitor_priority = DP-2, DP-3, DP-4
+    }
+}
+
+# Theme colors (managed by apply-theme.sh)
+source = ./colors.conf
+source = ./overview-tools-binds.conf
+source = ./conf.d/*.conf
+
+# ── Layer rules ───────────────────────────────────────────────────────
+# Quickshell surfaces (bar, toasts, popovers) — frosted-glass backdrop blur
+layerrule = blur on, match:namespace quickshell
+layerrule = ignore_alpha 0.15, match:namespace quickshell
+
+# Noctalia Liquid Tron material plane. Hyprland remains the sole blur owner;
+# Noctalia supplies bounded alpha and semantic content for these namespaces.
+layerrule = blur on, match:namespace ^noctalia-(bar-main|panel|attached-panel|notification|osd)$
+layerrule = ignore_alpha 0.12, match:namespace ^noctalia-(bar-main|panel|attached-panel|notification|osd)$
+
+# ── Window rules ──────────────────────────────────────────────────────
+# Tiled by default (hyprland standard). Super+Shift+F to float individual windows.
+
+windowrule = match:class ^(zen)$, opacity 0.85 override 0.85 override
+# Thunar: flat 0.8 override to bypass global multiplier.
+# Zen: bumped to 0.85 — 0.8 felt too transparent for browser content.
+windowrule = match:class ^(thunar)$, opacity 0.8 override 0.8 override
+
+# ── Keybinds ──────────────────────────────────────────────────────────
+$mainMod = SUPER
+
+# ── Launch ────────────────────────────────────────────────────────────
+bindd = $mainMod, RETURN, Launch: Terminal kitty, exec, kitty
+# Liquid Tron launcher theme: dotfiles/rofi/.config/rofi/
+bindd = $mainMod, D, Launch: Noctalia app palette, exec, {{ .chezmoi.homeDir }}/.local/lib/noctalia-pilot/5.0.0-beta.8/bin/noctalia msg panel-toggle launcher
+bindd = $mainMod SHIFT, D, Launch: Rofi app palette fallback, exec, ~/.config/rofi/scripts/liquid-tron-palette
+bindd = $mainMod, B, Launch: Browser Chrome (new window), exec, gtk-launch google-chrome
+bindd = $mainMod, E, Launch: File manager Thunar, exec, thunar
+bindd = $mainMod, W, Launch: Wallpaper Studio, exec, {{ .chezmoi.homeDir }}/.local/bin/wallpaper-studio
+
+# ── Session ───────────────────────────────────────────────────────────
+bindd = $mainMod, Q, Session: Kill active window, killactive,
+bindd = $mainMod SHIFT, Q, Session: Exit Hyprland, exit,
+bindd = $mainMod, L, Session: Lock screen, exec, {{ .chezmoi.homeDir }}/.local/bin/ares-lock
+
+# ── Window State ──────────────────────────────────────────────────────
+bindd = $mainMod, F, Window: Fullscreen, fullscreen, 0
+bindd = $mainMod SHIFT, F, Window: Toggle floating, togglefloating,
+bindd = $mainMod, P, Window: Pseudotile, pseudo,
+bindd = $mainMod, T, Launch: Terminal kitty, exec, kitty
+bindd = $mainMod, S, Window: Pin, pin,
+# SUPER+M → maximize within tiling (fullscreen mode 1).
+# Target of MX Master 4 middle-click button (cid 0x52) via logid.
+bindd = $mainMod, M, Window: Maximize tiled, fullscreen, 1
+bindd = $mainMod, O, Window: exec O, exec, ~/.config/hypr/scripts/toggle-opacity.sh
+# Super+I — toggle wvkbd-mobintl on-screen keyboard (backup when physical kbd unavailable).
+bindd = $mainMod, I, Launch: On-screen keyboard, exec, ~/.config/hypr/scripts/toggle-vkbd.sh
+# Super+| — toggle floating defaults (1920x1080) vs tiled/dwindle.
+# Keychron Q3 Pro emits `backslash` (no Shift) for the physical | key, so
+# bind on Super+backslash to match the actual event stream (verified via wev).
+bindd = $mainMod, backslash, Window: Toggle floating mode, exec, ~/.config/hypr/scripts/toggle-window-mode.sh
+# Super+Alt+| — toggle every window on the active workspace between floating and tiled.
+bindd = $mainMod ALT, backslash, Window: Toggle workspace floating, exec, ~/.config/hypr/scripts/workspace-float-toggle.sh
+
+# ── Focus (arrow keys + vim keys) ────────────────────────────────────
+# SUPER+Left/Right intentionally unbound (FEAT-workspace-ux-overhaul
+# Phase 4 redesign — Session 9): the cross-monitor workspace shift was
+# retired after physical testing showed Hyprland's per-monitor slide
+# direction can't be coordinated without a custom plugin. Vim-style
+# left focus via SUPER+H stays available; right focus via SUPER+L
+# stays unbound while SUPER+L is the lock alias.
+bindd = $mainMod, up, Focus: Move up, movefocus, u
+bindd = $mainMod, down, Focus: Move down, movefocus, d
+bindd = $mainMod, H, Focus: Move left, movefocus, l
+# Super+J — toggle the Nostromo Console (FEAT-nostromo-console). When
+# closed, the console opens with the recent-entries pane (and the user
+# can pick an entry or hit "Investigate latest"); when open, this same
+# chord closes it. The investigate IPC is now reachable through the
+# console UI rather than directly from the keybind. Vim-style focus-down
+# via SUPER+J was retired in favour of SUPER+down (line above) by
+# FEAT-nostromo-investigate; that retirement still stands.
+bindd = $mainMod, J, Overlay: Nostromo console, exec, qs -c mocr ipc call console toggle
+bindd = $mainMod, K, Focus: Move up, movefocus, u
+# NOTE: $mainMod+L is lock screen — use arrows or HJKL minus L for right
+# If you prefer vim purity, swap L/lock:
+#   bind = $mainMod, L, movefocus, r
+#   bind = $mainMod SHIFT, L, exec, hyprlock
+
+# ── Move Windows ──────────────────────────────────────────────────────
+bindd = $mainMod SHIFT, left, Move: Window left, movewindow, l
+bindd = $mainMod SHIFT, right, Move: Window right, movewindow, r
+bindd = $mainMod SHIFT, up, Move: Window up, movewindow, u
+bindd = $mainMod SHIFT, down, Move: Window down, movewindow, d
+bindd = $mainMod SHIFT, H, Move: Window left, movewindow, l
+bindd = $mainMod SHIFT, J, Move: Window down, movewindow, d
+bindd = $mainMod SHIFT, K, Move: Window up, movewindow, u
+bindd = $mainMod SHIFT, L, Move: Window right, movewindow, r
+
+# ── Resize Windows ────────────────────────────────────────────────────
+binde = $mainMod CTRL, left, resizeactive, -40 0
+binde = $mainMod CTRL, right, resizeactive, 40 0
+binde = $mainMod CTRL, up, resizeactive, 0 -40
+binde = $mainMod CTRL, down, resizeactive, 0 40
+binde = $mainMod CTRL, H, resizeactive, -40 0
+binde = $mainMod CTRL, J, resizeactive, 0 40
+binde = $mainMod CTRL, K, resizeactive, 0 -40
+binde = $mainMod CTRL, L, resizeactive, 40 0
+
+# ── Workspaces ────────────────────────────────────────────────────────
+# FEAT-workspace-split-monitor: no named workspaces, no summon scripts, and no
+# number-key direct jumps. Focus a monitor, then cycle within that monitor's
+# local 1/2/3 workspace stack.
+bindd = $mainMod, bracketleft, Workspace: Cycle stack up, split-cycleworkspaces, -1
+bindd = $mainMod, bracketright, Workspace: Cycle stack down, split-cycleworkspaces, +1
+# Vertical workspace stack — SUPER+ALT+Up/Down cycles the focused monitor's
+# local 1/2/3 stack. Workspace 1 is the top of the stack.
+bindd = $mainMod ALT, up, Workspace: Cycle stack up, split-cycleworkspaces, -1
+bindd = $mainMod ALT, down, Workspace: Cycle stack down, split-cycleworkspaces, +1
+
+# SUPER+scroll: Hyprland v0.54.3 maps `mouse_up` to physical scroll-DOWN and
+# `mouse_down` to physical scroll-UP on this setup. Route through a small helper
+# so wrapped local-stack transitions flip `slidevert` and keep the visible
+# animation synchronized with the physical wheel direction.
+bindd = $mainMod, mouse_up, Workspace: Cycle stack down, exec, ~/.config/hypr/scripts/workspace-cycle-vertical down
+bindd = $mainMod, mouse_down, Workspace: Cycle stack up, exec, ~/.config/hypr/scripts/workspace-cycle-vertical up
+
+# MX Master 4 gesture targets (logid → /etc/logid.cfg)
+# These binds exist for the thumb gesture button on the MX Master 4.
+# logid emits KEY_PROG1/2/3/4 (evdev 148/149/202/203) for the four
+# directional gestures.
+#
+# Using Hyprland's `code:N` syntax rather than keysym names because the
+# current XKB layout doesn't map KEY_PROG1-4 to XF86Launch1-4 keysyms,
+# so bind = , XF86Launch1, ... never fires. code:N bypasses keysym
+# resolution and matches on the raw XKB keycode (evdev + 8).
+#
+# Evdev 148 KEY_PROG1 → XKB 156 (Up gesture)
+# Evdev 149 KEY_PROG2 → XKB 157 (Down gesture)
+# Evdev 202 KEY_PROG3 → XKB 210 (Left gesture)
+# Evdev 203 KEY_PROG4 → XKB 211 (Right gesture)
+#
+# See machines/7800x/fixes/mx-master-4-logid-solaar-split.md.
+bind = , code:156, workspace, m+1              # gesture up: next workspace on current monitor
+bind = , code:157, workspace, m-1              # gesture down: prev workspace on current monitor
+bind = , code:210, movetoworkspace, m-1        # gesture left: move window to prev monitor
+bind = , code:211, movetoworkspace, m+1        # gesture right: move window to next monitor
+
+# ── Macro Keys (M1-M4 → F13-F16) ────────────────────────────────────
+# M1 mirrors Super+| window-mode toggles: plain = per-window, Shift = whole workspace.
+bindd = , XF86Tools, Window: Toggle floating mode, exec, ~/.config/hypr/scripts/toggle-window-mode.sh
+bindd = $mainMod SHIFT, XF86Tools, Window: Toggle floating mode, exec, ~/.config/hypr/scripts/workspace-float-toggle.sh
+bindd = , XF86Launch5, Launch: Noctalia app palette, exec, {{ .chezmoi.homeDir }}/.local/lib/noctalia-pilot/5.0.0-beta.8/bin/noctalia msg panel-toggle launcher
+bindd = , XF86Launch6, Workspace: Toggle scratchpad, togglespecialworkspace, scratch
+bindd = , XF86Launch7, Session: Lock screen, exec, {{ .chezmoi.homeDir }}/.local/bin/ares-lock
+
+# ── Overlay Tools ─────────────────────────────────────────────────────
+bindd = $mainMod, slash, Overlay: Keybind cheatsheet, exec, qs -c mocr ipc call cheatsheet toggle
+
+# ── Scratchpad / Special Workspaces ──────────────────────────────────
+bindd = $mainMod, grave, Workspace: Toggle scratchpad, togglespecialworkspace, scratch
+bindd = $mainMod SHIFT, grave, Workspace: Move to scratchpad, movetoworkspace, special:scratch
+# SUPER+U — dashboard deck (wtfutil). Mirrors the scratch special-workspace
+# pattern; deck summons on whichever monitor has focus.
+bindd = $mainMod, U, Workspace: Toggle dashboard deck, togglespecialworkspace, deck
+
+# ── Monitor Focus ─────────────────────────────────────────────────────
+bindd = $mainMod, comma, Monitor: Focus left, focusmonitor, l
+bindd = $mainMod, period, Monitor: Focus right, focusmonitor, r
+bindd = $mainMod SHIFT, comma, Monitor: Move window left, movewindow, mon:l
+bindd = $mainMod SHIFT, period, Monitor: Move window right, movewindow, mon:r
+
+# ── Tabbed/Grouped Windows ───────────────────────────────────────────
+bindd = $mainMod, G, Group: Toggle group, togglegroup,
+# SUPER+SHIFT+G — system-mode toggle (intelligent ↔ gaming).  The `p` flag
+# bypasses a game's shortcut-inhibition request, making this an escape hotkey
+# from gaming mode.  Use explicit desktop paths so the canonical state file is
+# never redirected by a caller's XDG_STATE_HOME or PATH.
+# SUPER+G is taken by togglegroup; the SHIFT variant is free.
+bindpd = $mainMod SHIFT, G, Session: System mode toggle, exec, env HOME={{ .chezmoi.homeDir }} XDG_STATE_HOME={{ .chezmoi.homeDir }}/.local/state {{ .chezmoi.homeDir }}/.local/bin/system-mode-toggle
+# Group cycling lives on SUPER+CTRL+TAB — SUPER+TAB is the Quickshell
+# workspace overview toggle (see overview-tools-binds.conf).
+bindd = $mainMod CTRL, TAB, Group: Cycle active, changegroupactive, f
+bindd = $mainMod CTRL SHIFT, TAB, Group: Cycle active backward, changegroupactive, b
+
+# ── Mouse ─────────────────────────────────────────────────────────────
+bindm = $mainMod, mouse:272, movewindow
+bindm = $mainMod, mouse:273, resizewindow
+bindd = $mainMod, mouse:275, Move: Window to left monitor, movewindow, mon:l    # Meta + Mouse Back  → send to left monitor
+bindd = $mainMod, mouse:276, Move: Window to right monitor, movewindow, mon:r    # Meta + Mouse Forward → send to right monitor
+
+# ── Screenshots ───────────────────────────────────────────────────────
+# Print family — image bytes on clipboard (paste into Claude CLI, Discord, GIMP)
+bind = $mainMod, Print, exec, sh -c 'f=~/Pictures/Screenshots/shot-$(date +%Y%m%d-%H%M%S).png; g=$(slurp) && grim -g "$g" "$f" && wl-copy -t image/png < "$f" && notify-send -u low -i camera-photo "Screenshot" "$f"'
+bind = , Print, exec, sh -c 'f=~/Pictures/Screenshots/shot-$(date +%Y%m%d-%H%M%S).png; grim "$f" && wl-copy -t image/png < "$f" && notify-send -u low -i camera-photo "Screenshot" "$f"'
+# SHIFT variants — file URI on clipboard (paste into Thunar, terminal, file dialogs)
+bind = SHIFT, Print, exec, sh -c 'f=~/Pictures/Screenshots/shot-$(date +%Y%m%d-%H%M%S).png; g=$(slurp) && grim -g "$g" "$f" && printf "file://%s" "$f" | wl-copy -t text/uri-list && notify-send -u low -i camera-photo "Screenshot" "$f"'
+bind = $mainMod SHIFT, Print, exec, sh -c 'f=~/Pictures/Screenshots/shot-$(date +%Y%m%d-%H%M%S).png; grim "$f" && printf "file://%s" "$f" | wl-copy -t text/uri-list && notify-send -u low -i camera-photo "Screenshot" "$f"'
+# SUPER+CTRL+Print — region capture → satty annotate. Ctrl+C in satty copies the annotated image; Ctrl+S saves to the output file.
+bindd = $mainMod CTRL, Print, Capture: Region annotate satty, exec, sh -c 'g=$(slurp) && grim -g "$g" - | satty --filename - --output-filename ~/Pictures/Screenshots/annotated-$(date +%Y%m%d-%H%M%S).png --early-exit --copy-command wl-copy'
+
+# ── Clipboard History ─────────────────────────────────────────────────
+bindd = $mainMod, V, Clipboard: History picker, exec, ~/.local/bin/clip-pick pick
+bindd = $mainMod SHIFT, V, Clipboard: Wipe history, exec, ~/.local/bin/clip-pick wipe
+
+# ── Screen Recording ─────────────────────────────────────────────────
+bindd = $mainMod ALT, R, Capture: Screen recording, exec, ~/.local/bin/rec-region
+bindd = $mainMod ALT SHIFT, R, Capture: Stop recording, exec, ~/.local/bin/rec-stop
+
+# ── Media / Volume ────────────────────────────────────────────────────
+binde = , XF86AudioRaiseVolume, exec, ~/.config/hypr/scripts/liquid-tron-audio-feedback up
+binde = , XF86AudioLowerVolume, exec, ~/.config/hypr/scripts/liquid-tron-audio-feedback down
+bindd = , XF86AudioMute, Media: Toggle mute, exec, ~/.config/hypr/scripts/liquid-tron-audio-feedback mute
+bindd = , XF86AudioPlay, Media: Play pause, exec, playerctl play-pause
+bindd = , XF86AudioNext, Media: Next track, exec, playerctl next
+bindd = , XF86AudioPrev, Media: Previous track, exec, playerctl previous

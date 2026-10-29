@@ -1,0 +1,1139 @@
+-- Ares panel (FEAT-lt29 C3; FEAT-ares-bar-ai-clients C3 + C5-panel redesign, owner-approved mock 2026-10-24).
+--
+-- v2 payloads: a helm header (Ares atlas frames, posed only while a client works or thinks), an aggregate line,
+-- an amber WAITING ON YOU card, one column per AI client (HERMES, CLAUDE) with a living pulse (ui.graph standing
+-- wave, amplitude and speed by client state, vertical displacement only) and clickable chat rows, and a TASKS strip.
+-- A row click opens that Conversation (ares-summon --hermes <id> | --claude <id> <cwd>) and closes the panel.
+-- v1 payloads keep the old session list.
+--
+-- On open it first runs `ares-summon --guard` (lock, gaming mode, fullscreen) and closes itself on a non-zero exit;
+-- nothing but a dim ARES header renders until the guard returns. Then it reads presence.json and the newest task
+-- state files, re-reading every 30 s while open (second ticks keep ages current) and taking presence pushes over
+-- IPC (`state`). Frame ticks run only while the panel is open and a client is listening, working, thinking or
+-- waiting (a moving pulse or the posing helm); closed or all idle = no frame work.
+-- AI USAGE strip (subscription session/weekly limits): reads $XDG_RUNTIME_DIR/ares/ai-usage.json, written by
+-- ai-usage.py (the 15-minute ai-usage-alert cron and every run). On open, a snapshot older than USAGE_STALE_MS
+-- triggers one `ai-usage.py --snapshot` refresh, then a re-read. Bars turn amber at the snapshot threshold (80%)
+-- and error-red at 95%.
+-- Esc and outside click use the attached-panel defaults.
+-- No panel background fill: the panel inherits the shell's adaptive glass. Labels inherit the shell font; only size
+-- is set (never fontFamily).
+--
+-- Colour literals (everything else is a palette role):
+--   #ff8c00  WAITING ON YOU / NEEDS YOU amber (alpha variants below)
+--   #00000000  transparent (resets a row's hover fill/border; the host keeps the last value when a prop is omitted)
+
+local SUMMON = "{{ .chezmoi.homeDir }}/.local/bin/ares-summon"
+local REFRESH_S = 30
+local MAX_TASKS = 8
+local MAX_TEXT = 48
+local MAX_SUMMARY = 64
+local MAX_SUB_LINES = 3
+local MAX_ROWS = 5 -- per client column; the rest collapse into "+k more"
+local FONT = 14
+
+local HELM_FRAMES = 48 -- assets/helm/00.png..47.png (machines/7800x/tools/ares-helm-frames.py)
+local HELM_FRAME_MS = 1000 / 12
+local PULSE_N = 48
+local WAKE_S = 0.45
+local MIN_FRAME_MS = 16
+
+local AMBER = "#ff8c00"
+local AMBER_CARD_FILL = "#ff8c0012"
+local AMBER_CARD_BORDER = "#ff8c0060"
+local AMBER_CHIP = "#ff8c0024"
+local AMBER_HOVER_FILL = "#ff8c0014"
+local AMBER_HOVER_BORDER = "#ff8c0050"
+local CLEAR = "#00000000"
+local DIM = "on_surface_variant"
+local FAINT = "on_surface_variant/0.6"
+local PULSE_IDLE = "on_surface_variant/0.45" -- the flat idle line stays dim (mock: rgba(192,192,208,.45))
+local HOVER_FILL = "primary/0.07"
+local HOVER_BORDER = "primary/0.28"
+
+local STATE_WORDS = {
+  idle = "ARES",
+  listening = "ARES",
+  thinking = "THINKING",
+  working = "WORKING",
+  needs_you = "NEEDS YOU",
+  done = "DONE",
+  error = "ERROR",
+}
+
+local CHIP_WORDS = {
+  idle = "IDLE",
+  listening = "LISTENING",
+  thinking = "THINKING",
+  working = "WORKING",
+  needs_you = "NEEDS YOU",
+  done = "DONE",
+  error = "ERROR",
+}
+
+local KIND_WORDS = {
+  clarify = "QUESTION",
+  approval = "APPROVAL",
+  sudo = "SUDO",
+}
+
+-- Pulse per client state: amplitude (fraction of the half height) and speed. Idle, done and error stay flat.
+local PULSE = {
+  idle = { a = 0, w = 0 },
+  done = { a = 0, w = 0 },
+  listening = { a = 0.18, w = 0.9 },
+  working = { a = 0.62, w = 2.2 },
+  thinking = { a = 0.48, w = 4.2 },
+  needs_you = { a = 0.7, w = 1.4 },
+  error = { a = 0, w = 0 },
+}
+
+local HELM_STATES = { working = true, thinking = true }
+local PULSE_STATES = { listening = true, working = true, thinking = true, needs_you = true }
+
+local CLIENTS = { { key = "hermes", word = "HERMES" }, { key = "claude", word = "CLAUDE" } }
+
+local runtimeDir = noctalia.getenv("XDG_RUNTIME_DIR")
+if runtimeDir == nil or runtimeDir == "" then
+  runtimeDir = "/run/user/1000"
+end
+local home = noctalia.getenv("HOME")
+if home == nil or home == "" then
+  home = "{{ .chezmoi.homeDir }}"
+end
+local PRESENCE = runtimeDir .. "/ares/presence.json"
+local USAGE = runtimeDir .. "/ares/ai-usage.json"
+local USAGE_SCRIPT = home .. "/.hermes/profiles/fullpower/scripts/ai-usage.py"
+local USAGE_STALE_MS = 5 * 60 * 1000 -- refresh on open past this age
+local USAGE_OLD_MS = 30 * 60 * 1000 -- label the strip STALE past this age
+local USAGE_HOT = 95
+local TASKS_DIR = home .. "/.hermes/tasks"
+
+local isOpen = false
+local guarded = false -- guard passed for this open
+local gen = 0 -- bumped on every open/close; stale async results are dropped
+local taskGen = 0 -- bumped on every task scan
+local seconds = 0
+local presence = nil -- last decoded presence.json
+local presenceAt = 0 -- nowMs when `presence` was received (v2 age_ms is relative to that moment)
+local tasks = {}
+local usage = nil -- last decoded ai-usage.json
+local usageRefreshing = false
+
+local tickOn = false -- frame tick currently requested from the host
+local clock = 0 -- seconds of animation since the guard passed (drives the pulse and its wake)
+local sinceRender = 0
+local helmFrame = 0
+local helmAcc = 0
+local hovered = nil -- key of the row under the pointer
+
+local render -- forward declaration (row hover callbacks re-render)
+
+-- Deterministic per-sample phase for the standing wave (the same shape on every open).
+local PHASE = {}
+for i = 0, PULSE_N - 1 do
+  local x = math.sin(i * 12.9898 + 1.7) * 43758.5453
+  PHASE[i] = x - math.floor(x)
+end
+
+local function str(v)
+  if type(v) == "string" then
+    return v
+  elseif type(v) == "number" then
+    return tostring(v)
+  end
+  return ""
+end
+
+local function clip(s, n)
+  local len = utf8.len(s)
+  if len == nil then
+    return string.sub(s, 1, n)
+  end
+  if len <= n then
+    return s
+  end
+  return string.sub(s, 1, utf8.offset(s, n + 1) - 1)
+end
+
+local function span(s)
+  if s < 60 then
+    return tostring(s) .. "S"
+  elseif s < 3600 then
+    return tostring(math.floor(s / 60)) .. "M"
+  elseif s < 86400 then
+    return tostring(math.floor(s / 3600)) .. "H"
+  end
+  return tostring(math.floor(s / 86400)) .. "D"
+end
+
+local function age(ms)
+  local t = tonumber(ms)
+  if t == nil then
+    return ""
+  end
+  return span(math.max(0, math.floor((noctalia.nowMs() - t) / 1000)))
+end
+
+-- v2 chats carry age_ms relative to the moment presence.json was written.
+local function chatAge(ms)
+  local t = tonumber(ms)
+  if t == nil then
+    return ""
+  end
+  return span(math.max(0, math.floor((t + noctalia.nowMs() - presenceAt) / 1000)))
+end
+
+local function join(parts, sep)
+  local out = {}
+  for _, p in ipairs(parts) do
+    if p ~= "" then
+      table.insert(out, p)
+    end
+  end
+  return string.upper(table.concat(out, sep or "  "))
+end
+
+local function list(key)
+  if type(presence) == "table" and type(presence[key]) == "table" then
+    return presence[key]
+  end
+  return {}
+end
+
+local function known(state)
+  state = str(state)
+  if PULSE[state] == nil then
+    return "idle"
+  end
+  return state
+end
+
+-- Colour of a state word. Quiet states keep the cyan primary role (a grey label on black reads as absent).
+local function stateColor(state)
+  if state == "needs_you" then
+    return AMBER
+  elseif state == "working" or state == "thinking" then
+    return "secondary"
+  elseif state == "error" then
+    return "error"
+  end
+  return "primary"
+end
+
+-- Colour of a state dot or pulse line: idle and done are dim.
+local function signalColor(state)
+  if state == "idle" or state == "done" then
+    return DIM
+  end
+  return stateColor(state)
+end
+
+local function plural(n, one, many)
+  return tostring(n) .. " " .. (n == 1 and one or many)
+end
+
+local function summon()
+  noctalia.runAsync({ SUMMON })
+  panel.close()
+end
+
+local function openChat(chat)
+  local o = type(chat) == "table" and chat.open or nil
+  if type(o) == "table" and type(o.id) == "string" and o.id ~= "" then
+    if o.kind == "hermes" then
+      noctalia.runAsync({ SUMMON, "--hermes", o.id })
+      panel.close()
+      return
+    elseif o.kind == "claude" and type(o.cwd) == "string" and o.cwd ~= "" then
+      noctalia.runAsync({ SUMMON, "--claude", o.id, o.cwd })
+      panel.close()
+      return
+    end
+  end
+  summon()
+end
+
+local function header(text, color)
+  return ui.label({ text = text, fontSize = FONT, color = color })
+end
+
+local function row(key, text)
+  return ui.row({ key = key, gap = 12, align = "center" }, {
+    ui.label({ text = text, fontSize = FONT, maxLines = 1, flexGrow = 1 }),
+    ui.button({ text = "OPEN", variant = "ghost", controlSize = "sm", onClick = summon }),
+  })
+end
+
+local function none(key)
+  return ui.label({ key = key, text = "NONE", fontSize = FONT, color = DIM })
+end
+
+local function isV2()
+  return type(presence) == "table" and presence.v == 2 and type(presence.chats) == "table"
+end
+
+-- Splits v2 chats into WAITING (needs_you), HERMES and CLAUDE, keeping the hub's order.
+local function groupChats()
+  local waiting, hermes, claude = {}, {}, {}
+  for _, c in ipairs(list("chats")) do
+    if type(c) == "table" then
+      if c.state == "needs_you" then
+        table.insert(waiting, c)
+      elseif c.client == "claude" then
+        table.insert(claude, c)
+      else
+        table.insert(hermes, c)
+      end
+    end
+  end
+  return waiting, hermes, claude
+end
+
+local function chatById(id)
+  for _, c in ipairs(list("chats")) do
+    if type(c) == "table" and c.id == id then
+      return c
+    end
+  end
+  return nil
+end
+
+-- Requests whose chat is not already listed as needs_you (that row would only repeat).
+local function extraRequests(waiting)
+  local listed = {}
+  for _, c in ipairs(waiting) do
+    listed[str(c.id)] = true
+  end
+  local extra = {}
+  for _, r in ipairs(list("requests")) do
+    if type(r) == "table" and not listed[str(r.session_id)] then
+      table.insert(extra, r)
+    end
+  end
+  return extra
+end
+
+-- Per-client totals from presence.clients, falling back to counting the chats.
+local function clientInfo(key)
+  local c = type(presence) == "table" and type(presence.clients) == "table" and presence.clients[key] or nil
+  local chats, subs, state = 0, 0, "idle"
+  if type(c) == "table" then
+    chats = math.max(0, math.floor(tonumber(c.chats) or 0))
+    subs = math.max(0, math.floor(tonumber(c.subagents) or 0))
+    state = known(c.state)
+  end
+  if chats == 0 then
+    for _, ch in ipairs(list("chats")) do
+      if type(ch) == "table" and (ch.client == key or (key == "hermes" and ch.client ~= "claude")) then
+        chats = chats + 1
+        subs = subs + math.max(0, math.floor(tonumber(ch.subagents) or 0))
+      end
+    end
+  end
+  return { chats = chats, subagents = subs, state = state }
+end
+
+local function anyClient(states)
+  if not isV2() then
+    return false
+  end
+  for _, c in ipairs(CLIENTS) do
+    local info = clientInfo(c.key)
+    if info.chats > 0 and states[info.state] then
+      return true
+    end
+  end
+  return false
+end
+
+local function helmActive()
+  return anyClient(HELM_STATES)
+end
+
+local function animating()
+  return anyClient(PULSE_STATES)
+end
+
+-- Requests or releases frame ticks: only while open, guarded and something moves.
+local function syncTick()
+  local want = isOpen and guarded and animating()
+  if want ~= tickOn then
+    tickOn = want
+    panel.setNeedsFrameTick(want)
+  end
+end
+
+-- Standing wave around 0.5: fixed x samples, vertical displacement only, a sin envelope pins both ends.
+local function pulseValues(state, seed)
+  local p = PULSE[state] or PULSE.idle
+  local wake = math.min(1, clock / WAKE_S)
+  local t = clock + seed
+  local out = {}
+  for i = 0, PULSE_N - 1 do
+    local env = math.sin(math.pi * i / (PULSE_N - 1))
+    local v = p.a * wake * env * (0.55 * math.sin(i * 0.55 + t * p.w * 2.1)
+      + 0.45 * math.sin(t * p.w * 3.3 + PHASE[i] * 6.2832))
+    local y = 0.5 + v * 0.7
+    if y < 0 then
+      y = 0
+    elseif y > 1 then
+      y = 1
+    end
+    out[i + 1] = y
+  end
+  return out
+end
+
+local function setHover(key, state)
+  if state == "true" then
+    hovered = key
+  elseif hovered == key then
+    hovered = nil
+  end
+end
+
+-- Soft state dot (the softness gives the glow); idle and done are dim and crisp.
+local function dot(state)
+  local active = state ~= "idle" and state ~= "done"
+  return ui.column({ paddingV = 4 }, {
+    ui.box({ width = 9, height = 9, radius = 4.5, fill = signalColor(state), softness = active and 3 or 1 }),
+  })
+end
+
+local function chip(text, color, fill)
+  return ui.row({ fill = fill or (color .. "/0.14"), radius = 4, paddingH = 7, paddingV = 3, align = "center" }, {
+    ui.label({ text = text, fontSize = 10.5, color = color, maxLines = 1 }),
+  })
+end
+
+-- A clickable chat row: soft state dot, bold title, dim summary, faint STATE · N SUB · AGE, nested subagents.
+-- Fill and border are always set, so a row that loses hover drops its inset (the host keeps omitted props).
+local function chatRow(key, chat, opts)
+  opts = opts or {}
+  local state = known(chat.state)
+  local title = str(chat.title)
+  if title == "" then
+    title = "untitled"
+  end
+  local lines = {
+    ui.label({ text = clip(title, MAX_TEXT), fontSize = 13.5, fontWeight = "bold", maxLines = 1 }),
+  }
+  local summary = opts.summary or str(chat.summary)
+  if summary ~= "" then
+    table.insert(lines, ui.label({ text = clip(summary, MAX_SUMMARY), fontSize = 11.5, color = DIM, maxLines = 1 }))
+  end
+  local subs = type(chat.sub) == "table" and chat.sub or {}
+  local nSub = math.max(#subs, math.floor(tonumber(chat.subagents) or 0))
+  if not opts.noMeta then
+    local meta = { CHIP_WORDS[state] or "IDLE" }
+    if nSub > 0 then
+      table.insert(meta, tostring(nSub) .. " SUB")
+    end
+    table.insert(meta, chatAge(chat.age_ms))
+    table.insert(lines, ui.label({ text = join(meta, " · "), fontSize = 10.5, color = FAINT, maxLines = 1 }))
+  end
+  for i, sub in ipairs(subs) do
+    if i > MAX_SUB_LINES then
+      break
+    end
+    if type(sub) == "table" then
+      table.insert(lines, ui.label({
+        text = "└ " .. clip(str(sub.title), MAX_TEXT) .. " · " .. str(sub.state),
+        fontSize = 11,
+        color = FAINT,
+        maxLines = 1,
+      }))
+    end
+  end
+  if nSub > MAX_SUB_LINES then
+    table.insert(lines, ui.label({
+      text = "└ +" .. tostring(nSub - MAX_SUB_LINES) .. " more",
+      fontSize = 11,
+      color = FAINT,
+      maxLines = 1,
+    }))
+  end
+  local children = { dot(state), ui.column({ gap = 2, flexGrow = 1 }, lines) }
+  if opts.chip ~= nil then
+    table.insert(children, opts.chip)
+  end
+  local hot = hovered == key
+  return ui.row({
+    key = key,
+    gap = 10,
+    align = "start",
+    padding = 8,
+    radius = 8,
+    fill = hot and (opts.hoverFill or HOVER_FILL) or CLEAR,
+    border = hot and (opts.hoverBorder or HOVER_BORDER) or CLEAR,
+    onClick = function()
+      openChat(chat)
+    end,
+    onHover = function(st)
+      if not (isOpen and guarded) then
+        return -- a late leave after close: nothing to draw
+      end
+      setHover(key, st)
+      render()
+    end,
+  }, children)
+end
+
+local function helmHeader(waiting, extra)
+  local minds, subs = 0, 0
+  for _, c in ipairs(CLIENTS) do
+    local info = clientInfo(c.key)
+    minds = minds + info.chats
+    subs = subs + info.subagents
+  end
+  local nWait = #waiting + #extra
+  local line = { ui.label({
+    text = plural(minds, "MIND", "MINDS") .. " ONLINE · " .. plural(subs, "SUBAGENT", "SUBAGENTS")
+      .. (nWait > 0 and " · " or ""),
+    fontSize = 12,
+    color = DIM,
+    maxLines = 1,
+  }) }
+  if nWait > 0 then
+    table.insert(line, ui.label({
+      text = tostring(nWait) .. " WAITING ON YOU",
+      fontSize = 12,
+      fontWeight = "bold",
+      color = AMBER,
+      maxLines = 1,
+    }))
+  end
+  local lastTool = str(presence.last_tool)
+  if lastTool == "" then
+    lastTool = "-"
+  end
+  local function agg(k, v)
+    return ui.row({ gap = 6, justify = "end" }, {
+      ui.label({ text = k, fontSize = 11, color = DIM }),
+      ui.label({ text = v, fontSize = 11, maxLines = 1 }),
+    })
+  end
+  return ui.row({ key = "head", gap = 16, align = "center" }, {
+    ui.image({ path = string.format("assets/helm/%02d.png", helmFrame), width = 64, height = 64, fit = "contain" }),
+    ui.column({ gap = 4, flexGrow = 1 }, {
+      ui.label({ text = "ARES", fontSize = 24, fontWeight = "bold", color = "primary" }),
+      ui.row({ gap = 0, align = "center" }, line),
+    }),
+    ui.column({ gap = 2, align = "end" }, {
+      agg("TOOL CALLS", tostring(math.max(0, math.floor(tonumber(presence.tool_calls) or 0)))),
+      agg("LAST", clip(lastTool, 16)),
+    }),
+  })
+end
+
+local function waitingCard(waiting, extra)
+  local reqBySession = {}
+  for _, r in ipairs(list("requests")) do
+    if type(r) == "table" then
+      reqBySession[str(r.session_id)] = r
+    end
+  end
+  local rows = { ui.label({ text = "WAITING ON YOU", fontSize = 11, fontWeight = "bold", color = AMBER }) }
+  local first = true
+  local function chipFor(client, ageText)
+    local text = join({ client, ageText }, " · ")
+    if first then
+      text = text .. " ↵" -- Enter opens this row
+      first = false
+    end
+    return chip(text, AMBER, AMBER_CHIP)
+  end
+  for _, c in ipairs(waiting) do
+    local r = reqBySession[str(c.id)]
+    local word = r ~= nil and (KIND_WORDS[str(r.kind)] or "APPROVAL") or "NEEDS YOU"
+    local summary = str(c.summary)
+    table.insert(rows, chatRow("wait-" .. str(c.id), c, {
+      summary = summary ~= "" and (word .. " · " .. summary) or word,
+      noMeta = true,
+      chip = chipFor(str(c.client) == "claude" and "CLAUDE" or "HERMES", chatAge(c.age_ms)),
+      hoverFill = AMBER_HOVER_FILL,
+      hoverBorder = AMBER_HOVER_BORDER,
+    }))
+  end
+  for i, r in ipairs(extra) do
+    local chat = chatById(str(r.session_id))
+    local stand = {
+      id = str(r.session_id),
+      title = chat ~= nil and str(chat.title) or "Hermes request",
+      state = "needs_you",
+      open = chat ~= nil and chat.open or nil,
+    }
+    table.insert(rows, chatRow("req-" .. tostring(i) .. "-" .. str(r.session_id), stand, {
+      summary = KIND_WORDS[str(r.kind)] or "APPROVAL",
+      noMeta = true,
+      chip = chipFor("HERMES", age(r.opened_ms)),
+      hoverFill = AMBER_HOVER_FILL,
+      hoverBorder = AMBER_HOVER_BORDER,
+    }))
+  end
+  return ui.column({
+    key = "waiting",
+    fill = AMBER_CARD_FILL,
+    border = AMBER_CARD_BORDER,
+    radius = 10,
+    paddingV = 10,
+    paddingH = 12,
+    gap = 2,
+  }, rows)
+end
+
+local function clientColumn(c, chats, seed)
+  local info = clientInfo(c.key)
+  local color = stateColor(info.state)
+  local chipColor = info.state == "idle" and DIM or color
+  local children = {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = c.word, fontSize = 15, fontWeight = "bold", color = color }),
+      ui.label({
+        text = plural(info.chats, "chat", "chats") .. " · " .. tostring(info.subagents) .. " sub",
+        fontSize = 12,
+        color = DIM,
+        maxLines = 1,
+        flexGrow = 1,
+      }),
+      chip(CHIP_WORDS[info.state] or "IDLE", chipColor, chipColor == AMBER and AMBER_CHIP or nil),
+    }),
+    ui.graph({
+      key = "pulse-" .. c.key,
+      values = pulseValues(info.state, seed),
+      color = (info.state == "idle" or info.state == "done") and PULSE_IDLE or signalColor(info.state),
+      lineWidth = 3,
+      fillOpacity = 0.16,
+      height = 44,
+    }),
+  }
+  for i, chat in ipairs(chats) do
+    if i > MAX_ROWS then
+      table.insert(children, ui.label({
+        text = "+" .. tostring(#chats - MAX_ROWS) .. " more",
+        fontSize = 11,
+        color = FAINT,
+        maxLines = 1,
+      }))
+      break
+    end
+    table.insert(children, chatRow("row-" .. str(chat.id), chat))
+  end
+  if #chats == 0 then
+    table.insert(children, ui.label({ text = "ALL WAITING ON YOU", fontSize = 11, color = FAINT }))
+  end
+  return ui.column({
+    key = "col-" .. c.key,
+    fill = "primary/0.035",
+    radius = 10,
+    paddingV = 12,
+    paddingH = 12,
+    gap = 4,
+    flexGrow = 1,
+  }, children)
+end
+
+local function taskStrip()
+  local parts = {
+    ui.label({ text = "TASKS", fontSize = 11, color = DIM }),
+    ui.label({ text = tostring(#tasks) .. " open", fontSize = 11 }),
+  }
+  for i, t in ipairs(tasks) do
+    if i > 2 then
+      break
+    end
+    table.insert(parts, ui.label({ text = "· " .. clip(str(t.title), 24), fontSize = 11, color = DIM, maxLines = 1 }))
+    local used, budget = tonumber(t.tokens_used), tonumber(t.budget_tokens)
+    if used ~= nil and budget ~= nil and budget > 0 then
+      table.insert(parts, ui.label({
+        text = tostring(math.floor(used / budget * 100 + 0.5)) .. "%",
+        fontSize = 11,
+        maxLines = 1,
+      }))
+    end
+  end
+  return ui.column({ key = "tasks", gap = 8 }, {
+    ui.separator({ thickness = 1, color = "primary/0.14" }),
+    ui.row({ gap = 10, align = "center" }, parts),
+  })
+end
+
+local function usageColor(pct, threshold)
+  if pct >= USAGE_HOT then
+    return "error"
+  elseif pct >= threshold then
+    return AMBER
+  end
+  return "primary"
+end
+
+local function untilText(ms)
+  local t = tonumber(ms)
+  if t == nil then
+    return ""
+  end
+  return "IN " .. span(math.max(0, math.floor((t - noctalia.nowMs()) / 1000)))
+end
+
+local function usageCard(p, threshold, idx)
+  local hot = false
+  local children = {}
+  local rows = {}
+  local limits = type(p.limits) == "table" and p.limits or {}
+  for i, l in ipairs(limits) do
+    if type(l) == "table" then
+      local pct = tonumber(l.pct) or 0
+      local color = usageColor(pct, threshold)
+      hot = hot or pct >= threshold
+      table.insert(rows, ui.row({ key = "usage-" .. idx .. "-" .. i, gap = 10, align = "center" }, {
+        ui.column({ minWidth = 112 }, {
+          ui.label({ text = clip(string.upper(str(l.label)), 18), fontSize = 11, color = DIM, maxLines = 1 }),
+        }),
+        ui.progress({
+          progress = math.max(0, math.min(pct, 100)) / 100,
+          fill = color,
+          track = "primary/0.12",
+          radius = 3,
+          width = 96,
+          height = 6,
+        }),
+        ui.label({
+          text = tostring(math.floor(pct + 0.5)) .. "%",
+          fontSize = 12,
+          fontWeight = pct >= threshold and "bold" or nil,
+          color = color == "primary" and "on_surface" or color,
+          maxLines = 1,
+          flexGrow = 1,
+        }),
+        ui.label({ text = untilText(l.resets_ms), fontSize = 11, color = FAINT, maxLines = 1 }),
+      }))
+    end
+  end
+  local name = str(p.name)
+  table.insert(children, ui.row({ gap = 8, align = "center" }, {
+    ui.label({ text = name, fontSize = 13, fontWeight = "bold", color = hot and AMBER or "primary", flexGrow = 1 }),
+    chip(clip(string.upper(str(p.plan)), 14), DIM),
+  }))
+  if str(p.error) ~= "" then
+    table.insert(children, ui.label({ text = "UNAVAILABLE · " .. clip(str(p.error), 40), fontSize = 11, color = "error",
+      maxLines = 1 }))
+  end
+  for _, row in ipairs(rows) do
+    table.insert(children, row)
+  end
+  return ui.column({
+    key = "usage-card-" .. idx,
+    fill = hot and AMBER_CARD_FILL or "primary/0.035",
+    border = hot and AMBER_CARD_BORDER or CLEAR,
+    borderWidth = 1,
+    radius = 10,
+    paddingV = 10,
+    paddingH = 12,
+    gap = 6,
+    flexGrow = 1,
+  }, children)
+end
+
+local function usageStrip()
+  if type(usage) ~= "table" or type(usage.providers) ~= "table" then
+    return nil
+  end
+  local threshold = tonumber(usage.threshold) or 80
+  local cards = {}
+  for i, p in ipairs(usage.providers) do
+    if type(p) == "table" then
+      table.insert(cards, usageCard(p, threshold, i))
+    end
+  end
+  if #cards == 0 then
+    return nil
+  end
+  local head = {
+    ui.label({ text = "AI USAGE", fontSize = 11, color = DIM }),
+    ui.label({ text = "ALERT ≥ " .. tostring(math.floor(threshold + 0.5)) .. "%", fontSize = 11, color = FAINT,
+      flexGrow = 1 }),
+  }
+  local at = tonumber(usage.at_ms)
+  if at ~= nil then
+    local old = noctalia.nowMs() - at > USAGE_OLD_MS
+    table.insert(head, ui.label({
+      text = (old and "STALE · " or "UPDATED ") .. age(at) .. " AGO",
+      fontSize = 11,
+      color = old and AMBER or FAINT,
+      maxLines = 1,
+    }))
+  end
+  return ui.column({ key = "usage", gap = 8 }, {
+    ui.row({ gap = 10, align = "center" }, head),
+    ui.row({ gap = 16, align = "start" }, cards),
+  })
+end
+
+local function renderV2()
+  local waiting, hermes, claude = groupChats()
+  local extra = extraRequests(waiting)
+  local children = { helmHeader(waiting, extra) }
+
+  if #waiting + #extra > 0 then
+    table.insert(children, waitingCard(waiting, extra))
+  end
+
+  -- Usage sits above the client columns so it is visible without scrolling in the fixed-height panel.
+  local strip = usageStrip()
+  if strip ~= nil then
+    table.insert(children, strip)
+  end
+
+  local cols = {}
+  local byClient = { hermes = hermes, claude = claude }
+  for i, c in ipairs(CLIENTS) do
+    if clientInfo(c.key).chats > 0 or #byClient[c.key] > 0 then
+      table.insert(cols, clientColumn(c, byClient[c.key], i * 2.5))
+    end
+  end
+  if #cols > 0 then
+    table.insert(children, ui.row({ key = "cols", gap = 16, align = "start" }, cols))
+  else
+    table.insert(children, ui.column({ key = "cols-none", fill = "primary/0.035", radius = 10, padding = 12 }, {
+      ui.label({ text = "NO MINDS ONLINE", fontSize = 12, color = DIM }),
+    }))
+  end
+
+  table.insert(children, taskStrip())
+  panel.render(ui.scroll({ paddingV = 18, paddingH = 20, gap = 16, flexGrow = 1 }, children))
+end
+
+local function taskSection(children)
+  table.insert(children, header("TASKS", DIM))
+  for _, t in ipairs(tasks) do
+    local pct = ""
+    local used, budget = tonumber(t.tokens_used), tonumber(t.budget_tokens)
+    if used ~= nil and budget ~= nil and budget > 0 then
+      pct = tostring(math.floor(used / budget * 100 + 0.5)) .. "%"
+    end
+    table.insert(children, row("task-" .. t.id, join({
+      clip(str(t.title), MAX_TEXT),
+      str(t.tier),
+      str(t.status),
+      pct,
+      clip(str(t.next_step), MAX_TEXT),
+    })))
+  end
+  if #tasks == 0 then
+    table.insert(children, none("task-none"))
+  end
+end
+
+-- v1 fallback: the original session list with OPEN buttons.
+local function renderV1()
+  local sessions = list("sessions")
+  local requests = list("requests")
+  local platformOf = {}
+  for _, s in ipairs(sessions) do
+    if type(s) == "table" and type(s.session_id) == "string" then
+      platformOf[s.session_id] = str(s.platform)
+    end
+  end
+
+  local children = {}
+
+  if #requests > 0 then
+    table.insert(children, header("WAITING ON YOU", AMBER))
+    for i, r in ipairs(requests) do
+      if type(r) == "table" then
+        local word = KIND_WORDS[str(r.kind)] or "APPROVAL"
+        table.insert(children, row("req-" .. i, join({
+          "WAITING ON YOU // " .. word,
+          platformOf[str(r.session_id)] or "",
+          age(r.opened_ms),
+        })))
+      end
+    end
+  end
+
+  table.insert(children, header("SESSIONS", DIM))
+  local nSessions = 0
+  for i, s in ipairs(sessions) do
+    if type(s) == "table" then
+      nSessions = nSessions + 1
+      table.insert(children, row("ses-" .. i, join({
+        str(s.platform),
+        str(s.model),
+        STATE_WORDS[str(s.state)] or "ARES",
+        age(s.started_ms),
+      })))
+    end
+  end
+  if nSessions == 0 then
+    table.insert(children, none("ses-none"))
+  end
+
+  taskSection(children)
+
+  panel.render(ui.scroll({ padding = 16, gap = 8, flexGrow = 1 }, children))
+end
+
+render = function()
+  if not guarded then
+    panel.render(ui.column({ padding = 16 }, { header("ARES", DIM) }))
+    return
+  end
+  if isV2() then
+    renderV2()
+  else
+    renderV1()
+  end
+end
+
+-- New presence arrived: redraw, then start or stop the frame tick to match.
+local function presenceChanged()
+  render()
+  syncTick()
+end
+
+local function readPresence()
+  local myGen = gen
+  noctalia.readFileAsync(PRESENCE, function(contents, _err)
+    if myGen ~= gen then
+      return
+    end
+    local p = nil
+    if contents ~= nil then
+      p = noctalia.json.decode(contents)
+    end
+    presence = type(p) == "table" and p or nil
+    presenceAt = noctalia.nowMs()
+    presenceChanged()
+  end)
+end
+
+-- Reads state.json files newest first (by mtime), one at a time, until MAX_TASKS open tasks are found.
+local function scanTasks()
+  taskGen = taskGen + 1
+  local myGen, myTaskGen = gen, taskGen
+  local names = noctalia.listDir(TASKS_DIR)
+  local queue = {}
+  if type(names) == "table" then
+    for _, name in ipairs(names) do
+      local path = TASKS_DIR .. "/" .. name .. "/state.json"
+      local info = noctalia.fileInfo(path)
+      if type(info) == "table" and not info.isDir then
+        table.insert(queue, { id = name, path = path, mtime = tonumber(info.mtime) or 0 })
+      end
+    end
+  end
+  table.sort(queue, function(a, b)
+    if a.mtime ~= b.mtime then
+      return a.mtime > b.mtime
+    end
+    return a.id > b.id
+  end)
+
+  local found = {}
+  local i = 0
+  local step
+
+  local function finish()
+    tasks = found
+    render()
+  end
+
+  local function take(entry, contents)
+    local s = contents ~= nil and noctalia.json.decode(contents) or nil
+    if type(s) == "table" and str(s.status) ~= "done" then
+      table.insert(found, {
+        id = str(s.id) ~= "" and str(s.id) or entry.id,
+        title = s.title,
+        tier = s.tier,
+        status = s.status,
+        tokens_used = s.tokens_used,
+        budget_tokens = s.budget_tokens,
+        next_step = s.next_step,
+      })
+    end
+  end
+
+  step = function()
+    if myGen ~= gen or myTaskGen ~= taskGen then
+      return
+    end
+    i = i + 1
+    local entry = queue[i]
+    if entry == nil or #found >= MAX_TASKS then
+      finish()
+      return
+    end
+    local queued = noctalia.readFileAsync(entry.path, function(contents, _err)
+      if myGen ~= gen or myTaskGen ~= taskGen then
+        return
+      end
+      take(entry, contents)
+      step()
+    end)
+    if not queued then
+      step()
+    end
+  end
+
+  step()
+end
+
+-- Reads the usage snapshot; with allowRefresh, a missing or old snapshot runs one `ai-usage.py --snapshot`.
+local function readUsage(allowRefresh)
+  local myGen = gen
+  local queued = noctalia.readFileAsync(USAGE, function(contents, _err)
+    if myGen ~= gen then
+      return
+    end
+    local u = contents ~= nil and noctalia.json.decode(contents) or nil
+    usage = type(u) == "table" and u or nil
+    render()
+    local at = usage ~= nil and tonumber(usage.at_ms) or nil
+    if allowRefresh and not usageRefreshing and (at == nil or noctalia.nowMs() - at > USAGE_STALE_MS) then
+      usageRefreshing = true
+      local launched = noctalia.runAsync({ "/usr/bin/python3", "-I", USAGE_SCRIPT, "--snapshot" }, function(_result)
+        usageRefreshing = false
+        if myGen == gen then
+          readUsage(false)
+        end
+      end)
+      if not launched then
+        usageRefreshing = false
+      end
+    end
+  end)
+  return queued
+end
+
+local function refresh()
+  seconds = 0
+  readPresence()
+  scanTasks()
+  readUsage(false)
+end
+
+function onOpen(_context)
+  gen = gen + 1
+  local myGen = gen
+  isOpen = true
+  guarded = false
+  presence = nil
+  tasks = {}
+  hovered = nil
+  clock = 0
+  sinceRender = 0
+  helmAcc = 0
+  render()
+  local launched = noctalia.runAsync({ SUMMON, "--guard" }, function(result)
+    if myGen ~= gen then
+      return
+    end
+    if result.exitCode ~= 0 then
+      panel.close()
+      return
+    end
+    guarded = true
+    clock = 0 -- the pulse amplitude wakes 0 -> 1 from here
+    panel.setWantsSecondTicks(true)
+    render()
+    seconds = 0
+    readPresence()
+    scanTasks()
+    readUsage(true)
+  end)
+  if not launched then
+    panel.close()
+  end
+end
+
+function onClose()
+  gen = gen + 1
+  isOpen = false
+  guarded = false
+  hovered = nil
+  panel.setWantsSecondTicks(false)
+  if tickOn then
+    tickOn = false
+    panel.setNeedsFrameTick(false)
+  end
+end
+
+function onFrameTick(deltaMs)
+  if not (isOpen and guarded) then
+    return
+  end
+  local dt = tonumber(deltaMs) or 0
+  if dt < 0 then
+    dt = 0
+  end
+  clock = clock + dt / 1000
+  if helmActive() then
+    helmAcc = helmAcc + dt
+    while helmAcc >= HELM_FRAME_MS do
+      helmAcc = helmAcc - HELM_FRAME_MS
+      helmFrame = (helmFrame + 1) % HELM_FRAMES
+    end
+  else
+    helmAcc = 0
+  end
+  sinceRender = sinceRender + dt
+  if sinceRender >= MIN_FRAME_MS then
+    sinceRender = 0
+    render()
+  end
+  syncTick()
+end
+
+function update()
+  if not (isOpen and guarded) then
+    return
+  end
+  seconds = seconds + 1
+  if seconds >= REFRESH_S then
+    refresh()
+  else
+    render() -- keeps the ages current
+  end
+end
+
+function onIpc(event, payload)
+  if event ~= "state" or type(payload) ~= "string" or not (isOpen and guarded) then
+    return
+  end
+  local p = noctalia.json.decode(payload)
+  if type(p) == "table" then
+    presence = p
+    presenceAt = noctalia.nowMs()
+    presenceChanged()
+  end
+end
+
+-- Enter opens the first row. v2: the first WAITING row (a needs_you chat, else a pending request's chat), else the
+-- first HERMES chat, else the first CLAUDE chat. v1: summons when there is a request or session. Delivered only when
+-- the manifest lists "Return" in capture_keys.
+function onKey(chord, pressed)
+  if chord ~= "Return" or not pressed or not (isOpen and guarded) then
+    return
+  end
+  if isV2() then
+    local waiting, hermes, claude = groupChats()
+    if waiting[1] ~= nil then
+      openChat(waiting[1])
+      return
+    end
+    local extra = extraRequests(waiting)
+    if extra[1] ~= nil then
+      openChat(chatById(str(extra[1].session_id)))
+      return
+    end
+    local first = hermes[1] or claude[1]
+    if first ~= nil then
+      openChat(first)
+    end
+    return
+  end
+  if #list("requests") > 0 or #list("sessions") > 0 then
+    summon()
+  end
+end

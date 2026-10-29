@@ -1,0 +1,5 @@
+module ambient.variants
+MatrixBezels 1.0 MatrixBezels.qml
+BladeRunnerStripes 1.0 BladeRunnerStripes.qml
+NostromoWhispers 1.0 NostromoWhispers.qml
+PrismaticVeil 1.0 PrismaticVeil.qml

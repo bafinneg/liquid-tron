@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME={{ .chezmoi.homeDir }}
+export XDG_CONFIG_HOME={{ .chezmoi.homeDir }}/.config
+export XDG_STATE_HOME={{ .chezmoi.homeDir }}/.local/state
+export XDG_RUNTIME_DIR=/run/user/1000
+export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}
+
+readonly config_name=noctalia-map
+readonly config_path={{ .chezmoi.homeDir }}/.config/quickshell/noctalia-map/shell.qml
+
+if [[ ! -f "$config_path" ]]; then
+  exit 1
+fi
+
+# An active scene must always remain dismissible, including after a suppression
+# state arrives. An idle companion must pass every admission gate below before
+# it can reopen. Named IPC state avoids brittle resolved-path matching.
+map_status=$(qs -c "$config_name" ipc call systemMap status 2>/dev/null || true)
+if grep -Fq active <<<"$map_status"; then
+  qs -c "$config_name" ipc call systemMap close >/dev/null 2>&1 || true
+  exit 0
+fi
+
+mode_file={{ .chezmoi.homeDir }}/.local/state/system-mode
+[[ -r $mode_file ]] || exit 0
+system_mode=$(<"$mode_file")
+case "$system_mode" in
+  intelligent) ;;
+  gaming) exit 0 ;;
+  *) exit 0 ;;
+esac
+
+# Logind owns lock state. A retained hyprlock process can survive unlock and
+# must not permanently suppress the map. Fail closed if state is unavailable.
+session_id=${XDG_SESSION_ID:-}
+if [[ -z $session_id ]]; then
+  session_id=$(loginctl show-user {{ .login }} -p Display --value 2>/dev/null || true)
+fi
+[[ -n $session_id ]] || exit 0
+locked_hint=$(loginctl show-session "$session_id" -p LockedHint --value 2>/dev/null || true)
+[[ $locked_hint == no ]] || exit 0
+
+# FEAT-lt26r-5: only a fullscreen window that is on screen blocks the Map. A fullscreen window parked on a
+# hidden workspace (the special:deck dashboard is permanently fullscreen) must not. Visible = each monitor's
+# active workspace plus its open special workspace. Fail closed on malformed state.
+if ! workspaces=$(hyprctl workspaces -j 2>/dev/null) || ! monitors=$(hyprctl monitors -j 2>/dev/null); then
+  exit 0
+fi
+fullscreen_state=$(/usr/bin/python -c \
+  'import json,sys
+rows=json.loads(sys.argv[1]); mons=json.loads(sys.argv[2])
+valid=isinstance(rows,list) and bool(rows) and all(isinstance(w,dict) and type(w.get("id")) is int and type(w.get("hasfullscreen")) is bool for w in rows)
+valid=valid and isinstance(mons,list) and bool(mons) and all(isinstance(m,dict) and isinstance(m.get("activeWorkspace"),dict) and type(m["activeWorkspace"].get("id")) is int for m in mons)
+if not valid:
+    print("unknown"); sys.exit()
+shown={m["activeWorkspace"]["id"] for m in mons}
+shown|={m["specialWorkspace"]["id"] for m in mons if isinstance(m.get("specialWorkspace"),dict) and m["specialWorkspace"].get("id")}
+print("blocked" if any(w["hasfullscreen"] and w["id"] in shown for w in rows) else "clear")' \
+  "$workspaces" "$monitors" 2>/dev/null || true)
+[[ $fullscreen_state == clear ]] || exit 0
+
+if ! power_profile=$(busctl --system get-property \
+  net.hadess.PowerProfiles \
+  /net/hadess/PowerProfiles \
+  net.hadess.PowerProfiles \
+  ActiveProfile 2>/dev/null); then
+  exit 0
+fi
+case "$power_profile" in
+  's "balanced"'|'s "performance"') ;;
+  's "power-saver"') exit 0 ;;
+  *) exit 0 ;;
+esac
+
+if grep -Fq idle <<<"$map_status"; then
+  qs -c "$config_name" ipc call systemMap toggle >/dev/null 2>&1
+else
+  # FEAT-lt28: own transient scope, never the caller's cgroup (see lt-companion-launch).
+  launcher=${LT_COMPANION_LAUNCH:-{{ .chezmoi.homeDir }}/.local/bin/lt-companion-launch}
+  if [[ -x $launcher ]]; then
+    "$launcher" "$config_name"
+  else
+    logger -t hypr-overview-trigger "lt-companion-launch missing; starting $config_name in the caller's cgroup"
+    qs -c "$config_name" -d
+  fi
+fi

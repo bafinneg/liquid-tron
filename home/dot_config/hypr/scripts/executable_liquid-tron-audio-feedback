@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    printf 'usage: %s up|down|mute\n' "${0##*/}" >&2
+    exit 64
+fi
+
+case "$1" in
+    up)
+        wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+
+        ;;
+    down)
+        wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
+        ;;
+    mute)
+        wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+        ;;
+    *)
+        printf 'usage: %s up|down|mute\n' "${0##*/}" >&2
+        exit 64
+        ;;
+esac
+
+# Feedback (FEAT-lt26r-4 OD-A): Noctalia's own volume OSD reacts to the PipeWire sink change above and shows one
+# updating card on the center display. Calling `noctalia msg volume-osd` here as well would double it, and the old
+# MOCR-Q feedback IPC call went nowhere (MOCR-Q is the inactive fallback; LT26-08 OD-3).

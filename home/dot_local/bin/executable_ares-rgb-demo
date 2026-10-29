@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# ares-rgb-demo: a watchable test of the FEAT-lt33 case heartbeat (owner round 4).
+#
+# The centre audio meter first says a case test is coming, then counts down. It then names each state
+# while the case plays it: thinking, working, needs you, done, then the fade home. The real ares-rgb service
+# is paused for the run and restarted afterwards. Base colours are snapshotted before and after; the
+# run fails if they differ.
+#
+#   ares-rgb-demo [lead_seconds] [seconds_per_state]     defaults 20 and 10
+#
+# Meter signals use the id `lt33-case-test` and always carry a ttl, so a killed run clears itself.
+# ares-advisor stays the only standing pusher. This script only sets and clears its own id.
+set -euo pipefail
+
+lead=${1:-20}
+per=${2:-10}
+[[ $lead =~ ^[0-9]+$ && $per =~ ^[0-9]+$ && $per -ge 4 ]] || { echo "usage: ares-rgb-demo [lead_s] [per_state_s>=4]" >&2; exit 2; }
+
+MSG=${ARES_RGB_DEMO_MSG:-$HOME/.local/bin/noctalia-primary-msg}
+BIN=$HOME/.local/bin/ares-rgb
+UVPY=(uv run --quiet --offline --with openrgb-python==0.3.8 python)
+ID=lt33-case-test
+work=$(mktemp -d "${TMPDIR:-/tmp}/ares-rgb-demo.XXXXXX")
+mkdir -p "$work/ares" "$work/state"
+svc_pid=""
+
+meter() {  # meter <severity> <text> <ttl_s>
+  local js
+  js=$(printf '{"id":"%s","priority":1,"severity":"%s","text":"%s","sticky":false,"ttl_ms":%d,"residual":false}' \
+    "$ID" "$1" "$2" "$(( $3 * 1000 ))")
+  "$MSG" visualizer-signal set "$js" >/dev/null 2>&1 || echo "meter: set failed ($2)" >&2
+}
+pres() {
+  printf '{"v":2,"state":"%s","since_ms":%s}' "$1" "$(date +%s%3N)" >"$work/ares/p.tmp"
+  mv "$work/ares/p.tmp" "$work/ares/presence.json"
+}
+snap() { "${UVPY[@]}" "$BIN" --snapshot >"$work/snap-$1.json"; }
+# shellcheck disable=SC2329  # invoked by trap
+finish() {
+  local rc=$?
+  trap - EXIT INT TERM
+  [[ -n $svc_pid ]] && kill -TERM "$svc_pid" 2>/dev/null && wait "$svc_pid" 2>/dev/null
+  systemctl --user start ares-rgb.service || true
+  "$MSG" visualizer-signal clear "$ID" >/dev/null 2>&1 || true
+  exit "$rc"
+}
+trap finish EXIT INT TERM
+
+# 1. Heads-up on the meter, with a countdown.
+for (( s = lead; s > 0; s -= 5 )); do
+  meter advisory "CASE TEST IN ${s} S // WATCH THE CASE" 8
+  sleep $(( s < 5 ? s : 5 ))
+done
+
+# 2. Pause the real service (its stop restores base), take the reference snapshot.
+systemctl --user stop ares-rgb.service
+sleep 1
+snap before
+pres idle
+ARES_RGB_PRESENCE=$work/ares/presence.json ARES_RGB_STATE_DIR=$work/state \
+  "${UVPY[@]}" "$BIN" 2>"$work/svc.log" &
+svc_pid=$!
+sleep 3
+
+# 3. Each state, named on the meter while the case plays it.
+step() {  # step <state> <severity> <label> <seconds>
+  meter "$2" "CASE TEST // $3" $(( $4 + 3 ))
+  pres "$1"
+  sleep "$4"
+}
+step thinking  advisory  "THINKING: BREATH, CYAN CREST"        "$per"
+step working   advisory  "WORKING: COMETS ON THE SIDE FANS"    "$per"
+step needs_you needs_you "NEEDS YOU: ORANGE FLASH, HEARTBEAT"  "$per"
+step "done"    "done"    "DONE: CYAN WAVE"                     4
+step thinking  advisory  "FADE HOME: THINKING, THEN QUIET"     3
+meter advisory "CASE TEST // FADING HOME TO BASE" 5
+pres idle
+sleep 2
+
+# 4. Stop, compare with the reference, report on the meter.
+kill -TERM "$svc_pid"; wait "$svc_pid" || true; svc_pid=""
+sleep 1
+snap after
+if cmp -s "$work/snap-before.json" "$work/snap-after.json"; then
+  meter "done" "CASE TEST COMPLETE // BASE RESTORED" 6
+  echo "PASS: base restored exactly (evidence $work)"
+  rc=0
+else
+  meter critical "CASE TEST // BASE NOT RESTORED" 15
+  echo "FAIL: snapshot differs (evidence $work)" >&2
+  rc=1
+fi
+sleep 6
+exit "$rc"

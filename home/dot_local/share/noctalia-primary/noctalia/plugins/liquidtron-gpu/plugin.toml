@@ -1,0 +1,16 @@
+id          = "liquidtron/gpu"
+name        = "GPU detail"
+version     = "1.0.0"
+plugin_api  = 34
+author      = "liquidtron"
+description = "What is using the GPU: top VRAM holders under the bar's GPU gauge, with End process and Ollama unload."
+
+# Opened by the GPU gauge's left click (`panel-toggle liquidtron/gpu:detail`); outside-click dismissal, attached
+# look and adaptive glass are Noctalia's own. Data comes from ~/.local/bin/gpu-procs.
+[[panel]]
+id              = "detail"
+entry           = "detail.luau"
+placement       = "attached"
+width           = 680
+height          = 680
+open_near_click = true   # opens under the gauge

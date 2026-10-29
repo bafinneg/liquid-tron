@@ -1,0 +1,488 @@
+[include]
+autoload = false
+files = ["20-wallpaper-auto-theme.toml"]
+
+[accessibility]
+ui_scale = 1.0
+high_contrast = false
+
+[shell]
+font_family = "GeistMono Nerd Font"  # 2026-10-23 trial: Geist Mono (was IosevkaTerm Nerd Font; VCR OSD Mono tried and reverted)
+phosphor_labels = true  # FEAT-lt30 (5.3.0-lt6): uppercase interface labels, text identity header in the Control Center; false = stock
+phosphor_header_avatar = true  # FEAT-lt35 (5.3.0-lt8): keep the user photo left of the Control Center text header (needs phosphor_labels)
+show_scrollbars = false  # 5.3.0-lt15 (owner 2026-10-26): Liquid Tron has no scroll bars; scrolling stays, no bar, no gutter
+time_format = "{:%H:%M}"
+date_format = "%A, %x"
+offline_mode = true
+external_ip_enabled = false
+telemetry_enabled = false
+setup_wizard_enabled = false
+polkit_agent = false
+screen_time_enabled = false
+show_location = false
+app_icon_colorize = true  # FEAT-lt26r-3 OD-F: folded from GUI state
+clipboard_enabled = false
+clipboard_keep_from_closed_apps = false
+clipboard_auto_paste = "off"
+shared_gl_context = true
+
+[shell.animation]
+enabled = true
+speed = 1.0
+
+[shell.panel]
+transparency_mode = "glass"
+borders = true
+shadow = false
+list_item_background = false
+adaptive_glass = true  # FEAT-lt27: attached panels frost over busy content (+0.08, cap 0.97); lt3 patch only
+launcher_placement = "attached"
+clipboard_placement = "floating"
+control_center_placement = "attached"
+wallpaper_placement = "attached"
+session_placement = "attached"
+launcher_position = "center"
+clipboard_position = "center"
+open_near_click_control_center = false
+open_near_click_launcher = false
+open_near_click_clipboard = false
+open_near_click_wallpaper = false
+open_near_click_session = false
+
+[shell.launcher]
+layout = "simple"  # LT26R-1: keep beta.8 behaviour
+width = 560  # LT26R-1: keep beta.8 behaviour
+show_app_origin_indicator = false  # LT26R-1: keep beta.8 behaviour
+categories = true
+show_icons = true
+compact = true  # FEAT-lt26r-3 OD-F: folded from GUI state
+app_grid = false
+sort_by_usage = true
+fetch_exchange_rates = false
+provider_prefix = "/"
+auto_paste = "off"
+
+[shell.window_switcher]
+# FEAT-lt26r-5 OD-B: ALT+Tab carousel — depth layout, most recent first, only the windows visible on the three
+# displays right now (the System Map owns the nine slots).
+style = "carousel"
+mru = true
+show_caption = true
+show_count = false  # LT26R-1: keep beta.8 behaviour
+show_app_icon = true
+show_all_outputs = true
+backdrop = false  # lt16: owner 2026-10-27 — carousel overlay fully transparent (no dimmer, glass body or glow)
+current_workspace_only = true
+
+[shell.screen_corners]
+enabled = false
+
+[shell.greeter_sync]
+auto_sync = false
+
+[hot_corners]
+enabled = false
+
+[wallpaper]
+enabled = false
+transition_on_startup = false
+
+[wallpaper.automation]
+enabled = false
+
+[theme]
+sync_color_scheme = false  # LT26R-1: keep beta.8 behaviour
+mode = "dark"
+source = "custom"
+builtin = "Noctalia"
+custom_palette = "Liquid-Tron"
+pure_black_dark = false
+
+[theme.templates]
+enable_builtin_templates = false
+builtin_ids = []
+enable_community_templates = false
+community_ids = []
+
+[backdrop]
+enabled = false
+
+[notification]
+keep_dismissed_in_history = false  # LT26R-1: keep beta.8 behaviour
+enable_daemon = true
+show_app_name = true
+show_actions = true
+layer = "top"
+background_opacity = 0.94  # FEAT-lt26r-3 Regular tuple
+scale = 1.1
+offset_x = 8
+offset_y = 8
+max_visible = 4
+monitors = ["ASUSTek COMPUTER INC PG42UQ {{ .monitors.center.serial }}"]
+# LT26R-4 OD-B alert grammar: wider cards (420 x scale 1.1 = 462 px, +17 %), thin cyan edge. Critical toasts keep
+# the red Error border at the emphasized width regardless of these keys (notification_toast.cpp:127-148).
+width = 420
+border_color = "primary"
+border_width = 1.0
+follow_focused_output = false  # center display only
+
+[osd]
+position = "top_center"
+orientation = "horizontal"
+background_opacity = 0.94  # FEAT-lt26r-3 Regular tuple
+scale = 1.1
+offset_x = 0
+offset_y = 8
+monitors = ["ASUSTek COMPUTER INC PG42UQ {{ .monitors.center.serial }}"]
+# LT26R-4 OD-B: one latest-value card, same cyan edge, hold pinned at 1400 ms.
+border_color = "primary"
+border_width = 1.0
+hide_delay_ms = 1400
+follow_focused_output = false
+
+# Owner 2026-10-25: volume feedback is drawn by the centre audio meter (lt5 level gauge); no popup card.
+[osd.kinds]
+volume = false
+volume_output = false
+volume_input = false
+
+[lockscreen]
+enabled = false
+blurred_desktop = false
+
+[system.monitor]
+enabled = true
+
+[control_center]
+sidebar = "full"
+sidebar_section = "compact"
+width = 920
+show_shortcut_labels = true
+show_session_button = true
+
+
+[control_center.calendar]
+show_week_numbers = true  # LT26R-4 OD-D: folded from GUI state
+
+[[control_center.shortcuts]]
+type = "wifi"
+
+[[control_center.shortcuts]]
+type = "bluetooth"
+
+[[control_center.shortcuts]]
+type = "power_profile"
+
+[[control_center.shortcuts]]
+type = "caffeine"
+
+[[control_center.shortcuts]]
+type = "notification"
+
+[[control_center.shortcuts]]
+type = "nightlight"
+
+[calendar]
+enabled = false
+
+[weather]
+enabled = true   # owner 2026-10-25: weather on the Control Center home tab
+unit = "imperial"
+
+[audio]
+enable_overdrive = false
+enable_sounds = false
+
+[brightness]
+enable_ddcutil = false
+
+[nightlight]
+enabled = false
+force = false
+
+[location]
+auto_locate = false
+# City level only: Noctalia geocodes this via api.noctalia.dev, so the street address is never sent.
+address = "Liberty Hill, TX 78642"
+
+[idle.behavior.lock]
+timeout = 600
+action = "lock"
+enabled = false
+
+[idle.behavior.screen-off]
+timeout = 660
+action = "screen_off"
+enabled = false
+
+# FEAT-lt26r-3 C2 material strengths (OD-B Regular is live). Contrast is the worst case: the bar composited on
+# white over #0a0a14/#0d0d1a (.alfred.locks/eval/FEAT-lt26r-3-material-motion/contrast.md). Essential text never
+# uses fg_dim #707080. Hyprland stays the only blur owner (hyprland.lua layer rules).
+#   Regular                background_opacity 0.84  text 6.87:1  cyan 5.35:1  (this file)
+#   High contrast          background_opacity 0.96  solid panels (shell.panel.transparency_mode = "solid")
+#   Reduced transparency   background_opacity 1.0   notification/osd 1.0
+[bar.main]
+enabled = true
+position = "top"
+thickness = 40
+background_opacity = 0.84
+border = "#0abdc666"
+border_width = 1.0
+color = "on_surface"
+icon_color = "primary"
+hover_highlight = true
+radius = 0
+margin_ends = 10
+margin_edge = 5
+padding = 14
+widget_spacing = 10
+scale = 1.2
+font_weight = 600
+shadow = false
+contact_shadow = false
+reserve_space = true
+capsule = false
+# Lanes and capsule groups folded verbatim from the GUI state Brian uses (FEAT-lt26r-3 OD-F).
+# FEAT-lt32 owner round 6: workspace pills far left, then System Map + Wallpaper, AI BRIEF, the Ares instrument, ASK.
+start = ["workspaces", "group:g2", "repogrid", "brief", "ares", "ask"]
+center = ["audio_visualizer"]
+end = ["media", "group:g3", "network", "bluetooth", "group:g1"]
+
+[[bar.main.capsule_group]]
+id = "g1"
+enabled = true
+members = ["power_profile", "notifications", "volume", "command_clock"]  # Fable S2: power profile joins the g1 capsule
+fill = "surface_variant"
+opacity = 0.0  # HQ-0100 round 3: no pills; the bar shows through under any palette
+padding = 6.0
+accordion = false
+accordion_direction = "end"
+
+# nobara-dotfiles reference (slashedzer0, catppuccin branch): quiet text telemetry beside a fill-bar gauge,
+# grouped in one inset capsule like the reference's battery bar. Liquid-Tron tokens only.
+[[bar.main.capsule_group]]
+id = "g3"
+enabled = true
+members = ["cpu_gauge", "gpu_gauge", "gpu_vram", "gpu_temp"]
+fill = "surface_variant"
+opacity = 0.0  # HQ-0100 round 3: no pills; the bar shows through under any palette
+padding = 6.0
+accordion = false
+accordion_direction = "end"
+
+[[bar.main.capsule_group]]
+id = "g2"
+enabled = true
+members = ["system_map", "wallpaper"]  # Obsidian status widget removed from the bar (2026-10-23)
+fill = "surface_variant"
+opacity = 0.0  # HQ-0100 round 3: no pills; the bar shows through under any palette
+padding = 6.0
+accordion = false
+accordion_direction = "end"
+
+[widget.system_map]
+type = "custom_button"
+glyph = "layout-grid"
+label = "MAP"
+tooltip = "Liquid Tron System Map"
+
+[widget.system_map.actions]
+left = "exec {{ .chezmoi.homeDir }}/.local/bin/hypr-overview-trigger"
+
+[widget.command_clock]
+type = "clock"
+format = "7800X // {:%H:%M}"
+tooltip_format = "{:%A, %B %d · %H:%M:%S}"
+
+[widget.audio_visualizer]
+width = 320
+bands = 48
+mirrored = true
+centered = true
+show_when_idle = true
+color_1 = "primary"
+color_2 = "secondary"
+signal_max_width = 520
+# FEAT-ares-signal-meter: actions used only while a signal (or its residual marker) shows; {id} = signal id
+signal_left = "exec {{ .chezmoi.homeDir }}/.local/bin/ares-signal-act {id} open"
+signal_right = "panel-toggle liquidtron/advisor:panel"
+
+[widget.audio_visualizer.actions]
+left = "panel-toggle control-center audio"
+right = "panel-toggle launcher"
+
+[widget.media]
+hide_album_art = false
+hide_artist = false
+artist_first = false
+min_length = 160
+max_length = 280
+art_size = 24
+title_scroll = "on_hover"
+hide_when_no_media = true
+# nobara reference: media sits in its own inset pill; the pill fills left to right with track progress.
+show_progress = true
+capsule = true
+capsule_fill = "surface_variant"
+
+# Left: MPD library picker (clear / shuffle / playlist / artist / album / open rmpc). Middle: stop and clear the
+# queue so the widget hides. Right (play/pause), thumb buttons and scroll (next/previous) keep Noctalia defaults.
+[widget.media.actions]
+left = "exec {{ .chezmoi.homeDir }}/.local/bin/music-pick"
+middle = "exec {{ .chezmoi.homeDir }}/.local/bin/music-pick clear"
+
+[widget.cpu_gauge]
+type = "sysmon"
+stat = "cpu_usage"
+visualization = "gauge"
+show_value = true
+show_glyph = true
+glyph_position = "before"
+highlight_color = "error"
+
+# Click: CPU detail panel (top processes, leading cause, End process). Native plugin panel liquidtron/cpu:detail,
+# so outside-click dismissal and the attached look are Noctalia's own (replaced the quickshell-cpu-detail companion).
+[widget.cpu_gauge.actions]
+left = "panel-toggle liquidtron/cpu:detail"
+right = "panel-toggle control-center system"  # the former left-click target
+
+# GPU usage gauge and VRAM share, from Noctalia's own NVML reader. Click: GPU detail panel (top VRAM holders, End
+# process, Ollama unload; native plugin liquidtron/gpu:detail fed by ~/.local/bin/gpu-procs). VRAM is shown because
+# running it out corrupts every window (nvidia-drm cannot allocate buffers).
+[widget.gpu_gauge]
+type = "sysmon"
+stat = "gpu_usage"
+visualization = "gauge"
+show_value = true
+show_glyph = true
+glyph_position = "before"
+highlight_color = "error"
+
+[widget.gpu_gauge.actions]
+left = "panel-toggle liquidtron/gpu:detail"
+right = "panel-toggle control-center system"
+
+[widget.gpu_vram]
+type = "sysmon"
+stat = "gpu_vram"
+visualization = "none"
+show_value = true
+show_glyph = false
+custom_label = "VRAM"
+highlight_color = "error"
+
+[widget.gpu_vram.actions]
+left = "panel-toggle liquidtron/gpu:detail"
+
+[widget.gpu_temp]
+type = "sysmon"
+stat = "gpu_temp"
+visualization = "none"
+show_value = true
+show_glyph = false
+highlight_color = "error"
+
+[widget.network]
+show_label = false  # icon only; no "eno1" interface text
+vpn_status = "both"
+show_vpn_label = false
+
+[widget.bluetooth]
+show_label = false
+hide_when_no_connected_device = true  # Fable S2: hidden until a device connects
+
+# FEAT-lt29: Ares presence instrument (Hermes activity), right of the centre-bar workspace pills.
+[widget.ares]
+type = "liquidtron/ares:instrument"
+
+# FEAT-lt32 C1: ASK button (fill only: no capsule group, no capsule_border/border keys) right of the instrument.
+[widget.ask]
+type = "liquidtron/ares:askbutton"
+
+# FEAT-lt32 owner round 6: AI BRIEF glyph button (fill only, like ASK); click toggles the Return Brief card.
+[widget.brief]
+type = "liquidtron/ares:briefbutton"
+
+# FEAT-lt36 owner round 1: REPO GRID glyph button (fill only, like ASK / AI BRIEF) right of the Map / Wallpaper
+# capsule. A click or SUPER+C toggles the Repo Grid dropdown attached under the centre bar.
+[widget.repogrid]
+type = "liquidtron/repogrid:button"
+
+[widget.workspaces]
+# nobara reference: dots for other workspaces, one wider pill (with the focused app icon) for the current one.
+style = "focus_hint"
+show_icons = true
+focused_output_only = true  # FEAT-lt26r-5 OD-G: amber only on the display that has focus
+focused_color = "#ff8c00"
+occupied_color = "primary"
+empty_color = "on_surface_variant"
+urgent_color = "error"
+change_color_on_hover = false
+
+[bar.main.monitor.center]
+match = "ASUSTek COMPUTER INC PG42UQ {{ .monitors.center.serial }}"
+enabled = true
+# FEAT-lt26r-3 OD-C/OD-F: folded from GUI state; the live centre bar is rounded (screenshot 2026-10-21 22:36).
+radius = 10
+
+[bar.main.monitor.left]
+match = "Dell Inc. AW2725Q {{ .monitors.left.serial }}"
+enabled = true
+# FEAT-lt27 owner ask: small workspace island, shown only when this monitor's workspace changes (lt3 keys).
+auto_hide = true
+reveal_on_edge = false
+show_on_workspace_switch = true
+workspace_switch_hold_ms = 1200
+reserve_space = false
+fit_content = true  # lt3: island as wide as its pills, anchored top-left
+margin_ends = 20
+# 27" 4K side panels are ~163 PPI vs ~105 PPI on the 42" centre; scale 1.85 / thickness 62 matches the centre bar's
+# physical size (1.2 x 163/105). Owner 2026-10-23: "too small, can't read them".
+scale = 1.85
+thickness = 62
+radius = 15
+start = ["workspaces"]
+center = []
+end = []
+
+[bar.main.monitor.right]
+match = "Dell Inc. AW2725Q {{ .monitors.right.serial }}"
+enabled = true
+# FEAT-lt27 owner ask: small workspace island, shown only when this monitor's workspace changes (lt3 keys).
+auto_hide = true
+reveal_on_edge = false
+show_on_workspace_switch = true
+workspace_switch_hold_ms = 1200
+reserve_space = false
+fit_content = true  # lt3: island as wide as its pills, anchored top-left
+margin_ends = 20
+# 27" 4K side panels are ~163 PPI vs ~105 PPI on the 42" centre; scale 1.85 / thickness 62 matches the centre bar's
+# physical size (1.2 x 163/105). Owner 2026-10-23: "too small, can't read them".
+scale = 1.85
+thickness = 62
+radius = 15
+start = ["workspaces"]
+center = []
+end = []
+
+[dock]
+enabled = false
+
+[desktop_widgets]
+enabled = false
+
+[plugins]
+enabled = ["liquidtron/ares", "liquidtron/cpu", "liquidtron/gpu", "liquidtron/wallpaper", "liquidtron/advisor", "liquidtron/repogrid"]   # local plugins (noctalia-plugins stow package): FEAT-lt29 Ares; CPU detail panel; GPU detail panel; wallpaper picker panel; ARES signals panel; Repo Grid dropdown (FEAT-lt36)
+auto_update = "none"  # LT26R-1: 5.3 migration 13 form of false
+
+[[plugins.source]]
+name = "official"
+kind = "git"
+location = "https://github.com/noctalia-dev/official-plugins"
+enabled = false
+
+[[plugins.source]]
+name = "community"
+kind = "git"
+location = "https://github.com/noctalia-dev/community-plugins"
+enabled = false

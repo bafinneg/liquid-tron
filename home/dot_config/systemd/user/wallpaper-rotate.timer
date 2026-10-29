@@ -1,0 +1,10 @@
+[Unit]
+Description=Manual fallback: rotate OLED-safe wallpaper every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+# Deliberately no [Install] target. mpvpaper/mainframe is the automatic
+# wallpaper owner; start this timer manually only after stopping that owner.

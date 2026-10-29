@@ -1,0 +1,694 @@
+#!/usr/bin/env python3
+"""ares-rgb: the case lighting shows what Ares is doing (FEAT-lt33-case-heartbeat; owner round 3, D3: louder and fluid).
+
+Reads $XDG_RUNTIME_DIR/ares/presence.json (written by ares-presence-hub) and animates the case from its base colours
+(hardware blue 0,0,255 and calibrated orange 255,25,0). Owner round 3 relaxed D2 (brightness only): blue zones bloom
+toward Liquid Tron cyan #0abdc6 at the crest of a motion, the side fans turn orange while a request waits, and the floor
+is 6 % instead of 35 %. Nothing ever passes through magenta: a blue<->orange change goes through dark.
+Talks to the running OpenRGB SDK server (127.0.0.1:6742) with openrgb-python, Direct mode only, colour writes only:
+no profile save, no mode change, no fan call. Run with `uv run --with openrgb-python==0.3.8 python ares-rgb`.
+
+  ares-rgb              follow presence (the user service)
+  ares-rgb --restore    write the saved base back (ExecStopPost; no-op when nothing is saved)
+  ares-rgb --snapshot   print every zone's colours as JSON (read-only)
+
+  thinking   the case breathes: side fans, then the radiator; each breath flows along the chain, cyan at the crest
+  working    two cyan-headed comets race round the side-fan chain; the three radiator fans pump in turn
+  needs_you  three hard orange flashes, then a lub-dub heartbeat until answered; side fans turn orange, blue goes dark
+  done       a cyan wave rolls across the blue zones and settles back to base
+  Every change cross-fades (0.45 s in, 0.7 s back to base when presence goes quiet). Orange dims while blue is busy.
+
+Idle = blocked in select() on an inotify fd: no timers, no polling. Active = frames at 15 Hz (hard ceiling 20 Hz) plus a
+1 s gate check. GPU zones never animate continuously. SIGTERM/SIGINT/ExecStop and every gate restore base at once:
+system mode gaming, the lock is up (hyprlock / ares-lock / red alert saved state), or a window is fullscreen on a
+shown workspace.
+"""
+import ctypes
+import json
+import math
+import os
+import select
+import signal
+import socket
+import struct
+import sys
+import time
+
+FLOOR = 0.06               # darkest any animated LED goes (0.35 before owner round 3)
+STEP = 1 / 15              # frame period, 15 Hz
+MIN_WRITE_GAP = 0.05       # 20 Hz ceiling
+GATE_PERIOD = 1.0
+FADE_IN = 0.45             # cross-fade into a new state
+RELEASE = 0.7              # fade back to base when presence goes quiet (gates and stop are instant)
+
+THINK_PERIOD = 2.6         # one breath
+THINK_LAG = 0.45           # the radiator breathes this long after the side fans
+THINK_RIPPLE = 0.7         # a breath takes this long to flow along one chain
+THINK_FLOOR = 0.08
+THINK_BLOOM = 0.6          # cyan mix at the crest of a breath
+
+LAP = 1.8                  # working: one comet lap of the side-fan chain
+COMETS = 2
+TAIL = 5.0                 # LEDs, e-folding length of a comet tail
+WORK_FLOOR = 0.10
+PUMP = 1.5                 # working: the three radiator fans light in turn, one round per PUMP seconds
+PUMP_FLOOR = 0.12
+
+FLASH = 0.5                # needs_you: three hard flashes ...
+FLASHES = 3
+BEAT = 1.3                 # ... then a lub-dub heartbeat
+DUB = 0.28                 # second beat this long after the first
+WAIT_FLOOR = 0.10
+DARK_BLUE = 0.08           # blue zones while a request waits
+
+DONE_LEN = 1.6
+DONE_SWEEP = 0.3           # the cyan wave crosses the case in this long
+DONE_DECAY = 0.45
+
+DIM_ORANGE = 0.4           # orange zones while blue is busy
+BLUE, ORANGE = (0, 0, 255), (255, 25, 0)
+CYAN = (10, 189, 198)      # Liquid Tron primary accent #0abdc6
+PALETTE = {BLUE, ORANGE, (0, 0, 0)}
+ACTIVE = ("thinking", "working", "needs_you", "done")
+TIMED = {"done": DONE_LEN, "release": RELEASE}
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+PRESENCE = os.environ.get("ARES_RGB_PRESENCE") or os.path.join(RUNTIME, "ares", "presence.json")
+MODE_FILE = os.environ.get("ARES_RGB_MODE_FILE") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "system-mode")
+SAVE_DIR = os.environ.get("ARES_RGB_STATE_DIR") or os.path.join(RUNTIME, "ares-rgb")
+BASE_FILE = os.path.join(SAVE_DIR, "base.json")
+LOCK_SAVED = os.path.join(RUNTIME, "ares-lock", "rgb-saved.json")
+HOST, PORT = "127.0.0.1", 6742
+
+BLUE_ZONES = ("Addressable RGB Header 1", "Addressable RGB Header 3")
+ORANGE_ZONES = ("Addressable RGB Header 2", "Aura Mainboard", "DRAM")
+RADIATOR = "Addressable RGB Header 3"
+SIDE_FANS = "Addressable RGB Header 1"
+RAD_FANS = 3
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- pure core
+def zname(key):
+    """Zone keys are 'device#index:Zone name'."""
+    return key.split(":", 1)[1]
+
+
+def is_blue(key):
+    n = zname(key)
+    return n in BLUE_ZONES or n.startswith("GPU zone")
+
+
+def is_gpu(key):
+    return zname(key).startswith("GPU zone")
+
+
+def is_orange(key):
+    return zname(key) in ORANGE_ZONES
+
+
+def _clamp(v, lo=0.0, hi=1.0):
+    return lo if v < lo else hi if v > hi else v
+
+
+def px(color, k, m=0.0):
+    """color scaled by k (floored at FLOOR); a blue colour blooms toward cyan by m. Orange never takes the accent."""
+    k = _clamp(k, FLOOR, 1.0)
+    m = _clamp(m)
+    if m and color[2] > color[0]:
+        color = tuple(a + (b - a) * m for a, b in zip(color, CYAN))
+    return tuple(int(round(c * k)) for c in color)
+
+
+def scale(color, k):
+    return px(color, k)
+
+
+def scaled(colors, k):
+    return [px(c, k) for c in colors]
+
+
+def breath(phase):
+    """Organic breathing curve in [0, 1] (lingers low, swells, peaks at phase 0.5): (e^sin - 1/e) / (e - 1/e)."""
+    return (math.exp(math.sin(2 * math.pi * phase - math.pi / 2)) - 1 / math.e) / (math.e - 1 / math.e)
+
+
+def ease(x):
+    x = _clamp(x)
+    return x * x * (3 - 2 * x)
+
+
+def _family(c):
+    return "orange" if c[0] > c[2] else "blue" if c[2] > c[0] else "dark"
+
+
+def blend(a, b, e):
+    """a -> b at e in [0, 1]. Across hue families (blue <-> orange) go through dark, so nothing reads magenta."""
+    a, b = tuple(a), tuple(b)
+    if _family(a) != _family(b) and "dark" not in (_family(a), _family(b)):
+        if e < 0.5:
+            return tuple(int(round(c * (1 - 2 * e))) for c in a)
+        return tuple(int(round(c * (2 * e - 1))) for c in b)
+    return tuple(int(round(x + (y - x) * e)) for x, y in zip(a, b))
+
+
+def effective_state(state, blocked):
+    if blocked or state not in ACTIVE:
+        return "idle"
+    return state
+
+
+def segment_end(state):
+    """Seconds after which the animation is over (None = runs until the state changes)."""
+    return TIMED.get(state)
+
+
+def wait_level(t):
+    """needs_you orange level in [0, 1]: three hard flashes, then lub-dub every BEAT seconds."""
+    if t < FLASHES * FLASH:
+        ph = (t % FLASH) / FLASH
+        return ph / 0.06 if ph < 0.06 else (1 - (ph - 0.06) / 0.94) ** 2     # 30 ms strike, quadratic decay
+    s = (t - FLASHES * FLASH) % BEAT
+
+    def beat(c, w):
+        if s < c - 0.05:
+            return 0.0
+        if s < c:
+            return (s - (c - 0.05)) / 0.05
+        return math.exp(-(s - c) / w)
+    return max(beat(0.05, 0.16), 0.7 * beat(0.05 + DUB, 0.2))
+
+
+def frame(state, t, base):
+    """Colours to show at t seconds into `state`. Returns {key: [(r,g,b)...]} for the zones that differ from base."""
+    out = {}
+    if state == "thinking":
+        for key, cols in base.items():
+            n = zname(key)
+            if n in (SIDE_FANS, RADIATOR):
+                lag = THINK_LAG if n == RADIATOR else 0.0
+                L = max(1, len(cols))
+                row = []
+                for i, c in enumerate(cols):
+                    b = breath((t - lag - THINK_RIPPLE * i / L) / THINK_PERIOD)
+                    row.append(px(c, THINK_FLOOR + (1 - THINK_FLOOR) * b, THINK_BLOOM * b * b))
+                out[key] = row
+            elif is_orange(key):
+                out[key] = scaled(cols, DIM_ORANGE)
+    elif state == "working":
+        for key, cols in base.items():
+            n = zname(key)
+            L = len(cols)
+            if n == SIDE_FANS and L:
+                heads = [((t / LAP + j / COMETS) % 1.0) * L for j in range(COMETS)]
+                row = []
+                for i, c in enumerate(cols):
+                    v = 0.0
+                    for h in heads:
+                        d = (h - i) % L                     # LEDs behind the head
+                        fwd = L - d                         # LEDs ahead of it (anti-aliased leading edge)
+                        v = max(v, math.exp(-d / TAIL), math.exp(-(fwd * fwd) / 0.6))
+                    row.append(px(c, WORK_FLOOR + (1 - WORK_FLOOR) * v, 0.85 * v * v))
+                out[key] = row
+            elif n == RADIATOR and L:
+                per = max(1, L // RAD_FANS)
+                row = []
+                for i, c in enumerate(cols):
+                    f = min(RAD_FANS - 1, i // per)
+                    b = breath(t / PUMP - f / RAD_FANS)
+                    row.append(px(c, PUMP_FLOOR + (1 - PUMP_FLOOR) * b, 0.5 * b * b))
+                out[key] = row
+            elif is_orange(key):
+                out[key] = scaled(cols, DIM_ORANGE)
+    elif state == "needs_you":
+        k = WAIT_FLOOR + (1 - WAIT_FLOOR) * wait_level(t)
+        for key, cols in base.items():
+            if is_orange(key):
+                out[key] = scaled(cols, k)
+            elif zname(key) == SIDE_FANS:
+                out[key] = [px(ORANGE, k)] * len(cols)     # owner round 3: the side panel carries the request
+            elif is_blue(key):
+                out[key] = scaled(cols, DARK_BLUE)
+    elif state == "done":
+        for key, cols in base.items():
+            if not is_blue(key):
+                continue
+            n = zname(key)
+            L = max(1, len(cols))
+            x0 = 0.0 if n == SIDE_FANS else 0.5 if n == RADIATOR else 1.0
+            row = []
+            for i, c in enumerate(cols):
+                x = x0 + (0.0 if is_gpu(key) else 0.5 * i / L)
+                tc = DONE_SWEEP * x / 1.5
+                m = 0.0 if t < tc else 0.9 * math.exp(-(t - tc) / DONE_DECAY)
+                if is_gpu(key):
+                    m = round(m * 4) / 4                    # SMBus GPU: a few coarse steps, not a write per frame
+                row.append(px(c, 1.0, m))
+            out[key] = row
+    return out
+
+
+def palette_ok(base):
+    return all(tuple(c) in PALETTE for cols in base.values() for c in cols)
+
+
+def hyprland_fullscreen(workspaces, monitors):
+    """True when a fullscreen workspace is shown on some monitor (a parked special workspace does not count)."""
+    shown = {m["activeWorkspace"]["id"] for m in monitors if isinstance(m.get("activeWorkspace"), dict)}
+    return any(w.get("hasfullscreen") is True and w.get("id") in shown for w in workspaces)
+
+
+def parse_presence(text):
+    try:
+        d = json.loads(text)
+    except (TypeError, ValueError):
+        return "idle", None
+    if not isinstance(d, dict) or d.get("v") != 2 or not isinstance(d.get("state"), str):
+        return "idle", None
+    return d["state"], d.get("since_ms")
+
+
+class Heartbeat:
+    """State machine. `rig` has read()/write(key, colours)/load_profile(); clock is injected by the caller via `now`."""
+
+    def __init__(self, rig, save_dir=None):
+        self.rig = rig
+        self.save_dir = save_dir
+        self.base = None
+        self.applied = {}
+        self.from_cols = {}
+        self.fade = FADE_IN
+        self.eff = "idle"
+        self.since = None
+        self.done_since = None
+        self.t0 = 0.0
+        self.last_write = -1e9
+        self.writes = 0
+
+    # -- base capture / persistence
+    def _save_base(self):
+        if not self.save_dir:
+            return
+        os.makedirs(self.save_dir, exist_ok=True)
+        tmp = os.path.join(self.save_dir, "base.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(self.base, f)
+        os.replace(tmp, os.path.join(self.save_dir, "base.json"))
+
+    def _drop_base(self):
+        if self.save_dir:
+            try:
+                os.unlink(os.path.join(self.save_dir, "base.json"))
+            except FileNotFoundError:
+                pass
+
+    def capture(self):
+        base = self.rig.read()
+        if not palette_ok(base):
+            log("ares-rgb: live colours are not the palette (leftover dim?); loading profile tron-compute")
+            self.rig.load_profile("tron-compute")
+            base = self.rig.read()
+        self.base = {k: [tuple(c) for c in v] for k, v in base.items()}
+        self.applied = {k: list(v) for k, v in self.base.items()}
+        self._save_base()
+
+    # -- writes
+    def _write_targets(self, targets, now):
+        wrote = False
+        for key, cols in targets.items():
+            if self.applied.get(key) != cols:
+                self.rig.write(key, cols)
+                self.applied[key] = list(cols)
+                wrote = True
+        if wrote:
+            self.last_write = now
+            self.writes += 1
+
+    def restore(self, now=0.0):
+        if self.base is not None:
+            self._write_targets({k: list(v) for k, v in self.base.items()}, now)
+        self.base = None
+        self.applied = {}
+        self._drop_base()
+
+    def stand_down(self, now=0.0):
+        """Gates and stop signals: base at once, no fade."""
+        self.eff = "idle"
+        self.restore(now)
+
+    def resync(self):
+        """After an SDK reconnect: assume nothing is applied."""
+        self.applied = {}
+
+    def _begin(self, eff, now, fade):
+        self.from_cols = {k: list(v) for k, v in self.applied.items()}
+        self.eff, self.t0, self.fade = eff, now, fade
+
+    # -- inputs
+    def on_input(self, state, since_ms, blocked, now):
+        eff = effective_state(state, blocked)
+        if eff == "idle":
+            self.since = since_ms
+            if blocked or self.base is None or self.eff == "idle":
+                if self.eff != "idle" or self.base is not None:
+                    self.stand_down(now)
+                return
+            if self.eff != "release":
+                self._begin("release", now, RELEASE)       # presence went quiet: fade home
+            return
+        if eff == "done" and since_ms == self.done_since:
+            self.since = since_ms            # this DONE already played
+            return
+        new_ep = eff != self.eff or (eff == "done" and since_ms != self.since)
+        self.since = since_ms
+        if new_ep and eff == "done":
+            self.done_since = since_ms
+        if new_ep:
+            if self.base is None:
+                self.capture()
+            self._begin(eff, now, FADE_IN)
+
+    def targets(self, t):
+        out = {k: list(v) for k, v in self.base.items()}
+        out.update(frame(self.eff, t, self.base))
+        if t < self.fade and self.from_cols:
+            e = ease(t / self.fade)
+            faded = {}
+            for k, v in out.items():
+                ek = round(e * 2) / 2 if is_gpu(k) else e      # SMBus GPU: two steps, not one write per frame
+                faded[k] = [blend(a, b, ek) for a, b in zip(self.from_cols.get(k, v), v)]
+            out = faded
+        return out
+
+    def step(self, now):
+        """Write the current frame. Returns the monotonic time of the next frame, or None when nothing more will change."""
+        if self.eff == "idle" or self.base is None:
+            return None
+        if now - self.last_write < MIN_WRITE_GAP - 1e-6:    # tolerance: last_write + GAP - last_write < GAP in floats
+            return self.last_write + MIN_WRITE_GAP
+        t = now - self.t0
+        end = segment_end(self.eff)
+        if end is not None and t >= end - 1e-6:         # one-shot over: exact base, drop it, stop ticking
+            self.stand_down(now)                        # (tolerance: t0 + end - t0 can land a hair below end)
+            return None
+        self._write_targets(self.targets(t), now)
+        nxt = now + STEP
+        return nxt if end is None else max(now + 1e-3, min(nxt, self.t0 + end))
+
+
+# ---------------------------------------------------------------- real OpenRGB rig
+class Rig:
+    def __init__(self):
+        from openrgb import OpenRGBClient
+        from openrgb.utils import RGBColor
+        self._rgb = RGBColor
+        self.client = OpenRGBClient(HOST, PORT, "ares-rgb")
+        self.zones = {}
+        for di, dev in enumerate(self.client.devices):
+            for zone in dev.zones:
+                self.zones[f"{dev.name}#{di}:{zone.name}"] = (dev, zone)
+
+    def read(self):
+        for dev in self.client.devices:
+            dev.update()
+        return {k: [(c.red, c.green, c.blue) for c in z.colors] for k, (_, z) in self.zones.items()}
+
+    def write(self, key, cols):
+        self.zones[key][1].set_colors([self._rgb(*c) for c in cols], fast=True)
+
+    def load_profile(self, name):
+        self.client.load_profile(name)
+
+    def modes(self):
+        return {d.name: d.modes[d.active_mode].name for d in self.client.devices}
+
+    def close(self):
+        try:
+            self.client.disconnect()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- gates and inputs
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def lock_up():
+    return os.path.exists(LOCK_SAVED) or ares_lock_client() or _hyprlock()
+
+
+def ares_lock_client():
+    try:
+        for p in os.listdir("/proc"):
+            if p.isdigit():
+                try:
+                    with open(f"/proc/{p}/cmdline", "rb") as f:
+                        a = f.read().split(b"\0")
+                except OSError:
+                    continue
+                if a and os.path.basename(a[0].decode(errors="ignore")) == "qs" and b"ares-lock" in a:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def hypr_query(sock_path, cmd):
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(0.5)
+    try:
+        s.connect(sock_path)
+        s.sendall(cmd.encode())
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf)
+    finally:
+        s.close()
+
+
+def hypr_sock():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    base = os.path.join(RUNTIME, "hypr")
+    if sig and os.path.exists(os.path.join(base, sig, ".socket.sock")):
+        return os.path.join(base, sig, ".socket.sock")
+    try:
+        cands = [os.path.join(base, d, ".socket.sock") for d in os.listdir(base)]
+        cands = [c for c in cands if os.path.exists(c)]
+        return max(cands, key=os.path.getmtime) if cands else None
+    except OSError:
+        return None
+
+
+def blocked_reason(cheap_only=False):
+    """Why the case must stay at base, or None."""
+    if (read_text(MODE_FILE) or "").strip() == "gaming":
+        return "gaming"
+    if cheap_only:
+        return None
+    if os.path.exists(LOCK_SAVED) or ares_lock_client() or _hyprlock():
+        return "lock"
+    sock = hypr_sock()
+    if sock:
+        try:
+            if hyprland_fullscreen(hypr_query(sock, "j/workspaces"), hypr_query(sock, "j/monitors")):
+                return "fullscreen"
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return None
+
+
+def _hyprlock():
+    try:
+        for p in os.listdir("/proc"):
+            if p.isdigit():
+                try:
+                    with open(f"/proc/{p}/comm") as f:
+                        if f.read().strip() == "hyprlock":
+                            return True
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return False
+
+
+class Inotify:
+    IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE = 0x8, 0x80, 0x100
+
+    def __init__(self, paths):
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        self.fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        self.names = set()
+        for p in paths:
+            d = os.path.dirname(p)
+            os.makedirs(d, exist_ok=True)
+            if libc.inotify_add_watch(self.fd, d.encode(), self.IN_CLOSE_WRITE | self.IN_MOVED_TO | self.IN_CREATE) < 0:
+                raise OSError(ctypes.get_errno(), f"inotify_add_watch {d}")
+            self.names.add(os.path.basename(p))
+
+    def drain(self):
+        hit = False
+        while True:
+            try:
+                buf = os.read(self.fd, 4096)
+            except BlockingIOError:
+                return hit
+            off = 0
+            while off + 16 <= len(buf):
+                _, _, _, ln = struct.unpack_from("iIII", buf, off)
+                name = buf[off + 16: off + 16 + ln].split(b"\0", 1)[0].decode(errors="ignore")
+                off += 16 + ln
+                if name in self.names:
+                    hit = True
+
+
+# ---------------------------------------------------------------- service
+def snapshot():
+    rig = Rig()
+    try:
+        print(json.dumps({"modes": rig.modes(), "zones": rig.read()}, sort_keys=True))
+    finally:
+        rig.close()
+
+
+def restore_cli():
+    try:
+        with open(BASE_FILE) as f:
+            base = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    if lock_up():
+        return 0
+    try:
+        rig = Rig()
+        for key, cols in base.items():
+            if key in rig.zones:
+                rig.write(key, [tuple(c) for c in cols])
+        rig.close()
+        os.unlink(BASE_FILE)
+    except Exception as e:
+        log(f"ares-rgb --restore: {e}")
+        return 1
+    return 0
+
+
+def connect(hb):
+    """Open the SDK connection and undo any dim left by a crashed predecessor or a dropped connection."""
+    hb.rig = Rig()
+    hb.resync()
+    log("ares-rgb: connected")
+    if not lock_up():
+        try:
+            with open(BASE_FILE) as f:
+                for key, cols in json.load(f).items():
+                    if key in hb.rig.zones:
+                        hb.rig.write(key, [tuple(c) for c in cols])
+            os.unlink(BASE_FILE)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            log(f"ares-rgb: crash restore failed: {e}")
+
+
+def run():
+    wake_r, wake_w = socket.socketpair()
+    wake_r.setblocking(False)
+    wake_w.setblocking(False)
+    signal.set_wakeup_fd(wake_w.fileno())
+    for s in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(s, lambda *_: None)
+    try:
+        ino = Inotify([PRESENCE, MODE_FILE])
+    except OSError as e:
+        log(f"ares-rgb: inotify unavailable ({e}); polling at 2 Hz while active")
+        ino = None
+
+    hb = Heartbeat(None, SAVE_DIR)
+    backoff, retry_at = 2.0, 0.0
+    while True:
+        # 1. (re)connect
+        if hb.rig is None and time.monotonic() >= retry_at:
+            try:
+                connect(hb)
+                backoff = 2.0
+            except Exception as e:
+                hb.rig = None
+                retry_at = time.monotonic() + backoff
+                log(f"ares-rgb: SDK unavailable ({e}); retry in {backoff:.0f}s")
+                backoff = min(30.0, backoff * 2)
+        # 2. read inputs and apply
+        state, since = parse_presence(read_text(PRESENCE))
+        blocked = blocked_reason(cheap_only=(state not in ACTIVE and hb.eff == "idle")) is not None
+        next_frame = None
+        if hb.rig is not None:
+            try:
+                hb.on_input(state, since, blocked, time.monotonic())
+                next_frame = hb.step(time.monotonic())
+            except Exception as e:
+                log(f"ares-rgb: SDK error ({e}); will reconnect")
+                try:
+                    hb.rig.close()
+                except Exception:
+                    pass
+                hb.rig, hb.eff, hb.base = None, "idle", None
+                retry_at = time.monotonic() + backoff
+                backoff = min(30.0, backoff * 2)
+        active = hb.eff != "idle" or state in ACTIVE
+        gate_at = time.monotonic() + (GATE_PERIOD if active else 1e9)
+        poll = ino is None and active
+        # 3. wait: frames are served here; anything else goes back to step 2
+        while True:
+            now = time.monotonic()
+            dl = [d for d in (next_frame, gate_at if active else None, retry_at if hb.rig is None else None,
+                              now + 0.5 if poll else None) if d is not None]
+            timeout = max(0.0, min(dl) - now) if dl else None      # None = block forever (idle)
+            r, _, _ = select.select([wake_r] + ([ino.fd] if ino else []), [], [], timeout)
+            if wake_r in r:
+                log("ares-rgb: signal; restoring base")
+                try:
+                    hb.stand_down(time.monotonic())
+                except Exception as e:
+                    log(f"ares-rgb: restore failed: {e}")
+                return 0
+            if ino and ino.fd in r and ino.drain():
+                break
+            now = time.monotonic()
+            if hb.rig is not None and next_frame is not None and now >= next_frame and now < gate_at:
+                try:
+                    next_frame = hb.step(now)
+                except Exception:
+                    break
+                continue
+            if now >= gate_at or poll or (hb.rig is None and now >= retry_at):
+                break
+
+
+def main(argv):
+    if len(argv) > 1 and argv[1] == "--snapshot":
+        snapshot()
+        return 0
+    if len(argv) > 1 and argv[1] == "--restore":
+        return restore_cli()
+    if len(argv) > 1:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return run()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

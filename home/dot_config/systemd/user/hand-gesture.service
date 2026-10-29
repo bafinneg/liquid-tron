@@ -1,0 +1,12 @@
+[Unit]
+Description=Hand gestures from the webcam drive Hyprland workspaces (HANDGESTURE, off by default)
+Wants=hand-gesture-hud.service
+Before=hand-gesture-hud.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hand-gesture run
+Restart=on-failure
+RestartSec=3
+Nice=10
+TimeoutStopSec=5

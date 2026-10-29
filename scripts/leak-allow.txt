@@ -1,0 +1,2 @@
+scripts/verify-generic.sh:
+/home/user/

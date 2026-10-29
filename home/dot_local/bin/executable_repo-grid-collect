@@ -1,0 +1,1362 @@
+#!/usr/bin/env -S python3 -I
+"""repo-grid-collect: snapshot repos, worktrees, specs, tasks and agent graph for the Repo Grid sheet.
+
+Read-only everywhere (never fetches, never writes except --out, which is replaced atomically).
+Writes schema 1 JSON to --out and prints the path. Exit 0 even with per-repo errors; exit 2 on
+unusable arguments or an unreadable registry.
+
+`--detail KEY` prints one JSON object for the grid's STATE pane and writes nothing. KEY is the grid node key:
+r:<repo>, c:<Hermes session id>, j:<Claude job id>, x:<Codex session id>. Message text (including any JSON in
+it) goes through plain() so the pane reads as plain English.
+
+Every detail answer carries `brief` (executive summary built from records, source "rules") and `chips`. `--brief KEY`
+asks zgx-02 (vLLM, OpenAI API) to write the same brief from a redacted context bundle; any failure prints the rules
+brief. Briefs are cached under $XDG_RUNTIME_DIR/repo-grid/briefs keyed by KEY plus last-activity stamp.
+Env: REPO_GRID_BRIEF_URL, REPO_GRID_BRIEF_MODEL, REPO_GRID_BRIEF=off.
+"""
+import argparse
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+UNSCOPED = "~unscoped"
+LIVE_SECS = 120
+GIT_TIMEOUT = 3
+
+
+def git(path, *args):
+    """Run `git -C path ...`; return stdout or raise."""
+    r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=GIT_TIMEOUT,
+                       env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr.strip() or f"git {args[0]} failed")[:200])
+    return r.stdout
+
+
+def dirty_count(path):
+    return len([ln for ln in git(path, "status", "--porcelain").splitlines() if ln.strip()])
+
+
+def default_branch_ref(path):
+    try:
+        return git(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").strip()
+    except Exception:
+        for cand in ("origin/main", "origin/master"):
+            try:
+                git(path, "rev-parse", "--verify", "-q", cand)
+                return cand
+            except Exception:
+                pass
+    return None
+
+
+def parse_worktrees(text):
+    out, cur = [], {}
+    for ln in text.splitlines() + [""]:
+        if not ln:
+            if cur:
+                out.append(cur)
+            cur = {}
+            continue
+        k, _, v = ln.partition(" ")
+        cur[k] = v
+    return out
+
+
+def repo_state(name, spec, tokens):
+    checkout = os.path.expanduser(spec.get("checkout", ""))
+    rec = {"name": name, "present": os.path.isdir(checkout), "checkout": checkout,
+           "visibility": spec.get("visibility", ""), "role": spec.get("role", ""),
+           "branch": None, "ahead": 0, "behind": 0, "dirty": 0, "worktrees": [], "specs": [],
+           "tokens_today": tokens}
+    if not rec["present"]:
+        return rec
+    try:
+        top = git(checkout, "rev-parse", "--show-toplevel").strip()
+        if os.path.realpath(top) != os.path.realpath(checkout):
+            raise RuntimeError("not a git checkout root")
+        rec["branch"] = git(checkout, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        rec["dirty"] = dirty_count(checkout)
+        try:
+            behind, ahead = git(checkout, "rev-list", "--left-right", "--count", "@{u}...HEAD").split()
+            rec["ahead"], rec["behind"] = int(ahead), int(behind)
+        except Exception:
+            pass  # no upstream
+        base = default_branch_ref(checkout)
+        merged = set()
+        if base:
+            try:
+                merged = {ln.strip().lstrip("*+ ").strip()
+                          for ln in git(checkout, "branch", "--merged", base).splitlines()}
+            except Exception:
+                pass
+        main_real = os.path.realpath(checkout)
+        for wt in parse_worktrees(git(checkout, "worktree", "list", "--porcelain")):
+            path = wt.get("worktree", "")
+            branch = wt.get("branch", "").removeprefix("refs/heads/") or None
+            is_main = os.path.realpath(path) == main_real
+            exists = os.path.isdir(path)
+            w = {"path": path, "branch": branch, "dirty": 0, "last_commit_age": None,
+                 "prunable": False}
+            if exists:
+                try:
+                    w["dirty"] = dirty_count(path)
+                    ts = int(git(path, "log", "-1", "--format=%ct").strip())
+                    w["last_commit_age"] = max(0, int(time.time()) - ts)
+                except Exception as e:
+                    w["error"] = str(e)
+            if not is_main:
+                w["prunable"] = (not exists) or bool(branch and branch in merged
+                                                     and branch != rec["branch"])
+            rec["worktrees"].append(w)
+    except Exception as e:
+        rec["error"] = str(e)
+    return rec
+
+
+def frontmatter(path):
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return {}
+    m = re.match(r"---\n(.*?)\n---", text, re.S)
+    out = {}
+    for ln in (m.group(1).splitlines() if m else []):
+        k, sep, v = ln.partition(":")
+        if sep and re.fullmatch(r"[A-Za-z_]+", k.strip()):
+            out[k.strip()] = v.split("#")[0].strip().strip("'\"")
+    return out
+
+
+def home_infra_specs(checkout):
+    specs = []
+    for p in sorted(glob.glob(os.path.join(checkout, "specs/in_progress/*.md"))):
+        fm = frontmatter(p)
+        specs.append({"slug": fm.get("slug") or os.path.basename(p)[:-3],
+                      "status": fm.get("status", "in_progress"), "tier": fm.get("tier", "")})
+    return specs
+
+
+def attribution(script, days, errors, work_dir):
+    """Return {session_id: entry} from the attribution sidecar, or None on failure.
+
+    The sidecar lives in a temp dir inside the --out dir (AC2: nothing is written outside it)."""
+    try:
+        with tempfile.TemporaryDirectory(dir=work_dir, prefix=".attr-") as td:
+            side = os.path.join(td, "attr.json")
+            r = subprocess.run([sys.executable, "-I", script, "--days", str(days), "--json", "--out", side],
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                raise RuntimeError(f"exit {r.returncode}: {r.stderr.strip()[:200]}")
+            with open(side) as fh:
+                data = json.load(fh)
+        rows = data["sessions"] if isinstance(data, dict) else data
+        return {e["session_id"]: e for e in rows if isinstance(e, dict) and e.get("session_id")}
+    except Exception as e:
+        errors.append(f"repo-attribution failed: {e}")
+        return None
+
+
+def read_sessions(db, days, errors):
+    try:
+        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = c.execute(
+                "SELECT id, title, source, parent_session_id, last_activity_at, started_at"
+                " FROM sessions WHERE started_at >= ? OR last_activity_at >= ?",
+                (time.time() - days * 86400,) * 2).fetchall()
+        finally:
+            c.close()
+        return rows
+    except Exception as e:
+        errors.append(f"state.db unreadable: {e}")
+        return []
+
+
+def read_tasks(tasks_dir, errors):
+    tasks, jobs_raw = [], []
+    for sp in sorted(glob.glob(os.path.join(tasks_dir, "*", "state.json"))):
+        try:
+            with open(sp) as fh:
+                st = json.load(fh)
+            if not isinstance(st, dict) or not st.get("id"):
+                raise ValueError("no task id")
+        except Exception as e:
+            errors.append(f"{sp}: {e}")
+            continue
+        if st.get("status") == "done":
+            continue
+        tasks.append(st)
+        d = os.path.dirname(sp)
+        for kind in ("implement", "review"):
+            for jp in sorted(glob.glob(os.path.join(d, f"{kind}-*.json"))):
+                sid = os.path.basename(jp)[:-5]
+                try:
+                    with open(jp) as fh:
+                        sid = json.load(fh).get("session_id") or sid
+                except Exception:
+                    pass
+                try:
+                    mtime = os.path.getmtime(jp)
+                except OSError:
+                    continue  # the job file vanished between glob and stat
+                jobs_raw.append((st, kind, sid, mtime))
+    return tasks, jobs_raw
+
+
+# ------------------------------------------------------------------ plain English
+CODEX_SKIP = ("# AGENTS.md", "<environment_context", "<user_instructions", "<INSTRUCTIONS", "<permissions")
+TIME_KEY = re.compile(r"(^|_|-)(at|time|timestamp|ts|date|created|updated|finished|started|ended|mtime|expires)$"
+                      r"|^(created|updated|finished|started|ended|mtime|expires|timestamp|time|date)", re.I)
+ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def ago_text(secs):
+    """Relative time in words: 'just now', '5 min ago', 'in 2 h'."""
+    future = secs < 0
+    n = abs(secs)
+    if n < 45:
+        return "just now"
+    if n < 5400:
+        t = f"{round(n / 60)} min"
+    elif n < 129600:
+        t = f"{round(n / 3600)} h"
+    else:
+        t = f"{round(n / 86400)} d"
+    return f"in {t}" if future else f"{t} ago"
+
+
+def humanize_key(key):
+    k = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(key))
+    k = re.sub(r"[_\-]+", " ", k).strip()
+    return k[:1].upper() + k[1:].lower() if k else str(key)
+
+
+def epoch_of(value, key=""):
+    """Epoch seconds when value looks like a timestamp (ISO string, or number under a time-like key)."""
+    if isinstance(value, str) and ISO_RE.match(value.strip()):
+        v = value.strip().replace("Z", "+00:00").replace(" ", "T", 1)
+        try:
+            d = datetime.fromisoformat(v)
+            if d.tzinfo is None:
+                return d.timestamp()
+            return d.astimezone(timezone.utc).timestamp()
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and TIME_KEY.search(str(key)):
+        if 1e9 <= value <= 4e9:
+            return float(value)
+        if 1e12 <= value <= 4e12:
+            return value / 1000.0
+    return None
+
+
+def scalar_text(value, key=""):
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    ep = epoch_of(value, key)
+    if ep is not None:
+        return ago_text(time.time() - ep)
+    if isinstance(value, float):
+        return f"{value:g}" if abs(value) >= 1e-4 or value == 0 else f"{value:.2e}"
+    return str(value)
+
+
+def _looks_json(text):
+    t = text.strip()
+    return len(t) > 1 and ((t[0] == "{" and t[-1] == "}") or (t[0] == "[" and t[-1] == "]"))
+
+
+def _try_json(text):
+    try:
+        v = json.loads(text)
+    except Exception:
+        return None
+    return v if isinstance(v, (dict, list)) else None
+
+
+def render_json(value, key="", depth=0):
+    """Render a parsed JSON value as plain-English lines (two-space nesting, bullets for object lists)."""
+    lines = []
+    if isinstance(value, dict):
+        if not value:
+            return ["none"]
+        for k, v in value.items():
+            label = humanize_key(k)
+            if isinstance(v, str) and depth < 4:
+                nested = _try_json(v) if _looks_json(v) else None
+                if nested is not None:
+                    v = nested
+            if isinstance(v, dict):
+                if not v:
+                    lines.append(f"{label}: none")
+                else:
+                    lines.append(f"{label}:")
+                    lines += ["  " + ln for ln in render_json(v, k, depth + 1)]
+            elif isinstance(v, list):
+                if not v:
+                    lines.append(f"{label}: none")
+                elif all(not isinstance(x, (dict, list)) for x in v):
+                    lines.append(f"{label}: " + ", ".join(scalar_text(x, k) for x in v))
+                else:
+                    lines.append(f"{label}:")
+                    lines += ["  " + ln for ln in render_json(v, k, depth + 1)]
+            elif isinstance(v, str) and "\n" in v.strip():
+                lines.append(f"{label}:")
+                lines += ["  " + ln.rstrip() for ln in v.strip().splitlines() if ln.strip()]
+            else:
+                lines.append(f"{label}: {scalar_text(v, k)}")
+    elif isinstance(value, list):
+        if not value:
+            return ["none"]
+        if all(not isinstance(x, (dict, list)) for x in value):
+            return [", ".join(scalar_text(x, key) for x in value)]
+        for item in value:
+            sub = render_json(item, key, depth + 1) if isinstance(item, (dict, list)) else [scalar_text(item, key)]
+            for i, ln in enumerate(sub):
+                lines.append(("• " if i == 0 else "  ") + ln)
+    else:
+        lines.append(scalar_text(value, key))
+    return lines
+
+
+def _strip_markdown(text):
+    out = []
+    for ln in text.splitlines():
+        if re.fullmatch(r"\s*\|?[\s:|-]+\|[\s:|-]*", ln) and "-" in ln:
+            continue  # table separator row
+        if ln.strip().startswith("|") and ln.strip().endswith("|"):
+            cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+            ln = "  ·  ".join(c for c in cells if c)
+        ln = re.sub(r"^\s{0,3}#{1,6}\s+", "", ln)
+        ln = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", ln)
+        ln = re.sub(r"^\s*>\s?", "", ln)
+        ln = re.sub(r"!?\[([^\]]*)\]\(([^)]*)\)", r"\1 (\2)", ln)
+        ln = re.sub(r"(\*\*|__)(.+?)\1", r"\2", ln)
+        ln = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"\1", ln)
+        ln = re.sub(r"`([^`]*)`", r"\1", ln)
+        out.append(ln.rstrip())
+    return "\n".join(out)
+
+
+def plain(text):
+    """Plain English for a chat / tool message: JSON becomes readable lines, markdown noise goes away."""
+    if text is None:
+        return ""
+    text = str(text).replace("\r\n", "\n").strip()
+    if not text:
+        return ""
+    if _looks_json(text):
+        v = _try_json(text)
+        if v is not None:
+            return "\n".join(render_json(v))
+
+    def fence(m):
+        body = m.group(2)
+        v = _try_json(body.strip()) if _looks_json(body.strip()) else None
+        return "\n" + ("\n".join(render_json(v)) if v is not None else body.strip("\n")) + "\n"
+
+    text = re.sub(r"```([^\n`]*)\n(.*?)```", fence, text, flags=re.S)
+    text = text.replace("```", "")
+    # inline {...} / [...] blocks that parse as JSON
+    dec, out, i = json.JSONDecoder(), [], 0
+    while i < len(text):
+        ch = text[i]
+        if ch in "{[":
+            try:
+                v, end = dec.raw_decode(text, i)
+            except ValueError:
+                v = None
+            if v is not None and isinstance(v, (dict, list)) and v and not text[end:end + 1] == "(":
+                out.append("\n" + "\n".join(render_json(v)) + "\n")
+                i = end
+                continue
+        out.append(ch)
+        i += 1
+    text = "".join(out)
+    text = _strip_markdown(text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def clip_words(text, n=900):
+    text = text.strip()
+    if len(text) <= n:
+        return text
+    cut = text[:n]
+    sp = max(cut.rfind(" "), cut.rfind("\n"))
+    if sp > n * 0.6:
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:.\n") + "…"
+
+
+def one_line(text, n=160):
+    return clip_words(re.sub(r"\s+", " ", text).strip(), n)
+
+
+def section(heading, text, n=900):
+    body = clip_words(plain(text), n)
+    return {"heading": heading, "lines": body.splitlines() if body else ["Nothing recorded."]}
+
+
+def stamp(ts):
+    if not ts:
+        return "unknown"
+    return time.strftime("%a %d %b %H:%M", time.localtime(ts)) + f" ({ago_text(time.time() - ts)})"
+
+
+def span(secs):
+    secs = int(secs or 0)
+    if secs < 90:
+        return f"{secs} sec"
+    if secs < 5400:
+        return f"{round(secs / 60)} min"
+    return f"{secs / 3600:.1f} h"
+
+
+# ------------------------------------------------------------------ Codex
+def _text_of(payload):
+    parts = []
+    for c in payload.get("content") or []:
+        if isinstance(c, dict) and isinstance(c.get("text"), str):
+            parts.append(c["text"])
+    return "\n".join(parts).strip()
+
+
+def _is_prompt(text):
+    return bool(text) and not text.startswith(CODEX_SKIP)
+
+
+def codex_head(path, scan_lines=80):
+    """(meta payload, title, model) from the top of a rollout file."""
+    meta, title, model = {}, "", ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, ln in enumerate(fh):
+                if i >= scan_lines or (meta and title and model):
+                    break
+                try:
+                    j = json.loads(ln)
+                except ValueError:
+                    continue
+                pl = j.get("payload") or {}
+                if j.get("type") == "session_meta" and not meta:
+                    meta = pl
+                elif j.get("type") == "response_item" and pl.get("type") == "message" and pl.get("role") == "user" \
+                        and not title:
+                    t = _text_of(pl)
+                    if _is_prompt(t):
+                        title = t
+                elif j.get("type") in ("turn_context", "event_msg") and not model:
+                    model = pl.get("model") or (pl.get("thread_settings") or {}).get("model") or ""
+    except OSError:
+        pass
+    return meta, title, model
+
+
+def codex_tail(path, size=600_000):
+    """(last user text, last assistant text) from the end of a rollout file."""
+    user = asst = ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            n = fh.tell()
+            fh.seek(max(0, n - size))
+            data = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return user, asst
+    for ln in data.splitlines():
+        try:
+            j = json.loads(ln)
+        except ValueError:
+            continue
+        pl = j.get("payload") or {}
+        if j.get("type") == "response_item" and pl.get("type") == "message":
+            t = _text_of(pl)
+            if pl.get("role") == "user" and _is_prompt(t):
+                user = t
+            elif pl.get("role") == "assistant" and t:
+                asst = t
+    return user, asst
+
+
+def codex_files(codex_dir, days):
+    """Rollout files touched within `days`, newest first, as (mtime, path)."""
+    found = []
+    cutoff = time.time() - days * 86400
+    lo = datetime.fromtimestamp(cutoff).date()
+    for ydir in sorted(glob.glob(os.path.join(codex_dir, "[0-9][0-9][0-9][0-9]"))):
+        for mdir in sorted(glob.glob(os.path.join(ydir, "[0-9][0-9]"))):
+            for ddir in sorted(glob.glob(os.path.join(mdir, "[0-9][0-9]"))):
+                try:
+                    day = datetime(int(os.path.basename(ydir)), int(os.path.basename(mdir)),
+                                   int(os.path.basename(ddir))).date()
+                except ValueError:
+                    continue
+                if day < lo:
+                    continue
+                for f in glob.glob(os.path.join(ddir, "rollout-*.jsonl")):
+                    try:
+                        mt = os.path.getmtime(f)
+                    except OSError:
+                        continue
+                    if mt >= cutoff:
+                        found.append((mt, f))
+    return sorted(found, reverse=True)
+
+
+def repo_for_cwd(cwd, repos):
+    """Repo whose checkout (or listed worktree) contains cwd; longest path wins."""
+    best, blen = UNSCOPED, -1
+    if not cwd:
+        return best
+    for r in repos:
+        paths = [r.get("checkout", "")] + [w.get("path", "") for w in r.get("worktrees", [])]
+        for p in paths:
+            if p and (cwd == p or cwd.startswith(p.rstrip("/") + "/")) and len(p) > blen:
+                best, blen = r["name"], len(p)
+    return best
+
+
+def read_codex(codex_dir, days, repos, now):
+    out = []
+    for mt, f in codex_files(codex_dir, days):
+        meta, title, _model = codex_head(f)
+        sid = meta.get("id")
+        if not sid:
+            continue
+        cwd = meta.get("cwd") or ""
+        out.append({"id": sid, "title": one_line(title, 120), "source": "codex", "repo": repo_for_cwd(cwd, repos),
+                    "cwd": cwd, "tokens": 0, "live": bool(now - mt <= LIVE_SECS), "parent": None,
+                    "last_activity_at": mt})
+    return out
+
+
+def codex_path(codex_dir, sid):
+    hits = glob.glob(os.path.join(codex_dir, "*", "*", "*", f"rollout-*{glob.escape(sid)}.jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+# ------------------------------------------------------------------ detail mode
+def tone_for_live(live, idle_secs):
+    return ("live", "Live now") if live else ("idle", f"Idle {span(idle_secs)}")
+
+
+def load_state(path):
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def task_for_session(tasks_dir, sid):
+    for sp in sorted(glob.glob(os.path.join(tasks_dir, "*", "state.json"))):
+        try:
+            with open(sp) as fh:
+                st = json.load(fh)
+        except Exception:
+            continue
+        if isinstance(st, dict) and sid in (st.get("session_ids") or []):
+            return st
+    return None
+
+
+def hermes_client(source, parent):
+    if parent or source == "subagent":
+        return "Hermes subagent"
+    return {"desktop": "Hermes desktop", "local": "Hermes desktop", "gui": "Hermes desktop", "cron": "Hermes cron",
+            "cli": "Hermes CLI", "tui": "Hermes CLI"}.get(source or "", f"Hermes ({source})" if source else "Hermes")
+
+
+# ------------------------------------------------------------------ executive summary (brief)
+def sentences(text, n=2, cap=240):
+    """First n sentences of a text, on one line, clipped at a word."""
+    flat = re.sub(r"\s+", " ", plain(text)).strip()
+    if not flat:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9“\"(])", flat)
+    return clip_words(" ".join(parts[:n]), cap)
+
+
+def short_model(model):
+    m = (model or "").rsplit("/", 1)[-1]
+    return clip_words(m, 22) if m else ""
+
+
+def mkbrief(headline, phase, progress, left_off, nxt, needs_you=None, highlights=(), risks=()):
+    return {"headline": clip_words(one_line(headline or "", 400), 90) or "No summary yet",
+            "phase": clip_words(one_line(phase or "", 80), 60),
+            "progress": progress, "left_off": clip_words(left_off or "Nothing recorded yet.", 240),
+            "next": clip_words(nxt or "Nothing recorded.", 240),
+            "needs_you": clip_words(needs_you, 160) if needs_you else None,
+            "highlights": [clip_words(one_line(h, 200), 80) for h in highlights if h][:4],
+            "risks": [clip_words(one_line(r, 200), 80) for r in risks if r][:3], "source": "rules"}
+
+
+def chips_of(*pairs):
+    return [{"text": t, "tone": tone} for t, tone in pairs if t][:5]
+
+
+def event_text(e):
+    return re.sub(r"^\d{4}-\d\d-\d\d[T ][\d:]+\s+", "", str(e)).strip()
+
+
+def tool_failed(tool_out):
+    v = _try_json(tool_out.strip()) if isinstance(tool_out, str) and _looks_json(tool_out.strip()) else None
+    if not isinstance(v, dict):
+        return False
+    code = v.get("exit_code")
+    return bool((isinstance(code, int) and code != 0) or v.get("error"))
+
+
+def task_bits(task):
+    """Board context for a task: progress, needs_you, next step, risks, highlights, context lines."""
+    if not task:
+        return None
+    ref = task.get("ref") or task.get("id") or ""
+    status = str(task.get("status") or "unknown")
+    runs = [r for r in (task.get("check_runs") or []) if isinstance(r, dict)]
+    last = runs[-1] if runs else None
+    chunk_m = re.search(r"\d+", str(task.get("chunk") or ""))
+    chunk_n = chunk_m.group(0) if chunk_m else None
+    total = task.get("chunks_total")
+    progress = None
+    if last and isinstance(last.get("total"), int) and last["total"] > 0:
+        progress = {"done": int(last.get("passed") or 0), "total": last["total"],
+                    "label": f"{int(last.get('passed') or 0)} / {last['total']} checks"}
+    elif chunk_n and isinstance(total, int) and total > 0:
+        c = int(chunk_n)
+        progress = {"done": c if status in ("validate", "done", "merged") else max(0, c - 1), "total": total,
+                    "label": f"chunk {c} of {total}"}
+    needs = None
+    waiting = str(task.get("waiting_on") or "").strip()
+    blocked = str(task.get("blocked_reason") or "").strip()
+    if status == "validate":
+        needs = "Waiting for your check on the board"
+    elif waiting:
+        needs = f"Waiting on: {waiting}"
+    elif blocked:
+        needs = f"Blocked: {blocked}"
+    elif status == "hold":
+        needs = "On hold until you release it"
+    risks = []
+    if blocked:
+        risks.append(f"Blocked: {blocked}")
+    if last and isinstance(last.get("total"), int) and last.get("passed", 0) < last["total"]:
+        risks.append(f"{last['total'] - int(last.get('passed') or 0)} of {last['total']} checks failing")
+    used, budget = task.get("tokens_used"), task.get("budget_tokens")
+    if isinstance(used, (int, float)) and isinstance(budget, (int, float)) and budget > 0 and used / budget >= 0.8:
+        risks.append(f"Token budget {round(100 * used / budget)}% used")
+    events = [event_text(e) for e in (task.get("events") or [])[-3:]]
+    notes = [event_text(n) for n in (task.get("context_notes") or [])[-1:]]
+    ctx = [f"Board task: {ref} · {task.get('title') or ''}",
+           f"Task status: {status}; tier: {task.get('tier') or 'unknown'}"]
+    if chunk_n:
+        ctx.append(f"Chunk: {chunk_n} of {total or 'unknown'}")
+    if task.get("next_step"):
+        ctx.append(f"Recorded next step: {one_line(str(task['next_step']), 400)}")
+    if waiting:
+        ctx.append(f"Waiting on: {waiting}")
+    if blocked:
+        ctx.append(f"Blocked reason: {blocked}")
+    if last:
+        ctx.append(f"Latest checks: {last.get('passed')} of {last.get('total')} passed")
+    if isinstance(used, (int, float)) and budget:
+        ctx.append(f"Task tokens: {int(used):,} of {int(budget):,}")
+    ctx += [f"Recent event: {one_line(e, 200)}" for e in events]
+    ctx += [f"Owner note: {one_line(n, 300)}" for n in notes]
+    return {"ref": ref, "title": task.get("title") or "", "status": status, "progress": progress, "needs": needs,
+            "risks": risks, "events": events, "notes": notes, "ctx": ctx, "tier": task.get("tier") or "",
+            "next": str(task.get("next_step") or "").strip(),
+            "phase": status.replace("_", " ").capitalize() + (f" · chunk {chunk_n} of {total}" if chunk_n and total else "")}
+
+
+def tok_short(n):
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else (f"{n / 1e3:.0f}k" if n >= 1e4 else f"{n:,}")
+
+
+REDACT_LINE = re.compile(
+    r"(?i)(\b[\w-]*(api[_-]?key|secret|token|passw(or)?d|passwd|credential|private[_-]?key|access[_-]?key)[\w-]*\s*=\s*\S)"
+    r"|(\b(password|passwd|secret|api[_ -]?key|authorization|private key)\b\s*[:=]\s*\S)"
+    r"|(\bbearer\s+[A-Za-z0-9._~+/=-]{12,})"
+    r"|(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{12,}|AIza[0-9A-Za-z_-]{20,})"
+    r"|(-----BEGIN [A-Z ]*PRIVATE KEY)|(\b[A-Fa-f0-9]{40,}\b)")
+
+
+def redact(text):
+    """Drop whole lines that look like they carry a secret before anything leaves the machine."""
+    return "\n".join(ln for ln in str(text).splitlines() if not REDACT_LINE.search(ln))
+
+
+
+def detail_conversation(sid, a, state):
+    now = time.time()
+    try:
+        c = sqlite3.connect(f"file:{a.state_db}?mode=ro", uri=True, timeout=2)
+    except Exception as e:
+        return unknown(f"c:{sid}", f"state.db unreadable: {e}")
+    try:
+        row = c.execute("SELECT title, source, parent_session_id, model, started_at, last_activity_at, message_count,"
+                        " cwd, input_tokens, output_tokens FROM sessions WHERE id = ?", (sid,)).fetchone()
+        if not row:
+            return unknown(f"c:{sid}", "Conversation not found")
+        title, source, parent, model, started, last, count, cwd, tin, tout = row
+
+        def last_msg(where, params=()):
+            r = c.execute(f"SELECT content, tool_name FROM messages WHERE session_id = ? AND {where}"
+                          " ORDER BY timestamp DESC, id DESC LIMIT 1", (sid, *params)).fetchone()
+            return r or ("", None)
+        user = last_msg("role = 'user' AND content IS NOT NULL AND content != '' AND content NOT LIKE '[CONTEXT COMPACTION%'")[0]
+        asst = last_msg("role = 'assistant' AND content IS NOT NULL AND TRIM(content) != ''")[0]
+        tool_out, tool_name = last_msg("role = 'tool'")
+    finally:
+        c.close()
+    live = bool(last and now - last <= LIVE_SECS)
+    tone, status = tone_for_live(live, now - (last or now))
+    conv = next((x for x in state.get("conversations", []) if x.get("id") == sid), {})
+    repo = conv.get("repo") or UNSCOPED
+    tokens = conv.get("tokens")
+    facts = [["Client", hermes_client(source, parent)], ["State", status], ["Model", model or "unknown"],
+             ["Started", stamp(started)], ["Last activity", stamp(last)], ["Messages", str(count or 0)],
+             ["Tokens today", f"{tokens:,}" if isinstance(tokens, int) else f"{(tin or 0) + (tout or 0):,} (all time)"],
+             ["Repo", "no repo" if repo == UNSCOPED else repo]]
+    task = task_for_session(a.tasks_dir, sid)
+    if task:
+        facts.append(["Task", f"{task.get('ref') or task.get('id')} · {task.get('title') or ''} · "
+                              f"{task.get('status') or 'unknown'}"])
+    tool_line = ""
+    if tool_name or tool_out:
+        tool_line = f"{tool_name or 'tool'}: {one_line(plain(tool_out), 300)}"
+    tb = task_bits(task)
+    failed = tool_failed(tool_out)
+    left = sentences(asst) or ("No reply recorded yet." if not user else f"Last asked: {one_line(plain(user), 120)}")
+    if tb:
+        headline = f"{tb['ref']} · {tb['title']}".strip(" ·")
+        nxt = sentences(tb["next"], 1) if tb["next"] else "No next step recorded on the board."
+        phase, progress, needs, risks = tb["phase"], tb["progress"], tb["needs"], list(tb["risks"])
+        highlights = list(tb["events"][::-1]) + [f"Owner note: {n}" for n in tb["notes"]]
+    else:
+        headline = clip_words(one_line(plain(user), 200), 90) or (title or sid[:8])
+        nxt = "Answer the latest request." if user and not asst else "No next step recorded."
+        phase, progress, needs, risks, highlights = (
+            "Live conversation" if live else "Idle conversation"), None, None, [], []
+        if user:
+            highlights.append(f"Last ask: {one_line(plain(user), 120)}")
+    if failed:
+        risks.insert(0, f"Last tool ({tool_name or 'tool'}) reported an error")
+    if tool_name:
+        highlights.append(f"Last tool: {tool_name}" + (" (failed)" if failed else ""))
+    ctx = [f"Conversation: {title or sid[:8]} ({hermes_client(source, parent)}), repo {'none' if repo == UNSCOPED else repo}",
+           f"Messages: {count or 0}"] + (tb["ctx"] if tb else [])
+    ctx += [f"Last user ask: {clip_words(plain(user), 900)}", f"Last assistant reply: {clip_words(plain(asst), 1500)}",
+            f"Last tool: {tool_line or 'none'}" + (" (it reported an error)" if failed else "")]
+    chips = chips_of((hermes_client(source, parent), "ok"), (status, tone), (short_model(model), "idle"),
+                     ("" if repo == UNSCOPED else repo, "idle"),
+                     (f"{tok_short(tokens)} tok today" if isinstance(tokens, int) and tokens else "", "idle"))
+    return {"key": f"c:{sid}", "kind": "conv", "client": "hermes", "title": title or sid[:8], "status": status,
+            "status_tone": tone, "facts": facts,
+            "sections": [section("Last request", user), section("Last reply", asst),
+                         {"heading": "Last tool", "lines": [tool_line or "Nothing recorded."]}],
+            "open": {"kind": "hermes", "id": sid, "cwd": cwd or HOME, "label": "Open in Hermes"},
+            "chips": chips, "brief": mkbrief(headline, phase, progress, left, nxt, needs, highlights, risks),
+            "_ctx": "\n".join(ctx), "_act": str(last or 0)}
+
+
+def find_job(tasks_dir, jid):
+    for sp in sorted(glob.glob(os.path.join(tasks_dir, "*", "state.json"))):
+        d = os.path.dirname(sp)
+        for kind in ("implement", "review"):
+            for jp in glob.glob(os.path.join(d, f"{kind}-*.json")):
+                try:
+                    with open(jp) as fh:
+                        data = json.load(fh)
+                except Exception:
+                    data = {}
+                if (data.get("session_id") or os.path.basename(jp)[:-5]) == jid:
+                    return sp, kind, jp, data
+    return None
+
+
+def detail_job(jid, a, state):
+    hit = find_job(a.tasks_dir, jid)
+    if not hit:
+        return unknown(f"j:{jid}", "Claude job not found")
+    sp, kind, jp, data = hit
+    try:
+        with open(sp) as fh:
+            task = json.load(fh)
+    except Exception:
+        task = {}
+    now = time.time()
+    mt = os.path.getmtime(jp)
+    result = data.get("result")
+    parsed = _try_json(result) if isinstance(result, str) and _looks_json(result.strip()) else None
+    parsed = parsed if isinstance(parsed, dict) else (data.get("structured_output") if isinstance(
+        data.get("structured_output"), dict) else {})
+    verdict = parsed.get("verdict") or parsed.get("status") or ("error" if data.get("is_error") else
+                                                              data.get("subtype") or "unknown")
+    v = str(verdict).lower()
+    live = now - mt <= LIVE_SECS
+    if data.get("is_error") or v in ("fail", "failed", "error", "blocked") or "error" in v:
+        tone = "error"
+    elif v in ("pass", "done", "success", "approved", "ok"):
+        tone = "ok"
+    elif "change" in v or "partial" in v or "warn" in v:
+        tone = "warn"
+    else:
+        tone = "idle"
+    if live:
+        tone = "live" if tone in ("ok", "idle") else tone
+    cost = data.get("total_cost_usd")
+    repo = next((j.get("repo") for j in state.get("jobs", []) if j.get("id") == jid), None)
+    cwd = next((r.get("checkout") for r in state.get("repos", []) if r.get("name") == repo), None) or HOME
+    facts = [["Task", f"{task.get('ref') or task.get('id')} · {task.get('title') or ''}"],
+             ["Role", "Implementer" if kind == "implement" else "Reviewer"],
+             ["Verdict / status", str(verdict)], ["Turns", str(data.get("num_turns", "unknown"))],
+             ["Cost", f"${cost:.2f}" if isinstance(cost, (int, float)) else "unknown"],
+             ["Duration", span((data.get("duration_ms") or 0) / 1000)], ["Finished", stamp(mt)]]
+    body = parsed.get("summary") if parsed else None
+    if body is None:
+        body = result if isinstance(result, str) else (json.dumps(parsed) if parsed else "")
+    secs = [section("Summary", body)]
+    if parsed:
+        rest = {k: v2 for k, v2 in parsed.items() if k not in ("summary",)}
+        if rest:
+            secs.append(section("Result", json.dumps(rest)))
+    if data.get("errors"):
+        secs.append(section("Errors", json.dumps({"errors": data["errors"]})))
+    tb = task_bits(task)
+    body_text = parsed.get("summary") if parsed.get("summary") else (result if isinstance(result, str) else "")
+
+    def item(x):
+        if isinstance(x, dict):
+            x = x.get("title") or x.get("summary") or x.get("issue") or x.get("description") or x.get("message") or ""
+        return one_line(plain(x), 160)
+    findings = []
+    for k in ("findings", "issues", "blocking", "problems", "errors"):
+        v = parsed.get(k) if parsed else None
+        if isinstance(v, list):
+            findings += [item(x) for x in v if item(x)]
+    if data.get("errors"):
+        findings += [item(x) for x in (data["errors"] if isinstance(data["errors"], list) else [data["errors"]])]
+    role = "Implementer" if kind == "implement" else "Reviewer"
+    headline = sentences(body_text, 1, 160) or (f"{role} job for {tb['ref']}" if tb else f"{role} job")
+    needs = None
+    if tone == "error":
+        needs = "This job failed; it may need a retry or your call"
+    elif tb and tb["needs"]:
+        needs = tb["needs"]
+    cost_s = f"${cost:.2f}" if isinstance(cost, (int, float)) else ""
+    highlights = ([f"Task: {tb['ref']} · {tb['title']}"] if tb else [])
+    if data.get("num_turns"):
+        highlights.append(f"Turns: {data['num_turns']}")
+    highlights.append(f"Finished {ago_text(now - mt)}")
+    ctx = [f"Claude job: {role} on {tb['ref'] if tb else 'unknown task'}", f"Verdict: {verdict}",
+           f"Turns {data.get('num_turns', 'unknown')}, cost {cost_s or 'unknown'}",
+           f"Result summary: {clip_words(plain(body_text), 1500)}"] + [f"Finding: {f}" for f in findings[:8]] + \
+          (tb["ctx"] if tb else [])
+    chips = chips_of((role, "ok"), ("Live now" if live else str(verdict)[:18], tone), (cost_s, "idle"),
+                     (f"{data['num_turns']} turns" if data.get("num_turns") else "", "idle"),
+                     (span((data.get("duration_ms") or 0) / 1000) if data.get("duration_ms") else "", "idle"))
+    brief = mkbrief(headline, f"{role} · {str(verdict).lower()}", tb["progress"] if tb else None,
+                    sentences(body_text, 2) or "No result summary recorded.",
+                    sentences(tb["next"], 1) if tb and tb["next"] else "No next step recorded.",
+                    needs, highlights, findings[:3] + (tb["risks"] if tb else []))
+    return {"key": f"j:{jid}", "kind": "job", "client": "claude",
+            "title": f"{kind} {task.get('id') or ''}".strip(), "status": "Live now" if live else str(verdict),
+            "status_tone": tone, "facts": facts, "sections": secs,
+            "open": {"kind": "claude", "id": jid, "cwd": cwd, "label": "Open in Claude Code"},
+            "chips": chips, "brief": brief, "_ctx": "\n".join(ctx), "_act": str(mt)}
+
+
+def detail_codex(sid, a):
+    path = codex_path(a.codex_dir, sid)
+    if not path:
+        return unknown(f"x:{sid}", "Codex session not found")
+    meta, title, model = codex_head(path)
+    user, asst = codex_tail(path)
+    mt = os.path.getmtime(path)
+    now = time.time()
+    live = now - mt <= LIVE_SECS
+    tone, status = tone_for_live(live, now - mt)
+    cwd = meta.get("cwd") or HOME
+    state = load_state(a.state)
+    repo = repo_for_cwd(cwd, state.get("repos", []))
+    facts = [["Client", "Codex"], ["State", status], ["Model", model or "unknown"],
+             ["Started", stamp(epoch_of(meta.get("timestamp")))], ["Last activity", stamp(mt)],
+             ["Folder", cwd], ["Repo", "no repo" if repo == UNSCOPED else repo]]
+    first = one_line(plain(title), 200)
+    ctx = [f"Codex session in {cwd}, repo {'none' if repo == UNSCOPED else repo}",
+           f"First ask: {clip_words(plain(title), 900)}",
+           f"Last user ask: {clip_words(plain(user), 900)}", f"Last assistant reply: {clip_words(plain(asst), 1500)}"]
+    chips = chips_of(("Codex", "ok"), (status, tone), (short_model(model), "idle"),
+                     ("" if repo == UNSCOPED else repo, "idle"))
+    brief = mkbrief(first or sid[:8], "Live session" if live else "Idle session", None,
+                    sentences(asst, 2) or "No reply recorded yet.", "Resume the session in Codex to continue.", None,
+                    [f"Last ask: {one_line(plain(user), 120)}"] if user and user != title else [], [])
+    return {"key": f"x:{sid}", "kind": "codex", "client": "codex", "title": one_line(title, 120) or sid[:8],
+            "status": status, "status_tone": tone, "facts": facts,
+            "sections": [section("Last request", user or title), section("Last reply", asst)],
+            "open": {"kind": "codex", "id": sid, "cwd": cwd, "label": "Open in Codex"},
+            "chips": chips, "brief": brief, "_ctx": "\n".join(ctx), "_act": str(mt)}
+
+
+def detail_repo(name, a, state):
+    rec = next((r for r in state.get("repos", []) if r.get("name") == name), None)
+    if rec is None:
+        try:
+            with open(a.registry, "rb") as fh:
+                spec = tomllib.load(fh).get("repos", {}).get(name)
+        except Exception:
+            spec = None
+        if spec is None and name != UNSCOPED:
+            return unknown(f"r:{name}", "Repo not found")
+        rec = repo_state(name, spec, 0) if spec else {"name": name, "present": False, "worktrees": [], "specs": [],
+                                                       "tokens_today": state.get("unscoped_tokens", 0)}
+    if name == UNSCOPED:
+        return {"key": f"r:{name}", "kind": "repo", "client": "kitty", "title": "Not in a repo", "status": "No repo",
+                "status_tone": "idle",
+                "facts": [["Tokens today", f"{state.get('unscoped_tokens', 0):,}"]],
+                "sections": [{"heading": "About", "lines": ["Sessions whose folder is not inside a registered repo."]}],
+                "open": {"kind": "kitty", "id": name, "cwd": HOME, "label": "Open in terminal"},
+                "chips": chips_of((f"{state.get('unscoped_tokens', 0):,} tok today", "idle")),
+                "brief": mkbrief("Sessions outside any registered repo", "No repo", None,
+                                 "These sessions have a folder that is not inside a registered repo.",
+                                 "Nothing to do here.", None, [f"{state.get('unscoped_tokens', 0):,} tokens today"], []),
+                "_ctx": "Sessions whose folder is not inside a registered repo.", "_act": "0"}
+    checkout = rec.get("checkout") or HOME
+    subject = ""
+    if rec.get("present"):
+        try:
+            ct, _, subject = git(checkout, "log", "-1", "--format=%ct%x09%s").strip().partition("\t")
+            subject = f"{subject} ({ago_text(time.time() - int(ct))})"
+        except Exception:
+            pass
+    dirty = rec.get("dirty", 0)
+    if not rec.get("present"):
+        tone, status = "idle", "Not checked out"
+    elif rec.get("error"):
+        tone, status = "error", "Git error"
+    elif dirty:
+        tone, status = "warn", f"{dirty} changed"
+    else:
+        tone, status = "ok", "Clean"
+    wts = [w for w in rec.get("worktrees", []) if w.get("path") != rec.get("checkout")]
+    facts = [["Branch", rec.get("branch") or "none"],
+             ["Ahead / behind", f"{rec.get('ahead', 0)} ahead, {rec.get('behind', 0)} behind"],
+             ["Changed files", str(dirty)], ["Last commit", subject or "unknown"],
+             ["Worktrees", str(len(wts))], ["Tokens today", f"{rec.get('tokens_today', 0):,}"]]
+    specs = rec.get("specs") or []
+    if specs:
+        counts = {}
+        for sp in specs:
+            counts[sp.get("status") or "unknown"] = counts.get(sp.get("status") or "unknown", 0) + 1
+        facts.append(["Specs", ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in sorted(counts.items()))])
+    lines = []
+    for w in wts[:12]:
+        bits = [w.get("branch") or "detached", f"{w.get('dirty', 0)} changed"]
+        if w.get("last_commit_age") is not None:
+            bits.append(ago_text(w["last_commit_age"]))
+        if w.get("prunable"):
+            bits.append("prunable")
+        lines.append(f"• {os.path.basename(w.get('path', '').rstrip('/'))} — " + ", ".join(bits))
+    if len(wts) > 12:
+        lines.append(f"…and {len(wts) - 12} more")
+    secs = [{"heading": "Worktrees", "lines": lines or ["No extra worktrees."]}]
+    if rec.get("error"):
+        secs.append(section("Problem", rec["error"]))
+    ahead, behind = rec.get("ahead", 0), rec.get("behind", 0)
+    bits = [rec.get("branch") or "no branch", "clean" if not dirty else f"{dirty} changed"]
+    if ahead:
+        bits.append(f"{ahead} ahead")
+    if behind:
+        bits.append(f"{behind} behind")
+    if not rec.get("present"):
+        bits = ["not checked out"]
+    live_convs = [c for c in state.get("conversations", [])
+                  if c.get("repo") == name and c.get("live") and not c.get("parent")]
+    jobs_here = [j for j in state.get("jobs", []) if j.get("repo") == name]
+    highlights = [f"{os.path.basename(w.get('path', '').rstrip('/'))} · {w.get('dirty', 0)} changed"
+                  for w in wts if w.get("dirty")]
+    if live_convs:
+        highlights.append(f"{len(live_convs)} live Conversation{'s' if len(live_convs) != 1 else ''}"
+                          + (f": {one_line(live_convs[0].get('title') or '', 40)}" if len(live_convs) == 1 else ""))
+    if jobs_here:
+        highlights.append(f"{len(jobs_here)} Claude job{'s' if len(jobs_here) != 1 else ''} on open tasks")
+    prunable = [w for w in wts if w.get("prunable")]
+    risks = ([f"Git error: {rec['error']}"] if rec.get("error") else []) + \
+            ([f"{len(prunable)} merged worktree{'s' if len(prunable) != 1 else ''} can be pruned"] if prunable else []) + \
+            ([f"Behind its upstream by {behind}"] if behind else [])
+    done_specs = len([sp for sp in specs if (sp.get("status") or "") in ("validate", "done", "merged")])
+    progress = ({"done": done_specs, "total": len(specs), "label": f"{done_specs} / {len(specs)} specs ready"}
+                if specs else None)
+    if dirty:
+        nxt = f"Review and commit the {dirty} changed file{'s' if dirty != 1 else ''}."
+    elif ahead:
+        nxt = f"Push {ahead} commit{'s' if ahead != 1 else ''} when ready."
+    else:
+        nxt = "Nothing pending in the checkout."
+    left = f"Last commit: {subject}." if subject else "No commit information available."
+    ctx = [f"Repo {name}: branch {rec.get('branch')}, {dirty} uncommitted changed files, "
+           f"{ahead} commits ahead and {behind} behind upstream", f"Last commit: {subject or 'unknown'}",
+           f"Worktrees: {len(wts)}; tokens today {rec.get('tokens_today', 0):,}"] + \
+          [f"Highlight: {h}" for h in highlights] + [f"Risk: {r}" for r in risks] + \
+          [f"Spec: {sp.get('slug')} ({sp.get('status')})" for sp in specs[:8]]
+    chips = chips_of((rec.get("visibility") or "repo", "ok"), (rec.get("branch") or "", "idle"), (status, tone),
+                     (f"{len(wts)} worktrees" if wts else "", "idle"),
+                     (f"{tok_short(rec.get('tokens_today', 0))} tok today" if rec.get("tokens_today") else "", "idle"))
+    act = f"{subject}|{dirty}|{ahead}|{len(live_convs)}|{len(jobs_here)}"
+    return {"key": f"r:{name}", "kind": "repo", "client": "kitty", "title": name, "status": status,
+            "status_tone": tone, "facts": facts, "sections": secs,
+            "open": {"kind": "kitty", "id": name, "cwd": checkout, "label": "Open in terminal"},
+            "chips": chips, "brief": mkbrief(" · ".join(bits), "Repository", progress, left, nxt, None, highlights, risks),
+            "_ctx": "\n".join(ctx), "_act": act}
+
+
+def unknown(key, why):
+    return {"key": key, "kind": "unknown", "client": "", "title": key, "status": why, "status_tone": "idle",
+            "facts": [], "sections": [{"heading": "Not available", "lines": [why]}], "open": None, "chips": [],
+            "brief": mkbrief(why, "Unavailable", None, "Nothing recorded.", "Nothing to do.", None, [], []),
+            "_ctx": why, "_act": "0"}
+
+
+def detail_full(key, a):
+    state = load_state(a.state)
+    kind, _, ident = key.partition(":")
+    if kind == "c":
+        return detail_conversation(ident, a, state)
+    if kind == "j":
+        return detail_job(ident, a, state)
+    if kind == "x":
+        return detail_codex(ident, a)
+    if kind == "r":
+        return detail_repo(ident, a, state)
+    return unknown(key, "Unknown item")
+
+
+def detail(key, a):
+    d = detail_full(key, a)
+    d.pop("_ctx", None)
+    d.pop("_act", None)
+    return d
+
+
+# ------------------------------------------------------------------ synthesised brief (zgx-02)
+BRIEF_URL = "http://127.0.0.1:8002/v1/chat/completions"
+BRIEF_SYSTEM = (
+    "You write an executive summary for Brian about one work item (a Hermes Conversation, a Claude job, a Codex "
+    "session or a repo). Plain English. No JSON, markdown, bullet characters or code in any value. Reply with one "
+    "JSON object with exactly these keys: headline (string, at most 90 characters, what this is), phase (string, "
+    "short stage label), left_off (one sentence: where it stopped), next (one sentence: what comes next), "
+    "needs_you (string when Brian must act, otherwise null), highlights (array of at most 4 strings, each at most "
+    "80 characters), risks (array of at most 3 strings, each at most 80 characters, empty when none). Never invent "
+    "facts that are not in the bundle. If the bundle does not say, write that it is not recorded.")
+BAD_VALUE = re.compile(r"[{}]|```|\*\*")
+
+
+def valid_brief(b, rules):
+    """Return a cleaned brief, or None when the model reply has the wrong shape or lengths."""
+    if not isinstance(b, dict):
+        return None
+
+    def s(k, lim, req=True):
+        v = b.get(k)
+        if v is None and not req:
+            return None
+        if not isinstance(v, str) or (req and not v.strip()) or len(v) > lim * 1.5 or BAD_VALUE.search(v):
+            raise ValueError(k)
+        return clip_words(one_line(v, lim * 2), lim) if v.strip() else None
+
+    def lst(k, n, lim):
+        v = b.get(k)
+        if not isinstance(v, list) or any(not isinstance(x, str) or BAD_VALUE.search(x) for x in v):
+            raise ValueError(k)
+        return [clip_words(one_line(x, lim * 2), lim) for x in v if x.strip()][:n]
+    try:
+        out = {"headline": s("headline", 90), "phase": s("phase", 60), "progress": rules.get("progress"),
+               "left_off": s("left_off", 240), "next": s("next", 240), "needs_you": s("needs_you", 160, req=False),
+               "highlights": lst("highlights", 4, 80), "risks": lst("risks", 3, 80), "source": "zgx-02"}
+    except ValueError:
+        return None
+    if out["needs_you"] is None:
+        out["needs_you"] = rules.get("needs_you")
+    return out
+
+
+def brief_cache_path(a, key):
+    base = a.brief_cache or os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
+                                         "repo-grid/briefs")
+    return os.path.join(base, hashlib.sha1(key.encode()).hexdigest() + ".json")
+
+
+FAIL_RETRY_S = 60
+
+
+def _read_cache(path):
+    try:
+        with open(path) as fh:
+            c = json.load(fh)
+        return c if isinstance(c, dict) else None
+    except Exception:
+        return None
+
+
+class _KeyLock:
+    """Per-key advisory lock so a click and the warm run never ask zgx-02 twice for one key."""
+
+    def __init__(self, path, timeout):
+        self.path, self.timeout, self.fh = path + ".lock", timeout, None
+
+    def __enter__(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            self.fh = open(self.path, "a")
+        except OSError:
+            return self
+        end = time.time() + max(self.timeout, 0)
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= end:
+                    break
+                time.sleep(0.05)
+        return self
+
+    def __exit__(self, *exc):
+        if self.fh:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+            finally:
+                self.fh.close()
+        return False
+
+
+def _with_cached(reply, rules, c, fresh):
+    reply["brief"] = {**c["brief"], "progress": rules.get("progress"), "generated_at": c.get("at")}
+    reply["fresh"], reply["cached"] = fresh, True
+    return reply
+
+
+def synth_brief(key, a, cached_only=False):
+    d = detail_full(key, a)
+    ctx, act = d.pop("_ctx", ""), d.pop("_act", "")
+    rules = d["brief"]
+    reply = {"key": key, "chips": d["chips"], "brief": rules, "fresh": False, "cached": False}
+    if d.get("kind") == "unknown":
+        return reply
+    path = brief_cache_path(a, key)
+    stamp_key = hashlib.sha1(act.encode()).hexdigest()
+    off = os.environ.get("REPO_GRID_BRIEF", "").lower() == "off"
+    if cached_only:
+        c = _read_cache(path)
+        if c and isinstance(c.get("brief"), dict):
+            return _with_cached(reply, rules, c, c.get("stamp") == stamp_key)
+        return reply
+    if off:
+        return reply
+
+    def from_cache():
+        c = _read_cache(path)
+        if c and c.get("stamp") == stamp_key:
+            if isinstance(c.get("brief"), dict):
+                return _with_cached(reply, rules, c, True)
+            if time.time() - float(c.get("fail_at") or 0) < FAIL_RETRY_S:
+                return reply
+        return None
+
+    hit = from_cache()
+    if hit is not None:
+        return hit
+    with _KeyLock(path, a.brief_timeout):
+        hit = from_cache()  # the other caller may have filled it while we waited
+        if hit is not None:
+            return hit
+        now = time.time()
+        bundle = clip_words(redact(ctx), 18000)
+        url = os.environ.get("REPO_GRID_BRIEF_URL") or BRIEF_URL
+        body = {"model": os.environ.get("REPO_GRID_BRIEF_MODEL") or "heavy", "temperature": 0.2, "max_tokens": 500,
+                "chat_template_kwargs": {"enable_thinking": False}, "response_format": {"type": "json_object"},
+                "messages": [{"role": "system", "content": BRIEF_SYSTEM},
+                             {"role": "user", "content": f"Work item bundle:\n{bundle}"}]}
+        good = None
+        try:
+            req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=a.brief_timeout) as r:
+                content = json.loads(r.read().decode())["choices"][0]["message"]["content"]
+            good = valid_brief(_try_json(content.strip()) if isinstance(content, str) else None, rules)
+        except Exception:
+            good = None
+        prev = _read_cache(path)
+        rec = {"stamp": stamp_key, "at": now, **({"brief": good} if good else {"fail_at": now})}
+        if not good and prev and isinstance(prev.get("brief"), dict):
+            rec = {**prev, "fail_at": now}  # keep the last good brief readable by --cached-only
+            rec["stamp"] = prev.get("stamp")
+        try:
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".b-", suffix=".tmp")
+            with os.fdopen(fd, "w") as fh:
+                json.dump(rec, fh)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    if good:
+        reply["brief"] = {**good, "generated_at": now}
+        reply["fresh"], reply["cached"] = True, True
+    return reply
+
+
+WARM_CAP = 12
+
+
+def warm_briefs(keys, a):
+    """Synthesise briefs sequentially for keys without a fresh cache (cap 12). Returns a summary dict."""
+    out = {"warmed": [], "skipped": [], "failed": []}
+    if os.environ.get("REPO_GRID_BRIEF", "").lower() == "off" or \
+            os.environ.get("REPO_GRID_BRIEF_WARM", "").lower() == "off":
+        out["off"] = True
+        return out
+    seen = []
+    for k in keys:
+        if k not in seen:
+            seen.append(k)
+    for k in seen[:WARM_CAP]:
+        if synth_brief(k, a, cached_only=True).get("fresh"):
+            out["skipped"].append(k)
+            continue
+        r = synth_brief(k, a)
+        (out["warmed"] if r.get("fresh") and r["brief"].get("source") == "zgx-02" else out["failed"]).append(k)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--days", type=float, default=1)
+    ap.add_argument("--out", default=os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
+                                                  "repo-grid/state.json"))
+    ap.add_argument("--registry", default=os.path.join(HOME, "home-infra/repos.toml"))
+    ap.add_argument("--tasks-dir", default=os.path.join(HOME, ".hermes/tasks"))
+    ap.add_argument("--state-db", default=os.path.join(HOME, ".hermes/profiles/fullpower/state.db"))
+    ap.add_argument("--codex-dir", default=os.path.join(HOME, ".codex/sessions"))
+    ap.add_argument("--detail", metavar="KEY", help="print one JSON detail object for a grid node key and exit")
+    ap.add_argument("--brief", metavar="KEY",
+                    help="print the executive-summary brief for a node key (zgx-02, rules fallback)")
+    ap.add_argument("--cached-only", action="store_true",
+                    help="with --brief: never call the network; print the last cached brief (fresh/cached flags)")
+    ap.add_argument("--warm", metavar="KEY", nargs="+",
+                    help="synthesise briefs for keys without a fresh cache (cap 12) and exit")
+    ap.add_argument("--brief-cache", default=None, help="brief cache directory (default: runtime dir repo-grid/briefs)")
+    ap.add_argument("--brief-timeout", type=float, default=20)
+    ap.add_argument("--state", default=None, help="snapshot read by --detail (default: the --out path)")
+    ap.add_argument("--attribution-script",
+                    default=os.path.join(HOME, ".hermes/profiles/fullpower/scripts/repo-attribution.py"))
+    try:
+        a = ap.parse_args()
+    except SystemExit as e:
+        sys.exit(2 if e.code else 0)
+    if a.state is None:
+        a.state = a.out
+    if a.detail:
+        print(json.dumps(detail(a.detail, a)))
+        return 0
+    if a.warm:
+        print(json.dumps(warm_briefs(a.warm, a)))
+        return 0
+    if a.brief:
+        print(json.dumps(synth_brief(a.brief, a, cached_only=a.cached_only)))
+        return 0
+    try:
+        with open(a.registry, "rb") as fh:
+            registry = tomllib.load(fh).get("repos", {})
+    except Exception as e:
+        print(f"repo-grid-collect: cannot read registry {a.registry}: {e}", file=sys.stderr)
+        return 2
+
+    errors = []
+    out_dir = os.path.dirname(os.path.abspath(a.out))
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    attr = attribution(a.attribution_script, a.days, errors, out_dir)
+    rows = read_sessions(a.state_db, a.days, errors)
+    now = time.time()
+
+    conversations = []
+    tokens_by_repo, unscoped = {}, 0
+    for sid, title, source, parent, last, _started in rows:
+        e = attr.get(sid) if attr else None
+        repo = (e.get("repo") or UNSCOPED) if e else UNSCOPED
+        tok = int(e.get("tokens") or 0) if e else 0
+        if repo == UNSCOPED:
+            unscoped += tok
+        else:
+            tokens_by_repo[repo] = tokens_by_repo.get(repo, 0) + tok
+        conversations.append({"id": sid, "title": title or "", "source": source, "repo": repo,
+                              "tokens": tok, "live": bool(last and now - last <= LIVE_SECS),
+                              "parent": parent, "last_activity_at": last})
+
+    tasks_raw, jobs_raw = read_tasks(a.tasks_dir, errors)
+    sess_repo = {c["id"]: c["repo"] for c in conversations}
+    tasks, latest = [], {}
+    for st in tasks_raw:
+        ids = st.get("session_ids") or []
+        latest[st["id"]] = ids[-1] if ids else None
+        repo = sess_repo.get(latest[st["id"]]) or next((sess_repo[s] for s in reversed(ids) if s in sess_repo),
+                                                       UNSCOPED)
+        tasks.append({"id": st.get("id"), "ref": st.get("ref"), "title": st.get("title"),
+                      "project": st.get("project"), "status": st.get("status"),
+                      "tokens_used": st.get("tokens_used", 0), "budget_tokens": st.get("budget_tokens", 0),
+                      "repo": repo})
+    task_repo = {t["id"]: t["repo"] for t in tasks}
+    jobs = [{"id": sid, "kind": kind, "task": st.get("id"), "parent": latest.get(st.get("id")),
+             "repo": task_repo.get(st.get("id"), UNSCOPED), "mtime": mt}
+            for st, kind, sid, mt in jobs_raw]
+
+    repos = []
+    for name, spec in registry.items():
+        rec = repo_state(name, spec, tokens_by_repo.get(name, 0))
+        if name == "home-infra" and rec["present"]:
+            rec["specs"] = home_infra_specs(rec["checkout"])
+        repos.append(rec)
+
+    try:
+        codex = read_codex(a.codex_dir, a.days, repos, now)
+    except Exception as e:
+        codex = []
+        errors.append(f"codex sessions unreadable: {e}")
+    state = {"schema": 1, "generated_at": now, "days": a.days, "repos": repos,
+             "conversations": conversations, "jobs": jobs, "tasks": tasks, "codex": codex,
+             "unscoped_tokens": unscoped, "errors": errors}
+
+    out_dir = os.path.dirname(os.path.abspath(a.out))
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=out_dir, prefix=".state-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, a.out)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    print(a.out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

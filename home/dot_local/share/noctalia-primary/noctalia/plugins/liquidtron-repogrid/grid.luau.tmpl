@@ -1,0 +1,2105 @@
+-- Repo Grid dropdown (FEAT-lt36 owner round 2): the git and agent view, attached under the centre PG42UQ bar.
+--
+-- Two views, OVERVIEW first:
+--   OVERVIEW  high-level summary tiles (repos, worktrees, specs, Conversations, Claude jobs, tokens, budgets), the agent
+--             DIAGRAM (repo -> Conversation -> subagent / Claude job, drawn with orthogonal connectors; connector
+--             thickness follows tokens) and a right rail with today's top token repos and the budgets nearest their limit.
+--   DETAILS   the full lists: AGENTS, REPOS (worktrees, specs), TODAY · TOKENS BY REPO, TASK BUDGETS.
+--
+-- Owner round 2 note: keep the diagram (main tab with the high-level summary, details second), highlights must go away
+-- when the pointer leaves, premium look, "maybe just do the borders". So every highlight is a border: rows, nodes,
+-- tiles and cards keep a constant fill, and hover / keyboard selection change only the hairline border colour.
+--
+-- Hover-clear rule: the Noctalia reconciler applies `fill` / `border` only when the prop is present. A render that drops
+-- the prop leaves the previous colour on screen, which is what kept highlights lit after the pointer left. Every
+-- highlightable node therefore always sends `border` (and a constant `fill`), with CLEAR or a rest colour at rest.
+--
+-- Data: `repo-grid-collect` (read-only collector, schema 1) on open and every 10 s while open; second ticks stop when the
+-- panel closes, so nothing runs at idle. The last snapshot is shown at once while the first refresh runs.
+-- Round 4: clicking (or Enter on) a DIAGRAM node no longer opens anything. It selects the node (EDGE_SELECT border) and
+-- the right rail turns into a STATE pane: kind glyph, title, status chip, a GO-TO glyph button and a CLOSE glyph button,
+-- then plain-English facts and sections from `repo-grid-collect --detail <key>` (JSON in chat is rendered as readable
+-- lines by the collector). The node's known title shows at once; the detail replaces it when the collector answers, and
+-- stale answers are dropped by request number. The pane refreshes on the 10 s tick while it is shown. CLOSE (x) brings
+-- the tokens and budgets rail back.
+-- GO-TO opens the object in the AI that owns it: Hermes -> `ares-summon --hermes`, Claude job -> `ares-summon --claude`,
+-- Codex -> `kitty codex resume`, repo -> `kitty` in its checkout. Enter on an already-selected node is GO-TO.
+-- DETAILS tab rows keep their direct-open behaviour: a Conversation or job resumes through `ares-summon`, a Codex
+-- session resumes in `kitty`, a worktree opens `kitty` there; summary tiles and "+N more" lines switch to DETAILS.
+-- Pop-out: a header glyph opens the grid as a free window (`panel-open liquidtron/repogrid:window`, lt14) and closes the
+-- dropdown. Window mode is `panel.isWindow ~= nil and panel.isWindow()`; on lt13 the API is nil, so it is always a
+-- dropdown. In window mode the pop-out glyph is hidden, PANEL_STATE_PATH is not written, the bar button is not told, and
+-- GO-TO leaves the window open.
+-- Keys: Left / Right switch view, Tab switches AGENTS / REPOS in DETAILS (OVERVIEW -> DETAILS in OVERVIEW), Up / Down
+-- move, Enter selects / opens, Esc closes (host). The panel itself has no fill: it inherits the shell panel material and glass.
+--
+-- Colour literals (everything else is a palette role):
+--   #ff8c00  amber (dirty / draft / budget >= 80 %)
+--   #00ff9f  green (live), #00ff9f73 its 45 % border
+--   #505060  dark (not checked out)
+--   #00000000 transparent (explicit "no highlight")
+
+local COLLECT = "{{ .chezmoi.homeDir }}/.local/bin/repo-grid-collect"
+local SUMMON = "{{ .chezmoi.homeDir }}/.local/bin/ares-summon"
+local MSG = "{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg"
+local STATE_PATH = "/run/user/1000/repo-grid/state.json"
+local COLLAPSE_DIR = "{{ .chezmoi.homeDir }}/.local/state/repo-grid"
+local COLLAPSE_PATH = COLLAPSE_DIR .. "/collapsed.json" -- persisted collapsed repo keys, shared by dropdown and window
+local PANEL_STATE_PATH = "/run/user/1000/repo-grid/panel" -- "open" / "closed", read by the repo-grid launcher
+local BUTTON = "liquidtron/repogrid:button"
+local UNSCOPED = "~unscoped"
+local REFRESH_EVERY_S = 10
+local STALE_S = 30
+local MAX_AGENT_ROWS = 48 -- rows in the DETAILS AGENTS list; the rest is summarised in a "+N more" line
+local MAX_KIDS = 6 -- subagents / jobs under one Conversation in DETAILS
+local MAX_TOPS = 5 -- Conversations per repo in the DIAGRAM
+local MAX_DIAGRAM_KIDS = 3 -- subagents / jobs per Conversation in the DIAGRAM
+local RAIL_ROWS = 6 -- rows per list in the OVERVIEW rail
+
+-- DETAILS geometry
+local W_REPOS = 540
+local W_BARS = 430
+local W_TOK = 120
+local W_AGENT_TEXT = 380 -- title / detail width at depth 0; nested rows lose their indent
+
+-- OVERVIEW geometry (panel 1680 wide, 22 padding: 1636 inner; rail 520 + gap 20 leaves 1096 for the diagram column).
+-- Round 7: a scroll well pads its content, and on a stock shell also reserves a 14 px scrollbar gutter (6 + 8 gap).
+-- Liquid Tron runs lt15 with `[shell] show_scrollbars = false` (scroll is implied, no bar, no gutter), but the widest
+-- diagram row still fits the gutter case, 1096 - 2 x (14 padding + 1 border) - 14 gutter - 2 x 14 content padding = 1024:
+-- chevron 28 + gap 8 + repo 226 + link 40 + Conversation 360 + link 40 + subagent 322 = 1024.
+local W_RAIL = 520
+local NODE_H = 54
+local ROW_GAP = 10
+local PITCH = NODE_H + ROW_GAP
+local PIN_FALLBACK_S = 25 -- show the rules brief when zgx-02 has not answered by then
+local RESYNTH_MIN_S = 60
+local WARM_MAX = 12
+local SYNTH_TIMEOUT_MS = 45000 -- runAsync defaults to 5 s; zgx-02 takes ~4-5 s plus a possible lock wait
+local W_CHEV = 28 -- collapse chevron button (square) at the left of every repo block
+local CHEV_GAP = 8 -- clear space between the chevron's hover frame and the repo pill
+local W_REPO_NODE = 226
+local W_CONV_NODE = 360
+local W_KID_NODE = 322
+local W_LINK = 40
+local LINK_LEAD = 14
+local TRUNK_W = 2
+
+-- STATE pane
+local W_FACT_LABEL = 118
+local WRAP_CHARS = 56 -- characters per wrapped body line at 13 px in the rail
+local MAX_SECTION_LINES = 30
+local INDENT_PX = 7 -- per leading space
+
+local AMBER = "#ff8c00"
+local GREEN = "#00ff9f"
+local DARK = "#505060"
+local CLEAR = "#00000000"
+local BLUE = "secondary"
+local RED = "error"
+local DIM = "on_surface_variant/0.72"
+local TONE = { live = GREEN, ok = "primary", warn = AMBER, error = RED, idle = DIM }
+
+-- Borders carry every highlight; fills never change with pointer or selection.
+local EDGE_REST = "on_surface/0.10" -- framed nodes, tiles and cards at rest
+local EDGE_HOVER = "primary/0.70"
+local EDGE_SELECT = "primary"
+local EDGE_LIVE = "#00ff9f73"
+local WELL = "on_surface/0.08" -- hairline round each scrolling list: rows clip inside a rounded frame
+local NODE_FILL = "surface_variant/0.30"
+local REPO_FILL = "surface_variant/0.46"
+local TILE_FILL = "surface_variant/0.22"
+local CARD_FILL = "surface_variant/0.38"
+local LINE_TRUNK = "primary/0.34"
+local LINE_CONV = "primary/0.62"
+local LINE_SUB = "secondary/0.75"
+local LINE_JOB = "primary/0.30"
+
+local isOpen = false
+local gen = 0 -- bumped on every open/close; stale async results are dropped
+local collecting = false
+local ticks = 0
+local st = nil
+local collectorError = false
+local wasStale = false
+local hovered = nil
+local tab = "overview"
+local pane = "agents"
+local agentIdx = 1
+local repoIdx = 1
+local diagIdx = 1
+local groups = {} -- repo -> Conversation -> kids tree
+local agents = {} -- flattened AGENTS rows (DETAILS)
+local agentActions = {} -- keys of actionable AGENTS rows, in order
+local diagram = {} -- capped tree drawn in OVERVIEW
+local diagramActions = {} -- keys of actionable diagram nodes, in order
+local actionByKey = {}
+local repoCards = {}
+local worktreeKeys = {} -- keys of worktree rows, in order
+local worktreePath = {} -- key -> path
+local bars = { tokens = {}, budgets = {} }
+local summary = nil
+local winMode = false -- true when running as a free window (lt14 `panel.isWindow()`); nil API on lt13
+local nodeInfo = {} -- key -> diagram item, for the STATE pane header while the detail loads
+local selKey = nil -- selected diagram node (its STATE pane is shown in the rail)
+local detail = nil -- latest `--detail` answer for selKey
+local detailError = false
+local detailReq = 0 -- bumped per request and on deselect; stale answers are dropped
+local detailBusy = false
+-- Pinned summary narrative (round 7): the prose of the STATE pane is pinned per selected key the first time it is shown
+-- and never replaced by itself. A newer brief waits in `pending` behind a "Newer summary · Show" pill.
+local pinned = nil -- brief table whose prose is on screen for selKey
+local pending = nil -- newer zgx-02 brief held back
+local pinStart = 0 -- when selKey was selected, for the 25 s fallback to the rules brief
+local briefReq = 0 -- bumped per selection and on deselect; stale answers are dropped
+local briefBusy = false -- a zgx-02 synthesis is running (footer: checking for newer...)
+local briefStamp = nil -- detail fingerprint the last synthesis was asked for
+local lastSynth = {} -- key -> time of the last synthesis request (re-ask at most once per 60 s)
+local collapsed = {} -- repo key -> true while its diagram block is folded
+local warmedGen = -1 -- open generation the background --warm already ran for
+local showDetails = false -- DETAILS (facts and full text) stay collapsed until the owner opens them
+
+local render -- forward
+
+-- ------------------------------------------------------------------ helpers
+local function fmt(n)
+  n = n or 0
+  if n >= 1e6 then
+    return string.format("%.1fM", n / 1e6)
+  elseif n >= 1e3 then
+    return string.format("%dk", math.floor(n / 1e3 + 0.5))
+  end
+  return tostring(math.floor(n))
+end
+
+local function age(secs)
+  secs = math.max(0, secs or 0)
+  if secs < 90 then
+    return string.format("%ds", math.floor(secs + 0.5))
+  elseif secs < 5400 then
+    return string.format("%dm", math.floor(secs / 60 + 0.5))
+  end
+  return string.format("%dh", math.floor(secs / 3600 + 0.5))
+end
+
+local function clip(s, n)
+  s = string.gsub(s or "", "%s+", " ")
+  local len = utf8.len(s)
+  if len == nil then
+    return string.sub(s, 1, n)
+  end
+  if len <= n then
+    return s
+  end
+  return string.sub(s, 1, utf8.offset(s, n) - 1) .. "…"
+end
+
+local function baseName(p)
+  return string.match(p or "", "([^/]+)/*$") or (p or "")
+end
+
+local function nowSec()
+  return noctalia.nowMs() / 1000
+end
+
+local function isStale()
+  return st ~= nil and (nowSec() - (st.generated_at or 0)) > STALE_S
+end
+
+local function onRowHover(state, key)
+  local nextKey = (state == "true" or state == true) and key or nil
+  if nextKey == "" then
+    nextKey = nil
+  end
+  if nextKey ~= hovered then
+    hovered = nextKey
+    render()
+  end
+end
+
+-- Border for a framed node (diagram node, tile, card): never nil, so leaving the pointer always repaints the rest colour.
+local function edge(key, selected, live)
+  if selected then
+    return EDGE_SELECT
+  elseif hovered == key then
+    return EDGE_HOVER
+  elseif live then
+    return EDGE_LIVE
+  end
+  return EDGE_REST
+end
+
+-- Border for a plain list row: invisible at rest, never nil.
+local function rowEdge(key, selected)
+  if selected then
+    return EDGE_SELECT
+  elseif hovered == key then
+    return EDGE_HOVER
+  end
+  return CLEAR
+end
+
+-- One connector segment. Empty segments are invisible (`opacity = 0`; a bare box draws a hairline); drawn segments set
+-- an explicit clear border so only the fill shows.
+local function seg(w, h, color)
+  if color == nil or color == CLEAR or h <= 0 then
+    return ui.box({ width = w, height = math.max(0, h), opacity = 0 })
+  end
+  return ui.box({ width = w, height = h, fill = color, border = CLEAR, borderWidth = 0 })
+end
+
+-- ------------------------------------------------------------------ model
+local function buildTree(s)
+  local out = {}
+  if s == nil then
+    return out
+  end
+  local convs = s.conversations or {}
+  local byId = {}
+  for _, c in ipairs(convs) do
+    byId[c.id] = c
+  end
+  local function topOf(c)
+    local guard = 0
+    while c.parent ~= nil and byId[c.parent] ~= nil and guard < 10 do
+      c = byId[c.parent]
+      guard += 1
+    end
+    return c
+  end
+  local kids, tops, topJobs = {}, {}, {}
+  for _, c in ipairs(convs) do
+    local t = topOf(c)
+    if t.id == c.id then
+      table.insert(tops, c)
+    else
+      kids[t.id] = kids[t.id] or {}
+      table.insert(kids[t.id], { kind = "conv", c = c, at = c.last_activity_at or 0 })
+    end
+  end
+  for _, j in ipairs(s.jobs or {}) do
+    if j.parent ~= nil and byId[j.parent] ~= nil then
+      local t = topOf(byId[j.parent])
+      kids[t.id] = kids[t.id] or {}
+      table.insert(kids[t.id], { kind = "job", j = j, at = j.mtime or 0 })
+    else
+      table.insert(topJobs, j)
+    end
+  end
+  table.sort(tops, function(a, b)
+    if (a.live == true) ~= (b.live == true) then
+      return a.live == true
+    end
+    return (a.last_activity_at or 0) > (b.last_activity_at or 0)
+  end)
+
+  local xs = {}
+  for _, x in ipairs(s.codex or {}) do
+    table.insert(xs, x)
+  end
+  table.sort(xs, function(a, b)
+    return (a.last_activity_at or 0) > (b.last_activity_at or 0)
+  end)
+  local order, present, byName = {}, {}, {}
+  local repoByName = {}
+  for _, r in ipairs(s.repos or {}) do
+    table.insert(order, r.name)
+    present[r.name] = true
+    repoByName[r.name] = r
+  end
+  local function group(name)
+    if byName[name] == nil then
+      byName[name] = { tops = {}, jobs = {}, xs = {} }
+      if not present[name] and name ~= UNSCOPED then
+        table.insert(order, name)
+        present[name] = true
+      end
+    end
+    return byName[name]
+  end
+  for _, c in ipairs(tops) do
+    table.insert(group(c.repo or UNSCOPED).tops, c)
+  end
+  for _, j in ipairs(topJobs) do
+    table.insert(group(j.repo or UNSCOPED).jobs, j)
+  end
+  for _, x in ipairs(xs) do
+    table.insert(group(x.repo or UNSCOPED).xs, x)
+  end
+  table.insert(order, UNSCOPED)
+
+  local maxTok = 1
+  for _, c in ipairs(convs) do
+    maxTok = math.max(maxTok, c.tokens or 0)
+  end
+  local gen_at = s.generated_at or nowSec()
+
+  local function convItem(c, depth)
+    local idle = c.last_activity_at and (gen_at - c.last_activity_at) or 0
+    return {
+      key = "c:" .. c.id, kind = depth > 1 and "sub" or "conv", depth = depth, live = c.live == true,
+      title = (c.title ~= nil and c.title ~= "") and c.title or string.sub(c.id, 1, 8),
+      sub = (c.source or "hermes") .. " · " .. (c.live and "live" or ("idle " .. age(idle))),
+      tokens = c.tokens or 0, frac = (c.tokens or 0) / maxTok,
+      action = { kind = "hermes", id = c.id },
+      go = { kind = "hermes", id = c.id, cwd = "{{ .chezmoi.homeDir }}" },
+    }
+  end
+  local function jobItem(j, depth, cwd)
+    local a = j.mtime and (gen_at - j.mtime) or 0
+    return {
+      key = "j:" .. j.id, kind = "job", depth = depth, live = a < 120,
+      title = (j.kind or "job") .. " " .. (j.task or string.sub(j.id, 1, 8)),
+      sub = "Claude " .. (j.kind or "job") .. " · " .. age(a) .. " ago",
+      tokens = nil, frac = 0,
+      action = { kind = "claude", id = j.id, cwd = cwd },
+      go = { kind = "claude", id = j.id, cwd = cwd },
+      badge = "Claude",
+    }
+  end
+  local function codexItem(x)
+    local idle = x.last_activity_at and (gen_at - x.last_activity_at) or 0
+    local act = { kind = "codex", id = x.id, cwd = x.cwd ~= nil and x.cwd ~= "" and x.cwd or "{{ .chezmoi.homeDir }}" }
+    return {
+      key = "x:" .. x.id, kind = "codex", depth = 1, live = x.live == true,
+      title = (x.title ~= nil and x.title ~= "") and x.title or string.sub(x.id, 1, 8),
+      sub = "codex · " .. (x.live and "live" or ("idle " .. age(idle))),
+      tokens = nil, frac = 0, action = act, go = act, badge = "Codex",
+    }
+  end
+
+  for _, name in ipairs(order) do
+    local grp = byName[name]
+    if grp ~= nil then
+      local rec = repoByName[name]
+      local cwd = rec and rec.checkout or "{{ .chezmoi.homeDir }}"
+      local tokensToday = rec and rec.tokens_today or s.unscoped_tokens or 0
+      local sub
+      if name == UNSCOPED then
+        sub = "no repo in cwd" -- the pill already shows the token count at its right edge
+      elseif rec ~= nil and rec.present then
+        sub = (rec.branch or "detached") .. " · " .. tostring(rec.dirty or 0) .. " changed · "
+          .. tostring(#(rec.worktrees or {})) .. " worktrees"
+      else
+        sub = "not checked out"
+      end
+      local head = { key = "r:" .. name, kind = "repo", depth = 0, live = false,
+        title = name == UNSCOPED and "~ UNSCOPED" or string.upper(name), sub = sub, tokens = tokensToday, frac = 0,
+        go = { kind = "kitty", id = name, cwd = (rec ~= nil and rec.present) and cwd or "{{ .chezmoi.homeDir }}" } }
+      local g = { head = head, tops = {} }
+      for _, c in ipairs(grp.tops) do
+        if c.live then
+          head.live = true
+        end
+        local node = { item = convItem(c, 1), kids = {} }
+        local list = kids[c.id] or {}
+        table.sort(list, function(a, b)
+          return a.at > b.at
+        end)
+        for _, kid in ipairs(list) do
+          if kid.kind == "conv" then
+            table.insert(node.kids, convItem(kid.c, 2))
+          else
+            table.insert(node.kids, jobItem(kid.j, 2, cwd))
+          end
+        end
+        table.insert(g.tops, node)
+      end
+      for _, x in ipairs(grp.xs) do
+        if x.live then
+          head.live = true
+        end
+        table.insert(g.tops, { item = codexItem(x), kids = {} })
+      end
+      for _, j in ipairs(grp.jobs) do
+        table.insert(g.tops, { item = jobItem(j, 1, cwd), kids = {} })
+      end
+      table.insert(out, g)
+    end
+  end
+  return out
+end
+
+-- DETAILS list: the tree flattened with indent depth, capped at MAX_AGENT_ROWS.
+local function flatten(tree)
+  local items, actions, hidden = {}, {}, 0
+  local function push(item)
+    if #items >= MAX_AGENT_ROWS then
+      hidden += 1
+      return false
+    end
+    table.insert(items, item)
+    if item.action ~= nil then
+      table.insert(actions, item.key)
+    end
+    return true
+  end
+  for _, g in ipairs(tree) do
+    if push(g.head) then
+      for _, t in ipairs(g.tops) do
+        push(t.item)
+        for k, kid in ipairs(t.kids) do
+          if k > MAX_KIDS then
+            hidden += #t.kids - MAX_KIDS
+            break
+          end
+          push(kid)
+        end
+      end
+    else
+      hidden += #g.tops
+    end
+  end
+  if hidden > 0 then
+    table.insert(items, { key = "more", kind = "more", depth = 0, title = "+" .. tostring(hidden) .. " more (older or nested)" })
+  end
+  return items, actions
+end
+
+-- OVERVIEW diagram: repos with agent activity, MAX_TOPS Conversations each, MAX_DIAGRAM_KIDS kids under each. A repo in
+-- `collapsed` keeps only its head node (and keyboard stop) plus counts for the one-line summary.
+local function buildDiagram(tree)
+  local out, actions = {}, {}
+  for _, g in ipairs(tree) do
+    if #g.tops > 0 then
+      local dg = { head = g.head, tops = {}, more = 0, collapsed = collapsed[g.head.key] == true,
+        sum = { convs = #g.tops, live = 0, subs = 0 } }
+      for _, t in ipairs(g.tops) do
+        if t.item.live then
+          dg.sum.live += 1
+        end
+        for _, kid in ipairs(t.kids) do
+          dg.sum.subs += 1
+          if kid.live then
+            dg.sum.live += 1
+          end
+        end
+      end
+      table.insert(actions, g.head.key)
+      if not dg.collapsed then
+        for i, t in ipairs(g.tops) do
+          if i > MAX_TOPS then
+            dg.more = #g.tops - MAX_TOPS
+            break
+          end
+          local dt = { item = t.item, kids = {}, more = 0 }
+          table.insert(actions, t.item.key)
+          for k, kid in ipairs(t.kids) do
+            if k > MAX_DIAGRAM_KIDS then
+              dt.more = #t.kids - MAX_DIAGRAM_KIDS
+              break
+            end
+            table.insert(dt.kids, kid)
+            table.insert(actions, kid.key)
+          end
+          table.insert(dg.tops, dt)
+        end
+      end
+      table.insert(out, dg)
+    end
+  end
+  return out, actions
+end
+
+local function buildRepos(s)
+  local cards, keys, paths = {}, {}, {}
+  if s == nil then
+    return cards, keys, paths
+  end
+  for _, r in ipairs(s.repos or {}) do
+    local status = {}
+    if not r.present then
+      table.insert(status, { text = "not checked out", color = DARK })
+    elseif r.error ~= nil then
+      table.insert(status, { text = "error", color = RED })
+    else
+      table.insert(status, { text = r.branch or "detached", color = "on_surface" })
+      if (r.dirty or 0) > 0 then
+        table.insert(status, { text = tostring(r.dirty) .. " changed", color = AMBER })
+      else
+        table.insert(status, { text = "clean", color = DIM })
+      end
+      if (r.ahead or 0) > 0 then
+        table.insert(status, { text = "+" .. tostring(r.ahead), color = "on_surface" })
+      end
+      if (r.behind or 0) > 0 then
+        table.insert(status, { text = "↓" .. tostring(r.behind), color = BLUE })
+      end
+    end
+    local rows = {}
+    for _, w in ipairs(r.worktrees or {}) do
+      if w.path ~= r.checkout then
+        local right, color
+        if w.prunable then
+          right, color = "prunable", RED
+        elseif (w.dirty or 0) > 0 then
+          right, color = tostring(w.dirty) .. " changed", AMBER
+        else
+          right, color = "clean", DIM
+        end
+        local key = "w:" .. w.path
+        table.insert(rows, { key = key, kind = "wt", label = w.branch or (baseName(w.path) .. " (detached)"),
+          right = right, color = color })
+        table.insert(keys, key)
+        paths[key] = w.path
+      end
+    end
+    for _, sp in ipairs(r.specs or {}) do
+      local color = DIM
+      if sp.status == "ready" then
+        color = BLUE
+      elseif sp.status == "draft" then
+        color = AMBER
+      end
+      table.insert(rows, { key = "s:" .. r.name .. ":" .. (sp.slug or "?"), kind = "spec", label = sp.slug or "?",
+        right = (sp.status or "") .. (sp.tier and (" · " .. sp.tier) or ""), color = color })
+    end
+    local meta = {}
+    if r.visibility then
+      table.insert(meta, r.visibility)
+    end
+    if r.role then
+      table.insert(meta, r.role)
+    end
+    table.insert(cards, { key = "rc:" .. r.name, name = r.name, meta = table.concat(meta, " · "), status = status,
+      rows = rows })
+  end
+  return cards, keys, paths
+end
+
+local function buildBars(s)
+  local res = { tokens = {}, budgets = {} }
+  if s == nil then
+    return res
+  end
+  local list = { { name = "~ unscoped", tokens = s.unscoped_tokens or 0, dim = true } }
+  for _, r in ipairs(s.repos or {}) do
+    if (r.tokens_today or 0) > 0 then
+      table.insert(list, { name = r.name, tokens = r.tokens_today, dim = false })
+    end
+  end
+  table.sort(list, function(a, b)
+    return a.tokens > b.tokens
+  end)
+  local top = math.max(1, list[1] and list[1].tokens or 1)
+  for _, e in ipairs(list) do
+    table.insert(res.tokens, { key = "t:" .. e.name, name = e.name, right = fmt(e.tokens), frac = e.tokens / top,
+      dim = e.dim })
+  end
+  for _, t in ipairs(s.tasks or {}) do
+    if (t.budget_tokens or 0) > 0 then
+      local f = math.min(1, (t.tokens_used or 0) / t.budget_tokens)
+      table.insert(res.budgets, { key = "b:" .. t.id, name = t.ref or t.title or t.id, title = t.title or "",
+        right = fmt(t.tokens_used) .. " / " .. fmt(t.budget_tokens) .. " · " .. tostring(math.floor(f * 100 + 0.5)) .. "%",
+        frac = f, hot = f >= 0.8 })
+    end
+  end
+  -- Closest to the limit first, so the tasks that matter stay in view.
+  table.sort(res.budgets, function(a, b)
+    return a.frac > b.frac
+  end)
+  return res
+end
+
+local function buildSummary(s)
+  if s == nil then
+    return nil
+  end
+  local sum = { repos = 0, dirtyRepos = 0, missing = 0, worktrees = 0, dirtyWt = 0, prunable = 0, specs = 0, ready = 0,
+    draft = 0, convs = 0, live = 0, subs = 0, jobs = 0, liveJobs = 0, tokens = s.unscoped_tokens or 0, topRepo = nil,
+    topTokens = 0, budgets = 0, hot = 0 }
+  for _, r in ipairs(s.repos or {}) do
+    sum.repos += 1
+    if not r.present then
+      sum.missing += 1
+    elseif (r.dirty or 0) > 0 then
+      sum.dirtyRepos += 1
+    end
+    for _, w in ipairs(r.worktrees or {}) do
+      if w.path ~= r.checkout then
+        sum.worktrees += 1
+        if w.prunable then
+          sum.prunable += 1
+        elseif (w.dirty or 0) > 0 then
+          sum.dirtyWt += 1
+        end
+      end
+    end
+    for _, sp in ipairs(r.specs or {}) do
+      sum.specs += 1
+      if sp.status == "ready" then
+        sum.ready += 1
+      elseif sp.status == "draft" then
+        sum.draft += 1
+      end
+    end
+    sum.tokens += r.tokens_today or 0
+    if (r.tokens_today or 0) > sum.topTokens then
+      sum.topTokens = r.tokens_today
+      sum.topRepo = r.name
+    end
+  end
+  for _, c in ipairs(s.conversations or {}) do
+    sum.convs += 1
+    if c.live then
+      sum.live += 1
+    end
+    if c.parent ~= nil then
+      sum.subs += 1
+    end
+  end
+  local gen_at = s.generated_at or nowSec()
+  for _, j in ipairs(s.jobs or {}) do
+    sum.jobs += 1
+    if j.mtime and (gen_at - j.mtime) < 120 then
+      sum.liveJobs += 1
+    end
+  end
+  for _, t in ipairs(s.tasks or {}) do
+    if (t.budget_tokens or 0) > 0 then
+      sum.budgets += 1
+      if (t.tokens_used or 0) / t.budget_tokens >= 0.8 then
+        sum.hot += 1
+      end
+    end
+  end
+  return sum
+end
+
+local function rebuild()
+  local keepKey = diagramActions[diagIdx]
+  groups = buildTree(st)
+  agents, agentActions = flatten(groups)
+  diagram, diagramActions = buildDiagram(groups)
+  actionByKey = {}
+  nodeInfo = {}
+  for _, g in ipairs(groups) do
+    nodeInfo[g.head.key] = g.head
+    for _, t in ipairs(g.tops) do
+      actionByKey[t.item.key] = t.item.action
+      nodeInfo[t.item.key] = t.item
+      for _, kid in ipairs(t.kids) do
+        actionByKey[kid.key] = kid.action
+        nodeInfo[kid.key] = kid
+      end
+    end
+  end
+  repoCards, worktreeKeys, worktreePath = buildRepos(st)
+  bars = buildBars(st)
+  summary = buildSummary(st)
+  agentIdx = math.max(1, math.min(agentIdx, #agentActions))
+  repoIdx = math.max(1, math.min(repoIdx, #worktreeKeys))
+  diagIdx = math.max(1, math.min(diagIdx, #diagramActions))
+  if keepKey ~= nil then
+    for i, k in ipairs(diagramActions) do
+      if k == keepKey then
+        diagIdx = i
+      end
+    end
+  end
+end
+
+-- Collapsed repos persist in COLLAPSE_PATH ({"collapsed":["r:name",...]}), written through a temp file and renamed in
+-- one step. Unknown keys are harmless: only repos present in the diagram look the set up.
+local function saveCollapsed()
+  local list = {}
+  for k, v in pairs(collapsed) do
+    if v then
+      table.insert(list, k)
+    end
+  end
+  table.sort(list)
+  noctalia.mkdirAll(COLLAPSE_DIR)
+  local tmp = COLLAPSE_PATH .. ".tmp"
+  if noctalia.writeFile(tmp, noctalia.json.encode({ collapsed = list }) .. "\n") then
+    noctalia.renameFile(tmp, COLLAPSE_PATH)
+  end
+end
+
+local function applyCollapsed(contents)
+  local ok, d = pcall(noctalia.json.decode, contents or "")
+  collapsed = {}
+  if ok and type(d) == "table" and type(d.collapsed) == "table" then
+    for _, k in ipairs(d.collapsed) do
+      if type(k) == "string" then
+        collapsed[k] = true
+      end
+    end
+  end
+end
+
+-- ------------------------------------------------------------------ data
+local function applyState(contents)
+  local ok, d = pcall(noctalia.json.decode, contents or "")
+  if ok and type(d) == "table" and d.schema == 1 then
+    st = d
+    rebuild()
+    return true
+  end
+  return false
+end
+
+local warmBriefs -- forward: defined with the brief pinning below
+
+local function readState(myGen, markError)
+  local queued = noctalia.readFileAsync(STATE_PATH, function(contents, _err)
+    if myGen ~= gen then
+      return
+    end
+    local good = contents ~= nil and applyState(contents)
+    if markError then
+      collectorError = not good
+    end
+    if good and warmedGen ~= gen then
+      warmedGen = gen
+      warmBriefs()
+    end
+    render()
+  end)
+  if not queued and markError then
+    collectorError = true
+    render()
+  end
+end
+
+local function collect()
+  if collecting then
+    return
+  end
+  collecting = true
+  local myGen = gen
+  noctalia.runAsync({ COLLECT, "--out", STATE_PATH }, function(result)
+    collecting = false
+    if myGen ~= gen then
+      return
+    end
+    if result.exitCode ~= 0 then
+      collectorError = true
+      render()
+      return
+    end
+    readState(myGen, true)
+  end)
+end
+
+-- ------------------------------------------------------------------ actions
+-- A dropdown closes after it opens something; a free window stays where the owner put it.
+local function closeAfterOpen()
+  if not winMode then
+    panel.close()
+  end
+end
+
+local function openWorktree(path)
+  if path == nil then
+    return
+  end
+  noctalia.runAsync({ "kitty", "--directory", path })
+  closeAfterOpen()
+end
+
+local function runAction(a)
+  if a == nil then
+    return
+  end
+  if a.kind == "hermes" then
+    noctalia.runAsync({ SUMMON, "--hermes", a.id })
+  elseif a.kind == "claude" then
+    noctalia.runAsync({ SUMMON, "--claude", a.id, a.cwd or "{{ .chezmoi.homeDir }}" })
+  elseif a.kind == "codex" then
+    noctalia.runAsync({ "kitty", "--directory", a.cwd or "{{ .chezmoi.homeDir }}", "codex", "resume", a.id })
+  else
+    noctalia.runAsync({ "kitty", "--directory", a.cwd or "{{ .chezmoi.homeDir }}" })
+  end
+  closeAfterOpen()
+end
+
+local function actionTip(a)
+  if a.kind == "hermes" then
+    return "Resume this Conversation"
+  elseif a.kind == "codex" then
+    return "Resume this Codex session"
+  end
+  return "Resume this Claude job"
+end
+
+-- Executive summary, pinned (round 7). The prose of a card is pinned per selected key the first time it is shown and is
+-- never replaced by itself, so a reader is not moved mid-sentence. Pin order: (a) any cached zgx-02 brief
+-- (`--brief KEY --cached-only`, <1 s, run right after select); (b) the fresh synthesis when it returns; (c) the rules
+-- brief only when synthesis fails or takes over PIN_FALLBACK_S. A newer brief that arrives afterwards waits in `pending`
+-- behind the "Newer summary · Show" pill. Short facts (chips, status, progress) stay live.
+local function briefSig(b)
+  return type(b) == "table" and (tostring(b.headline) .. "|" .. tostring(b.phase) .. "|" .. tostring(b.left_off) .. "|"
+    .. tostring(b.next) .. "|" .. tostring(b.needs_you) .. "|" .. tostring(b.highlights and #b.highlights) .. "|"
+    .. tostring(b.risks and #b.risks)) or ""
+end
+
+local function detailFp(d)
+  return d ~= nil and (tostring(d.status) .. "|" .. tostring(d.brief and d.brief.left_off) .. "|"
+    .. tostring(d.brief and d.brief.headline) .. "|" .. tostring(d.brief and d.brief.next)) or nil
+end
+
+-- A brief that is ready: pin it when nothing is pinned yet, otherwise hold it back when it reads differently.
+local function offerBrief(b)
+  if type(b) ~= "table" then
+    return
+  end
+  if pinned == nil then
+    pinned = b
+    pending = nil
+  elseif b.source == "zgx-02" and briefSig(b) ~= briefSig(pinned) then
+    pending = b
+  end
+end
+
+-- Pin the rules brief when zgx-02 failed, was off, or has not answered within PIN_FALLBACK_S.
+local function pinRules()
+  if pinned == nil and detail ~= nil and type(detail.brief) == "table" then
+    pinned = detail.brief
+  end
+end
+
+local function synthesise()
+  if selKey == nil or briefBusy then
+    return
+  end
+  local key, myGen, req = selKey, gen, briefReq
+  briefBusy = true
+  lastSynth[key] = nowSec()
+  briefStamp = detailFp(detail) or briefStamp
+  noctalia.runAsync({ COLLECT, "--brief", key }, function(result)
+    if myGen ~= gen or req ~= briefReq then
+      return
+    end
+    briefBusy = false
+    local ok, b = false, nil
+    if result.exitCode == 0 then
+      ok, b = pcall(noctalia.json.decode, result.stdout or "")
+    end
+    if ok and type(b) == "table" and b.key == key and type(b.brief) == "table" then
+      offerBrief(b.brief)
+    elseif pinned == nil then
+      pinRules()
+    end
+    render()
+  end, SYNTH_TIMEOUT_MS)
+end
+
+local function fetchCached()
+  if selKey == nil then
+    return
+  end
+  local key, myGen, req = selKey, gen, briefReq
+  noctalia.runAsync({ COLLECT, "--brief", key, "--cached-only" }, function(result)
+    if myGen ~= gen or req ~= briefReq then
+      return
+    end
+    local ok, b = false, nil
+    if result.exitCode == 0 then
+      ok, b = pcall(noctalia.json.decode, result.stdout or "")
+    end
+    local cached = ok and type(b) == "table" and b.key == key and b.cached == true and type(b.brief) == "table"
+    if cached then
+      offerBrief(b.brief)
+    end
+    if not (cached and b.fresh == true) then
+      synthesise() -- nothing cached or the cache is older than the item's activity: the result is pinned or held back
+    end
+    render()
+  end)
+end
+
+-- Ask for a re-synthesis when the item's activity changed: at most once per RESYNTH_MIN_S per key; it always lands in
+-- `pending` because something is already pinned.
+local function maybeResynth(d)
+  local fp = detailFp(d)
+  if briefStamp == nil then
+    briefStamp = fp
+    return
+  end
+  if fp ~= briefStamp and pinned ~= nil and not briefBusy and nowSec() - (lastSynth[selKey] or 0) >= RESYNTH_MIN_S then
+    synthesise()
+  end
+end
+
+-- Background warm-up on open: synthesise briefs for the visible diagram nodes (live first, at most WARM_MAX) so most
+-- clicks pin a cached brief at once.
+warmBriefs = function()
+  local live, rest = {}, {}
+  for _, k in ipairs(diagramActions) do
+    local it = nodeInfo[k]
+    table.insert(it ~= nil and it.live and live or rest, k)
+  end
+  local argv = { COLLECT, "--warm" }
+  for _, k in ipairs(live) do
+    if #argv < 2 + WARM_MAX then
+      table.insert(argv, k)
+    end
+  end
+  for _, k in ipairs(rest) do
+    if #argv < 2 + WARM_MAX then
+      table.insert(argv, k)
+    end
+  end
+  if #argv > 2 then
+    noctalia.runAsync(argv, function(_result) end, 60000)
+  end
+end
+
+-- STATE pane: selection and the asynchronous detail fetch.
+local function fetchDetail()
+  if selKey == nil then
+    return
+  end
+  detailReq += 1
+  local req, key, myGen = detailReq, selKey, gen
+  detailBusy = true
+  noctalia.runAsync({ COLLECT, "--detail", key }, function(result)
+    if myGen ~= gen or req ~= detailReq then
+      return
+    end
+    detailBusy = false
+    local ok, d = false, nil
+    if result.exitCode == 0 then
+      ok, d = pcall(noctalia.json.decode, result.stdout or "")
+    end
+    if ok and type(d) == "table" and d.key == key then
+      detail = d
+      detailError = false
+      if pinned == nil and not briefBusy and nowSec() - pinStart > PIN_FALLBACK_S then
+        pinRules()
+      end
+      maybeResynth(d)
+    else
+      detailError = true
+    end
+    render()
+  end)
+end
+
+local function toggleDetails()
+  showDetails = not showDetails
+  hovered = nil
+  render()
+end
+
+local function showPending()
+  if pending ~= nil then
+    pinned = pending
+    pending = nil
+  end
+  hovered = nil
+  render()
+end
+
+local function resetPin()
+  pinned = nil
+  pending = nil
+  pinStart = nowSec()
+  briefBusy = false
+  briefStamp = nil
+  briefReq += 1
+end
+
+local function selectKey(key)
+  if key ~= selKey then
+    selKey = key
+    detail = nil
+    detailError = false
+    resetPin()
+    showDetails = false
+    fetchCached()
+  end
+  for i, k in ipairs(diagramActions) do
+    if k == key then
+      diagIdx = i
+    end
+  end
+  hovered = nil
+  fetchDetail()
+  render()
+end
+
+local function clearSelection()
+  selKey = nil
+  detail = nil
+  detailError = false
+  detailReq += 1
+  detailBusy = false
+  resetPin()
+  hovered = nil
+  render()
+end
+
+local function toggleRepo(key)
+  if collapsed[key] then
+    collapsed[key] = nil
+  else
+    collapsed[key] = true
+  end
+  hovered = nil
+  rebuild()
+  saveCollapsed()
+  render()
+end
+
+local function setAllCollapsed(on)
+  collapsed = {}
+  if on then
+    for _, g in ipairs(groups) do
+      if #g.tops > 0 then
+        collapsed[g.head.key] = true
+      end
+    end
+  end
+  hovered = nil
+  rebuild()
+  saveCollapsed()
+  render()
+end
+
+local function goTarget()
+  if selKey == nil then
+    return nil
+  end
+  if detail ~= nil and detail.key == selKey and type(detail.open) == "table" then
+    return { kind = detail.open.kind, id = detail.open.id, cwd = detail.open.cwd }
+  end
+  local it = nodeInfo[selKey]
+  return it ~= nil and it.go or nil
+end
+
+local function goToSelected()
+  runAction(goTarget())
+end
+
+local function popOut()
+  noctalia.runAsync({ MSG, "panel-open", "liquidtron/repogrid:window", "window" })
+  panel.close()
+end
+
+local function setTab(id)
+  if tab ~= id then
+    tab = id
+    hovered = nil
+    render()
+  end
+end
+
+-- ------------------------------------------------------------------ view: shared
+local function sectionHead(key, title, note)
+  return ui.row({ key = key, gap = 10, align = "center", paddingH = 4 }, {
+    ui.label({ text = title, fontSize = 13.5, fontWeight = "bold", color = "primary" }),
+    ui.label({ text = note or "", fontSize = 12, color = DIM, maxLines = 1, flexGrow = 1 }),
+  })
+end
+
+local KIND_GLYPH = { repo = "folder-code", conv = "message-circle", sub = "subtask", job = "robot", codex = "terminal-2",
+  more = "dots" }
+local KIND_COLOR = { repo = "primary", conv = "primary", sub = BLUE, job = "primary", codex = "primary", more = DIM }
+local GO_TIP = { hermes = "Open in Hermes", claude = "Open in Claude Code", codex = "Open in Codex", kitty = "Open in terminal" }
+local GO_GLYPH = "arrow-up-right"
+
+local function barRow(e, color)
+  return ui.column({ key = e.key, gap = 5, paddingH = 10, paddingV = 6, radius = 8, fill = CLEAR,
+    border = rowEdge(e.key, false), borderWidth = 1, onHover = onRowHover,
+    tooltip = (e.title ~= nil and e.title ~= "") and e.title or nil }, {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = clip(e.name, 30), fontSize = 13.5, color = e.dim and DIM or "on_surface", maxLines = 1,
+        maxWidth = W_BARS - 230, flexGrow = 1 }),
+      ui.label({ text = e.right, fontSize = 12.5, color = DIM, maxLines = 1 }),
+    }),
+    ui.progress({ progress = math.max(0.01, e.frac or 0), height = 5, radius = 2.5, fill = color,
+      track = "on_surface/0.08" }),
+  })
+end
+
+local function tokenColor(e)
+  return e.dim and "on_surface/0.35" or "primary"
+end
+
+local function budgetColor(e)
+  return e.frac >= 1 and RED or (e.hot and AMBER or BLUE)
+end
+
+local function tabChip(id, glyph, text)
+  local active = tab == id
+  local key = "tab-" .. id
+  local border = EDGE_REST
+  if active then
+    border = EDGE_SELECT
+  elseif hovered == key then
+    border = EDGE_HOVER
+  end
+  return ui.row({ key = key, gap = 8, align = "center", paddingH = 14, paddingV = 7, radius = 9, fill = CLEAR,
+    border = border, borderWidth = 1, onHover = onRowHover, tooltip = active and nil or ("Show " .. text),
+    onClick = function()
+      setTab(id)
+    end }, {
+    ui.glyph({ name = glyph, size = 16, color = active and "primary" or DIM }),
+    ui.label({ text = text, fontSize = 13.5, fontWeight = "bold", color = active and "primary" or "on_surface" }),
+  })
+end
+
+-- ------------------------------------------------------------------ view: OVERVIEW
+local function tile(key, glyph, caption, value, note, noteColor)
+  return ui.column({ key = key, flexGrow = 1, gap = 4, paddingH = 16, paddingV = 12, radius = 12, fill = TILE_FILL,
+    border = edge(key, false, false), borderWidth = 1, onHover = onRowHover, tooltip = "Open DETAILS",
+    onClick = function()
+      setTab("details")
+    end }, {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.glyph({ name = glyph, size = 16, color = "primary" }),
+      ui.label({ text = caption, fontSize = 12, fontWeight = "bold", color = DIM, maxLines = 1 }),
+    }),
+    ui.label({ text = value, fontSize = 28, fontWeight = "bold", color = "on_surface", maxLines = 1 }),
+    ui.label({ text = note, fontSize = 12.5, color = noteColor or DIM, maxLines = 1, maxWidth = 200 }),
+  })
+end
+
+local function tiles()
+  local s = summary
+  if s == nil then
+    return ui.row({ key = "tiles", gap = 12 }, {
+      tile("k:none", "loader-2", "SNAPSHOT", "…", collectorError and "No snapshot yet." or "Collecting…"),
+    })
+  end
+  local repoNote = tostring(s.dirtyRepos) .. " with changes"
+  if s.missing > 0 then
+    repoNote = repoNote .. " · " .. tostring(s.missing) .. " absent"
+  end
+  local wtNote = tostring(s.dirtyWt) .. " changed · " .. tostring(s.prunable) .. " prunable"
+  local specNote = tostring(s.ready) .. " ready · " .. tostring(s.draft) .. " draft"
+  local convNote = tostring(s.live) .. " live · " .. tostring(s.subs) .. " subagents"
+  local jobNote = tostring(s.liveJobs) .. " active in 2 min"
+  local tokNote = s.topRepo and ("top " .. s.topRepo .. " " .. fmt(s.topTokens)) or "no repo usage yet"
+  local budNote = tostring(s.hot) .. " at 80 % or more"
+  return ui.row({ key = "tiles", gap = 12 }, {
+    tile("k:repos", "folder-code", "REPOS", tostring(s.repos), repoNote, s.dirtyRepos > 0 and AMBER or DIM),
+    tile("k:wt", "git-branch", "WORKTREES", tostring(s.worktrees), wtNote, s.prunable > 0 and RED or DIM),
+    tile("k:specs", "file-description", "SPECS", tostring(s.specs), specNote),
+    tile("k:convs", "message-circle", "CONVERSATIONS", tostring(s.convs), convNote, s.live > 0 and GREEN or DIM),
+    tile("k:jobs", "robot", "CLAUDE JOBS", tostring(s.jobs), jobNote, s.liveJobs > 0 and GREEN or DIM),
+    tile("k:tokens", "coins", "TOKENS TODAY", fmt(s.tokens), tokNote),
+    tile("k:budgets", "gauge", "TASK BUDGETS", tostring(s.budgets), budNote, s.hot > 0 and AMBER or DIM),
+  })
+end
+
+local function lineColor(it)
+  if it.kind == "sub" then
+    return LINE_SUB
+  elseif it.kind == "job" then
+    return LINE_JOB
+  end
+  return LINE_CONV
+end
+
+local function lineThickness(it)
+  if it.kind == "job" then
+    return 2
+  end
+  return 2 + math.floor(3 * (it.frac or 0) + 0.5)
+end
+
+-- Orthogonal connector cell left of one child: a lead from the parent (first child only), the shared trunk (from the
+-- top unless first, down to the bottom unless last) and a stub into the child, at the child node's mid-height.
+-- Every segment is a fixed-size box, so the drawing does not depend on flex sizing.
+local function link(key, first, last, height, color, thick)
+  local top = math.floor(NODE_H / 2 - thick / 2)
+  local stubW = W_LINK - LINK_LEAD - TRUNK_W
+  local below = height - top - thick
+  return ui.row({ key = key, width = W_LINK, height = height, gap = 0, align = "start" }, {
+    ui.column({ width = LINK_LEAD, gap = 0 }, {
+      seg(LINK_LEAD, top, CLEAR),
+      seg(LINK_LEAD, thick, first and color or CLEAR),
+    }),
+    ui.column({ width = TRUNK_W, gap = 0 }, {
+      seg(TRUNK_W, top, first and CLEAR or LINE_TRUNK),
+      seg(TRUNK_W, thick, color),
+      seg(TRUNK_W, below, last and CLEAR or LINE_TRUNK),
+    }),
+    ui.column({ width = stubW, gap = 0 }, {
+      seg(stubW, top, CLEAR),
+      seg(stubW, thick, color),
+    }),
+  })
+end
+
+local function diagramNode(it, width)
+  local key = "d" .. it.key
+  local selected = tab == "overview" and it.go ~= nil and (selKey == it.key or diagramActions[diagIdx] == it.key)
+  local isRepo = it.kind == "repo"
+  local textW = width - (isRepo and 112 or 130)
+  local right
+  if isRepo then
+    right = ui.column({ width = 52, align = "end" }, {
+      ui.label({ text = fmt(it.tokens), fontSize = 13, color = "on_surface" }),
+      ui.label({ text = "today", fontSize = 11.5, color = DIM }),
+    })
+  elseif it.badge ~= nil then
+    right = ui.column({ width = 64, align = "end" }, { ui.label({ text = it.badge, fontSize = 12, color = DIM }) })
+  else
+    right = ui.column({ width = 64, gap = 5, align = "end" }, {
+      ui.label({ text = fmt(it.tokens), fontSize = 13, color = "on_surface" }),
+      ui.progress({ progress = math.max(0.03, it.frac or 0), width = 56, height = 3, radius = 1.5,
+        fill = it.kind == "sub" and BLUE or "primary", track = "on_surface/0.08" }),
+    })
+  end
+  local props = { key = key, width = width, height = NODE_H, gap = 10, align = "center", paddingH = 12, radius = 10,
+    fill = isRepo and REPO_FILL or NODE_FILL, border = edge(key, selected, it.live), borderWidth = 1,
+    onHover = onRowHover }
+  if it.go ~= nil then
+    local key0 = it.key
+    props.onClick = function()
+      selectKey(key0)
+    end
+    props.tooltip = "Show its latest state"
+  end
+  return ui.row(props, {
+    ui.glyph({ name = KIND_GLYPH[it.kind] or "point", size = isRepo and 18 or 16,
+      color = it.live and GREEN or (KIND_COLOR[it.kind] or "primary") }),
+    ui.column({ gap = 2, flexGrow = 1 }, {
+      ui.label({ text = clip(it.title, math.floor(textW / (isRepo and 7.6 or 8))), fontSize = isRepo and 15 or 14, fontWeight = "semibold",
+        color = isRepo and "primary" or "on_surface", maxLines = 1, maxWidth = textW }),
+      ui.label({ text = clip(it.sub or "", math.floor(textW / (isRepo and 7.4 or 7.8))), fontSize = 12, color = DIM, maxLines = 1,
+        maxWidth = textW }),
+    }),
+    right,
+  })
+end
+
+local function moreNode(key, width, n, what)
+  return ui.row({ key = key, width = width, height = NODE_H - 14, gap = 8, align = "center", paddingH = 12, radius = 10,
+    fill = CLEAR, border = hovered == key and EDGE_HOVER or WELL, borderWidth = 1, onHover = onRowHover,
+    tooltip = "Show everything in DETAILS", onClick = function()
+      setTab("details")
+    end }, {
+    ui.glyph({ name = "dots", size = 14, color = DIM }),
+    ui.label({ text = "+" .. tostring(n) .. " more " .. what .. " · DETAILS", fontSize = 12.5, color = DIM, maxLines = 1,
+      maxWidth = width - 50 }),
+  })
+end
+
+-- Rows a top node's block occupies: its kids (and their "+N" line), at least one.
+local function blockRows(dt)
+  local n = #dt.kids
+  if dt.more > 0 then
+    n += 1
+  end
+  return math.max(1, n)
+end
+
+local function kidColumn(dt)
+  local rows = {}
+  local count = #dt.kids + (dt.more > 0 and 1 or 0)
+  for i, kid in ipairs(dt.kids) do
+    table.insert(rows, ui.row({ key = "kr:" .. kid.key, height = PITCH, gap = 0, align = "start" }, {
+      link("kl:" .. kid.key, i == 1, i == count, PITCH, lineColor(kid), lineThickness(kid)),
+      diagramNode(kid, W_KID_NODE),
+    }))
+  end
+  if dt.more > 0 then
+    local mk = "km:" .. dt.item.key
+    table.insert(rows, ui.row({ key = mk .. "-r", height = PITCH, gap = 0, align = "start" }, {
+      link(mk .. "-l", count == 1, true, PITCH, LINE_TRUNK, 2),
+      moreNode(mk, W_KID_NODE, dt.more, "under it"),
+    }))
+  end
+  return ui.column({ key = "kc:" .. dt.item.key, gap = 0 }, rows)
+end
+
+-- Collapse chevron at the left of a repo block: a square button centred on the repo pill, DIM glyph, a border only
+-- while the pointer is over it, and CHEV_GAP of clear space so its hover frame never touches the pill (owner round 8).
+local function chevronCell(dg)
+  local key = "ch:" .. dg.head.key
+  local hk = dg.head.key
+  return ui.row({ key = "chw:" .. dg.head.key, width = W_CHEV, height = NODE_H, gap = 0, align = "center",
+    justify = "center" }, {
+    ui.row({ key = key, width = W_CHEV, height = W_CHEV, gap = 0, align = "center", justify = "center", radius = 8,
+      fill = CLEAR, border = rowEdge(key, false), borderWidth = 1, onHover = onRowHover,
+      tooltip = dg.collapsed and "Show this repo's Conversations" or "Collapse this repo", onClick = function()
+        toggleRepo(hk)
+      end }, {
+      ui.glyph({ name = dg.collapsed and "chevron-right" or "chevron-down", size = 16, color = DIM }),
+    }),
+  })
+end
+
+-- Collapsed repo: one node-height line to the right of the repo node; clicking it expands. It spans the whole width
+-- the expanded block would use (owner round 8: at 360 px the counts overflowed the pill), so the worst case
+-- "999 Conversations · 99 live · 999 subagents / jobs · 999.9M today" (about 545 px at 13 px mono) fits inside.
+local W_COLLAPSED_LINE = W_LINK + W_CONV_NODE + W_LINK + W_KID_NODE - 12
+local function collapsedLine(dg)
+  local key = "cs:" .. dg.head.key
+  local hk = dg.head.key
+  local s0 = dg.sum
+  local w = W_COLLAPSED_LINE
+  local parts = {
+    ui.label({ text = tostring(s0.convs) .. (s0.convs == 1 and " Conversation" or " Conversations"), fontSize = 13,
+      color = "on_surface", maxLines = 1 }),
+  }
+  local function add(text, color)
+    table.insert(parts, ui.label({ text = "·", fontSize = 13, color = DIM }))
+    table.insert(parts, ui.label({ text = text, fontSize = 13, color = color, maxLines = 1 }))
+  end
+  add(tostring(s0.live) .. " live", s0.live > 0 and GREEN or DIM)
+  add(tostring(s0.subs) .. " subagents / jobs", "on_surface")
+  add(fmt(dg.head.tokens) .. " today", "on_surface")
+  return ui.row({ key = key, width = w, height = NODE_H, gap = 8, align = "center", paddingH = 14, radius = 10, fill = CLEAR,
+    border = hovered == key and EDGE_HOVER or WELL, borderWidth = 1, onHover = onRowHover,
+    tooltip = "Show this repo's Conversations", onClick = function()
+      toggleRepo(hk)
+    end }, parts)
+end
+
+local function groupBlock(dg)
+  local head = ui.row({ key = "gh:" .. dg.head.key, gap = CHEV_GAP, align = "start" }, {
+    chevronCell(dg),
+    diagramNode(dg.head, W_REPO_NODE),
+  })
+  if dg.collapsed then
+    local line = collapsedLine(dg)
+    return ui.row({ key = "g:" .. dg.head.key, gap = 12, align = "start" }, { head, line })
+  end
+  local rows = {}
+  local count = #dg.tops + (dg.more > 0 and 1 or 0)
+  for i, dt in ipairs(dg.tops) do
+    local h = blockRows(dt) * PITCH
+    local cells = {
+      link("tl:" .. dt.item.key, i == 1, i == count, h, lineColor(dt.item), lineThickness(dt.item)),
+      diagramNode(dt.item, W_CONV_NODE),
+    }
+    if #dt.kids > 0 or dt.more > 0 then
+      table.insert(cells, kidColumn(dt))
+    end
+    table.insert(rows, ui.row({ key = "tr:" .. dt.item.key, height = h, gap = 0, align = "start" }, cells))
+  end
+  if dg.more > 0 then
+    local mk = "gm:" .. dg.head.key
+    table.insert(rows, ui.row({ key = mk .. "-r", height = PITCH, gap = 0, align = "start" }, {
+      link(mk .. "-l", count == 1, true, PITCH, LINE_TRUNK, 2),
+      moreNode(mk, W_CONV_NODE, dg.more, "Conversations"),
+    }))
+  end
+  return ui.row({ key = "g:" .. dg.head.key, gap = 0, align = "start" }, {
+    head,
+    ui.column({ key = "gc:" .. dg.head.key, gap = 0 }, rows),
+  })
+end
+
+local function legendSwatch(color, thick, text)
+  return ui.row({ gap = 6, align = "center" }, {
+    seg(22, thick, color),
+    ui.label({ text = text, fontSize = 12, color = DIM }),
+  })
+end
+
+-- ------------------------------------------------------------------ view: STATE pane (right rail)
+-- Greedy word wrap to `n` characters; blank lines are kept as paragraph gaps.
+local function wrapText(text, n)
+  local out = {}
+  for line in string.gmatch(text .. "\n", "(.-)\n") do
+    local lead = string.match(line, "^( *)") or ""
+    local body = string.sub(line, #lead + 1)
+    if body == "" then
+      table.insert(out, "")
+    else
+      local cur = ""
+      for word in string.gmatch(body, "%S+") do
+        if cur == "" then
+          cur = word
+        elseif #lead + #cur + 1 + #word <= n then
+          cur = cur .. " " .. word
+        else
+          table.insert(out, lead .. cur)
+          cur = word
+        end
+        while #lead + #cur > n and #cur > 8 do
+          table.insert(out, lead .. string.sub(cur, 1, n - #lead))
+          cur = string.sub(cur, n - #lead + 1)
+        end
+      end
+      if cur ~= "" then
+        table.insert(out, lead .. cur)
+      end
+    end
+  end
+  return out
+end
+
+-- One wrapped body line; leading spaces become a fixed indent box (ui.spacer is a flex filler).
+local function bodyLine(key, text)
+  local lead = #(string.match(text, "^( *)") or "")
+  local label = ui.label({ text = string.sub(text, lead + 1), fontSize = 13, color = "on_surface", maxLines = 1,
+    maxWidth = 470 - lead * INDENT_PX, flexGrow = 1 })
+  if lead == 0 then
+    return ui.row({ key = key }, { label })
+  end
+  return ui.row({ key = key }, { ui.box({ width = lead * INDENT_PX, height = 1, opacity = 0 }), label })
+end
+
+local function stateHeader(info, d)
+  local title = d ~= nil and d.title or (info ~= nil and info.title or selKey)
+  local kind = d ~= nil and d.kind or (info ~= nil and info.kind or "repo")
+  local tone = d ~= nil and d.status_tone or "idle"
+  local status = d ~= nil and d.status or "Loading…"
+  local target = goTarget()
+  local tip = target ~= nil and (GO_TIP[target.kind] or "Open") or "Nothing to open"
+  local row = {
+    ui.glyph({ name = KIND_GLYPH[kind] or "point", size = 20, color = KIND_COLOR[kind] or "primary" }),
+    ui.label({ text = clip(title or "", 34), fontSize = 15, fontWeight = "bold", maxLines = 1, maxWidth = 250,
+      flexGrow = 1 }),
+    ui.row({ key = "st-chip", gap = 6, align = "center", padding = 4, paddingH = 10, radius = 12, border = TONE[tone] or DIM,
+      borderWidth = 1, fill = NODE_FILL }, {
+      ui.label({ text = clip(status, 16), fontSize = 12, fontWeight = "bold", color = TONE[tone] or DIM, maxLines = 1,
+        maxWidth = 110 }),
+    }),
+    ui.button({ key = "st-go", glyph = GO_GLYPH, variant = "ghost", controlSize = "sm", tooltip = tip,
+      enabled = target ~= nil, onClick = goToSelected }),
+    ui.button({ key = "st-close", glyph = "x", variant = "ghost", controlSize = "sm",
+      tooltip = "Back to tokens and budgets", onClick = clearSelection }),
+  }
+  return ui.row({ key = "st-head", gap = 8, align = "center" }, row)
+end
+
+-- Executive summary pieces. Every card uses a constant fill and a constant rest border; only the left accent bar and
+-- text carry colour, so nothing here depends on the pointer.
+local W_CARD_TEXT = 430 -- text width inside a card (rail 520 - well padding 24 - accent 4 - card padding 2 x 10 - slack)
+local LH = 1.4 -- line height factor used to size accent bars
+
+local function lineBlock(keyPrefix, text, fontSize, color, weight, chars)
+  local lines = wrapText(text, chars)
+  local out = {}
+  for i, ln in ipairs(lines) do
+    table.insert(out, ui.label({ key = keyPrefix .. i, text = ln == "" and " " or ln, fontSize = fontSize, color = color,
+      fontWeight = weight, maxLines = 1, maxWidth = W_CARD_TEXT }))
+  end
+  return out, #lines
+end
+
+-- A labelled card with a left accent bar: glyph + small caps label, then the wrapped text.
+local function infoCard(key, glyph, label, text, accent, chars)
+  local lines, n = lineBlock(key .. "-t", text, 13.5, "on_surface", nil, chars or 50)
+  local body = { ui.row({ key = key .. "-h", gap = 6, align = "center" }, {
+    ui.glyph({ name = glyph, size = 14, color = accent }),
+    ui.label({ text = label, fontSize = 11.5, fontWeight = "bold", color = accent }),
+  }) }
+  for _, l in ipairs(lines) do
+    table.insert(body, l)
+  end
+  local h = 16 + 14 * LH + 4 + n * 13.5 * LH + 6
+  return ui.row({ key = key, gap = 0, align = "start", radius = 10, fill = CARD_FILL, border = EDGE_REST, borderWidth = 1 }, {
+    ui.box({ key = key .. "-bar", width = 4, height = math.floor(h), fill = accent, border = CLEAR, borderWidth = 0 }),
+    ui.box({ width = 10, height = 1, opacity = 0 }),
+    ui.column({ key = key .. "-c", gap = 3, paddingV = 8 }, body),
+  })
+end
+
+local function chipRows(chips)
+  local rows, cur, curW = {}, {}, 0
+  local function flush()
+    if #cur > 0 then
+      table.insert(rows, ui.row({ key = "st-chips" .. #rows, gap = 6, align = "center" }, cur))
+    end
+    cur, curW = {}, 0
+  end
+  for i, c in ipairs(chips or {}) do
+    local text = clip(tostring(c.text or ""), 22)
+    local w = utf8.len(text) * 7 + 24
+    if curW + w > 440 and #cur > 0 then
+      flush()
+    end
+    local tone = TONE[c.tone or "idle"] or DIM
+    table.insert(cur, ui.row({ key = "st-chip" .. i, padding = 3, paddingH = 9, radius = 11, border = tone,
+      borderWidth = 1, fill = NODE_FILL }, {
+      ui.label({ text = text, fontSize = 11.5, color = tone, maxLines = 1, maxWidth = 200 }),
+    }))
+    curW = curW + w + 6
+  end
+  flush()
+  return rows
+end
+
+local function bulletList(key, items, color, dotColor)
+  local out = {}
+  for i, t in ipairs(items) do
+    local lines = wrapText(tostring(t), 50)
+    local col = {}
+    for j, ln in ipairs(lines) do
+      table.insert(col, ui.label({ key = key .. i .. "-" .. j, text = ln, fontSize = 13, color = color, maxLines = 1,
+        maxWidth = W_CARD_TEXT - 22 }))
+    end
+    table.insert(out, ui.row({ key = key .. i, gap = 8, align = "start" }, {
+      ui.glyph({ name = "point-filled", size = 10, color = dotColor }),
+      ui.column({ gap = 1 }, col),
+    }))
+  end
+  return out
+end
+
+local function sinceText(t)
+  local s = math.max(0, nowSec() - (tonumber(t) or 0))
+  if s < 45 then
+    return "just now"
+  elseif s < 5400 then
+    return string.format("%d min ago", math.floor(s / 60 + 0.5))
+  end
+  return string.format("%d h ago", math.floor(s / 3600 + 0.5))
+end
+
+-- Dim rounded bars standing in for text that is not decided yet (no words that could later change).
+local function skeletonBar(key, w, h)
+  return ui.box({ key = key, width = w, height = h, radius = h / 2, fill = "on_surface/0.10", border = CLEAR,
+    borderWidth = 0 })
+end
+
+local function skeletonCard(key, label, glyph, accent, widths)
+  local body = { ui.row({ key = key .. "-h", gap = 6, align = "center" }, {
+    ui.glyph({ name = glyph, size = 14, color = accent }),
+    ui.label({ text = label, fontSize = 11.5, fontWeight = "bold", color = accent }),
+  }) }
+  for i, w in ipairs(widths) do
+    table.insert(body, skeletonBar(key .. "-b" .. i, w, 10))
+  end
+  local h = 16 + 14 * LH + 3 + #widths * 13 + 14
+  return ui.row({ key = key, gap = 0, align = "start", radius = 10, fill = CARD_FILL, border = EDGE_REST, borderWidth = 1 }, {
+    ui.box({ key = key .. "-bar", width = 4, height = math.floor(h), fill = accent, border = CLEAR, borderWidth = 0 }),
+    ui.box({ width = 10, height = 1, opacity = 0 }),
+    ui.column({ key = key .. "-c", gap = 3, paddingV = 8 }, body),
+  })
+end
+
+-- Short facts (chips, progress) may change live; the prose below comes from `b`, the pinned brief (nil = skeleton).
+local function progressRow(p)
+  return ui.row({ key = "st-prog", gap = 10, align = "center" }, {
+    ui.progress({ progress = math.max(0.02, math.min(1, (p.done or 0) / p.total)), width = 250, height = 6, radius = 3,
+      fill = "primary", track = "on_surface/0.10" }),
+    ui.label({ text = tostring(p.label or ""), fontSize = 12, color = DIM, maxLines = 1, maxWidth = 170 }),
+  })
+end
+
+local function summaryKids(d, b)
+  local kids = {}
+  for _, r in ipairs(chipRows(d.chips)) do
+    table.insert(kids, r)
+  end
+  local p = type(d.brief) == "table" and d.brief.progress or nil
+  if b == nil then
+    local head = { skeletonBar("st-hl-sk1", 360, 16), skeletonBar("st-hl-sk2", 230, 16),
+      ui.label({ key = "st-wait-sum", text = "zgx-02 is writing the summary…", fontSize = 12, color = DIM, maxLines = 1,
+        maxWidth = W_CARD_TEXT }) }
+    if type(p) == "table" and (p.total or 0) > 0 then
+      table.insert(head, progressRow(p))
+    end
+    table.insert(kids, ui.column({ key = "st-headline", gap = 8, padding = 12, radius = 10, fill = CARD_FILL,
+      border = EDGE_REST, borderWidth = 1 }, head))
+    table.insert(kids, skeletonCard("st-left", "WHERE IT LEFT OFF", "map-pin", "primary", { 400, 360, 210 }))
+    table.insert(kids, skeletonCard("st-next", "NEXT", "player-track-next", BLUE, { 380, 250 }))
+    return kids
+  end
+  -- HEADLINE card
+  local hl = lineBlock("st-hl", tostring(b.headline or ""), 16, "on_surface", "bold", 38)
+  local head = {}
+  for _, l in ipairs(hl) do
+    table.insert(head, l)
+  end
+  if b.phase ~= nil and b.phase ~= "" then
+    table.insert(head, ui.label({ key = "st-phase", text = string.upper(clip(b.phase, 44)), fontSize = 11.5,
+      fontWeight = "bold", color = "primary", maxLines = 1, maxWidth = W_CARD_TEXT }))
+  end
+  if type(p) == "table" and (p.total or 0) > 0 then
+    table.insert(head, progressRow(p))
+  end
+  table.insert(kids, ui.column({ key = "st-headline", gap = 5, padding = 12, radius = 10, fill = CARD_FILL,
+    border = EDGE_REST, borderWidth = 1 }, head))
+  table.insert(kids, infoCard("st-left", "map-pin", "WHERE IT LEFT OFF", tostring(b.left_off or ""), "primary"))
+  table.insert(kids, infoCard("st-next", "player-track-next", "NEXT", tostring(b.next or ""), BLUE))
+  if type(b.needs_you) == "string" and b.needs_you ~= "" then
+    table.insert(kids, infoCard("st-needs", "alert-triangle", "NEEDS YOU", b.needs_you, AMBER))
+  end
+  if type(b.highlights) == "table" and #b.highlights > 0 then
+    table.insert(kids, ui.label({ key = "st-kp-h", text = "KEY POINTS", fontSize = 11.5, fontWeight = "bold",
+      color = "primary" }))
+    for _, r in ipairs(bulletList("st-kp", b.highlights, "on_surface", "primary")) do
+      table.insert(kids, r)
+    end
+  end
+  if type(b.risks) == "table" and #b.risks > 0 then
+    table.insert(kids, ui.label({ key = "st-rk-h", text = "RISKS", fontSize = 11.5, fontWeight = "bold", color = AMBER }))
+    for _, r in ipairs(bulletList("st-rk", b.risks, AMBER, AMBER)) do
+      table.insert(kids, r)
+    end
+  end
+  return kids
+end
+
+local function detailsKids(d)
+  local kids = {}
+  for i, f in ipairs(d.facts or {}) do
+    table.insert(kids, ui.row({ key = "st-f" .. i, gap = 10 }, {
+      ui.label({ text = clip(tostring(f[1] or ""), 16), fontSize = 12.5, color = DIM, maxLines = 1,
+        maxWidth = W_FACT_LABEL, width = W_FACT_LABEL }),
+      ui.label({ text = clip(tostring(f[2] or ""), 90), fontSize = 13, maxLines = 2, maxWidth = 340, flexGrow = 1 }),
+    }))
+  end
+  for si, sec in ipairs(d.sections or {}) do
+    table.insert(kids, ui.box({ key = "st-gap" .. si, height = 6, opacity = 0 }))
+    table.insert(kids, ui.label({ key = "st-h" .. si, text = string.upper(tostring(sec.heading or "")), fontSize = 11.5,
+      fontWeight = "bold", color = "primary" }))
+    local shown = 0
+    for _, raw in ipairs(sec.lines or {}) do
+      for _, w in ipairs(wrapText(tostring(raw), WRAP_CHARS)) do
+        shown += 1
+        if shown <= MAX_SECTION_LINES then
+          table.insert(kids, bodyLine("st-s" .. si .. "-" .. shown, w))
+        end
+      end
+    end
+    if shown > MAX_SECTION_LINES then
+      table.insert(kids, ui.label({ key = "st-more" .. si, text = "…and " .. tostring(shown - MAX_SECTION_LINES) .. " more lines",
+        fontSize = 12, color = DIM }))
+    end
+  end
+  return kids
+end
+
+local function stateBody()
+  local info = nodeInfo[selKey]
+  local d = (detail ~= nil and detail.key == selKey) and detail or nil
+  local kids = {}
+  if d == nil then
+    local sub = info ~= nil and info.sub or ""
+    table.insert(kids, ui.label({ key = "st-wait", text = detailError and "Could not read the latest state." or "Reading the latest state…",
+      fontSize = 13, color = detailError and AMBER or DIM }))
+    if sub ~= "" then
+      table.insert(kids, ui.label({ key = "st-sub", text = clip(sub, 60), fontSize = 12, color = DIM, maxLines = 1,
+        maxWidth = 470 }))
+    end
+  else
+    local b = pinned -- nil until pinned: skeleton, never text that will change
+    kids = summaryKids(d, b)
+    local foot
+    if b == nil then
+      foot = "Looking for the saved summary…"
+    elseif b.source == "zgx-02" then
+      foot = "Summary by zgx-02 · " .. sinceText(b.generated_at)
+      if briefBusy then
+        foot = foot .. " · checking for newer…"
+      end
+    else
+      foot = "Summary from records (zgx-02 unavailable)"
+    end
+    local foots = { ui.label({ key = "st-foot", text = foot, fontSize = 11, color = DIM, maxLines = 1, flexGrow = 1,
+      maxWidth = 300 }) }
+    if pending ~= nil then
+      table.insert(foots, ui.row({ key = "st-newer", gap = 6, align = "center", paddingV = 3, paddingH = 10, radius = 12,
+        fill = NODE_FILL, border = hovered == "st-newer" and EDGE_SELECT or EDGE_HOVER, borderWidth = 1,
+        onHover = onRowHover, tooltip = "Replace the text above with the newer summary", onClick = showPending }, {
+        ui.glyph({ name = "refresh", size = 12, color = "primary" }),
+        ui.label({ text = "Newer summary · Show", fontSize = 11.5, fontWeight = "bold", color = "primary", maxLines = 1 }),
+      }))
+    end
+    table.insert(kids, ui.row({ key = "st-footer", gap = 8, align = "center" }, foots))
+    -- collapsed DETAILS
+    local hasDetails = #(d.facts or {}) > 0 or #(d.sections or {}) > 0
+    if hasDetails then
+      table.insert(kids, ui.row({ key = "st-dt", gap = 8, align = "center", paddingV = 4, paddingH = 6, radius = 8,
+        border = rowEdge("st-dt", false), borderWidth = 1, onHover = onRowHover, tooltip = showDetails and "Hide details" or "Show details",
+        onClick = toggleDetails }, {
+        ui.glyph({ name = showDetails and "chevron-down" or "chevron-right", size = 14, color = DIM }),
+        ui.label({ text = "DETAILS", fontSize = 11.5, fontWeight = "bold", color = DIM }),
+        ui.label({ text = showDetails and "facts and full text" or "facts, last request, reply and tool", fontSize = 11.5, color = DIM,
+          maxLines = 1, flexGrow = 1 }),
+      }))
+      if showDetails then
+        for _, k in ipairs(detailsKids(d)) do
+          table.insert(kids, k)
+        end
+      end
+    end
+  end
+  return ui.column({ key = "ov-r", gap = 8, width = W_RAIL }, {
+    stateHeader(info, d),
+    ui.scroll({ key = "st-s", gap = 8, flexGrow = 1, padding = 12, radius = 12, border = WELL, borderWidth = 1 }, kids),
+  })
+end
+
+local function overviewBody()
+  local blocks = {}
+  for _, dg in ipairs(diagram) do
+    table.insert(blocks, groupBlock(dg))
+  end
+  if #blocks == 0 then
+    table.insert(blocks, ui.label({ key = "d-none", text = st and "No agent activity in the last day." or "",
+      fontSize = 13.5, color = DIM }))
+  end
+  local tokenRows, budgetRows = {}, {}
+  for i, e in ipairs(bars.tokens) do
+    if i > RAIL_ROWS then
+      break
+    end
+    table.insert(tokenRows, barRow(e, tokenColor(e)))
+  end
+  for i, e in ipairs(bars.budgets) do
+    if i > RAIL_ROWS then
+      break
+    end
+    table.insert(budgetRows, barRow(e, budgetColor(e)))
+  end
+  local rail
+  if selKey ~= nil then
+    rail = stateBody()
+  else
+    rail = ui.column({ key = "ov-r", gap = 8, width = W_RAIL }, {
+      sectionHead("ov-tok-h", "TOKENS TODAY", "top " .. tostring(math.min(RAIL_ROWS, #bars.tokens)) .. " by repo"),
+      ui.scroll({ key = "ov-tok-s", gap = 3, flexGrow = 1, padding = 8, radius = 12, border = WELL, borderWidth = 1 },
+        tokenRows),
+      sectionHead("ov-bud-h", "BUDGETS AT RISK", "closest to the limit"),
+      ui.scroll({ key = "ov-bud-s", gap = 3, flexGrow = 1, padding = 8, radius = 12, border = WELL, borderWidth = 1 },
+        budgetRows),
+    })
+  end
+  return ui.row({ key = "ov", gap = 20, flexGrow = 1 }, {
+    ui.column({ key = "ov-d", gap = 8, flexGrow = 1 }, {
+      ui.row({ key = "ov-dh", gap = 18, align = "center", paddingH = 4 }, {
+        ui.label({ text = "AGENT DIAGRAM", fontSize = 13.5, fontWeight = "bold", color = "primary" }),
+        ui.label({ text = "repo → Conversation → subagent / Claude job", fontSize = 12, color = DIM, maxLines = 1,
+          flexGrow = 1 }),
+        ui.button({ key = "d-collapse", glyph = "fold", text = "Collapse all", variant = "ghost", controlSize = "sm",
+          tooltip = "Fold every repo to one line", onClick = function()
+            setAllCollapsed(true)
+          end }),
+        ui.button({ key = "d-expand", glyph = "fold-down", text = "Expand all", variant = "ghost", controlSize = "sm",
+          tooltip = "Show every repo's Conversations", onClick = function()
+            setAllCollapsed(false)
+          end }),
+        legendSwatch(LINE_CONV, 3, "Conversation"),
+        legendSwatch(LINE_SUB, 3, "subagent"),
+        legendSwatch(LINE_JOB, 2, "Claude job"),
+        ui.label({ text = "line weight = tokens", fontSize = 12, color = DIM }),
+      }),
+      ui.scroll({ key = "diagram-s", gap = 14, flexGrow = 1, padding = 14, radius = 12, border = WELL, borderWidth = 1,
+        revealKey = tab == "overview" and ("d" .. (diagramActions[diagIdx] or "")) or "" }, blocks),
+    }),
+    rail,
+  })
+end
+
+-- ------------------------------------------------------------------ view: DETAILS
+local function agentRow(it)
+  local selected = tab == "details" and pane == "agents" and agentActions[agentIdx] == it.key
+  local indent = (it.depth or 0) * 26
+  local children = {}
+  if indent > 0 then
+    -- Fixed-width empty box: ui.spacer is a flex filler and would swallow the row's free space.
+    table.insert(children, ui.box({ width = indent, height = 1, opacity = 0 }))
+  end
+  -- Live rows tint their glyph green: a separate dot in a nested row would escape the column's width and overlap the
+  -- token column, while direct column children are sized (and elided) to it.
+  table.insert(children, ui.glyph({ name = KIND_GLYPH[it.kind] or "point", size = it.kind == "repo" and 18 or 16,
+    color = it.live and GREEN or (KIND_COLOR[it.kind] or "primary") }))
+  if it.kind == "more" then
+    table.insert(children, ui.label({ text = it.title, fontSize = 13, color = DIM, flexGrow = 1, maxLines = 1 }))
+    return ui.row({ key = it.key, gap = 10, align = "center", paddingH = 10, paddingV = 6, radius = 8, fill = CLEAR,
+      border = rowEdge(it.key, false), borderWidth = 1, onHover = onRowHover }, children)
+  end
+  table.insert(children, ui.column({ gap = 2, flexGrow = 1 }, {
+    ui.label({ text = clip(it.title, it.kind == "repo" and 40 or 56), fontSize = it.kind == "repo" and 16 or 15,
+      fontWeight = "semibold", color = it.kind == "repo" and "primary" or "on_surface", maxLines = 1,
+      maxWidth = W_AGENT_TEXT - indent }),
+    ui.label({ text = it.sub or "", fontSize = 12.5, color = DIM, maxLines = 1, maxWidth = W_AGENT_TEXT - indent }),
+  }))
+  if it.kind == "repo" then
+    table.insert(children, ui.label({ text = fmt(it.tokens) .. " today", fontSize = 12.5, color = DIM }))
+  elseif it.tokens ~= nil then
+    table.insert(children, ui.column({ gap = 4, width = W_TOK, align = "end" }, {
+      ui.label({ text = fmt(it.tokens), fontSize = 13, color = "on_surface" }),
+      ui.progress({ progress = math.max(0.02, it.frac or 0), width = W_TOK, height = 4, radius = 2,
+        fill = it.kind == "sub" and BLUE or "primary", track = "on_surface/0.08" }),
+    }))
+  else
+    table.insert(children, ui.column({ width = W_TOK, align = "end" }, {
+      ui.label({ text = it.badge or "Claude", fontSize = 12, color = DIM }),
+    }))
+  end
+  local props = { key = it.key, gap = 10, align = "center", paddingH = 10, paddingV = it.kind == "repo" and 8 or 6,
+    radius = 8, fill = CLEAR, border = rowEdge(it.key, selected), borderWidth = 1, onHover = onRowHover }
+  if it.action ~= nil then
+    local action = it.action
+    props.onClick = function()
+      runAction(action)
+    end
+    props.tooltip = actionTip(action)
+  end
+  return ui.row(props, children)
+end
+
+local function repoRow(row)
+  local selected = tab == "details" and pane == "repos" and worktreeKeys[repoIdx] == row.key
+  local props = { key = row.key, gap = 10, align = "center", paddingH = 10, paddingV = 5, radius = 7, fill = CLEAR,
+    border = rowEdge(row.key, selected), borderWidth = 1, onHover = onRowHover }
+  if row.kind == "wt" then
+    local path = worktreePath[row.key]
+    props.onClick = function()
+      openWorktree(path)
+    end
+    props.tooltip = "Open a terminal in " .. (path or "")
+  end
+  return ui.row(props, {
+    ui.glyph({ name = row.kind == "wt" and "git-branch" or "file-description", size = 15,
+      color = row.kind == "wt" and "primary" or DIM }),
+    ui.label({ text = clip(row.label, 40), fontSize = 13.5, color = "on_surface", maxLines = 1, maxWidth = 300,
+      flexGrow = 1 }),
+    ui.label({ text = row.right, fontSize = 12.5, color = row.color, maxLines = 1, maxWidth = 150 }),
+  })
+end
+
+local function repoCard(card)
+  local statusRow = {}
+  for i, s in ipairs(card.status) do
+    if i > 1 then
+      table.insert(statusRow, ui.label({ text = "·", fontSize = 12.5, color = DIM }))
+    end
+    table.insert(statusRow, ui.label({ text = s.text, fontSize = 12.5, color = s.color, maxLines = 1 }))
+  end
+  local body = {
+    ui.row({ gap = 10, align = "center" }, {
+      ui.glyph({ name = "folder-code", size = 17, color = "primary" }),
+      ui.label({ text = string.upper(card.name), fontSize = 15, fontWeight = "bold", color = "on_surface", maxLines = 1 }),
+    }),
+    ui.row({ gap = 6, align = "center" }, statusRow),
+  }
+  if card.meta ~= "" then
+    table.insert(body, 2, ui.label({ text = card.meta, fontSize = 12, color = DIM, maxLines = 1, maxWidth = W_REPOS - 60 }))
+  end
+  for _, row in ipairs(card.rows) do
+    table.insert(body, repoRow(row))
+  end
+  return ui.column({ key = card.key, gap = 6, padding = 12, radius = 10, fill = CARD_FILL,
+    border = edge(card.key, false, false), borderWidth = 1, onHover = onRowHover }, body)
+end
+
+local function detailsBody()
+  local agentRows = {}
+  for _, it in ipairs(agents) do
+    table.insert(agentRows, agentRow(it))
+  end
+  if #agentRows == 0 then
+    table.insert(agentRows, ui.label({ key = "none", text = st and "No agent activity in the last day." or "",
+      fontSize = 13.5, color = DIM }))
+  end
+  local cards = {}
+  for _, c in ipairs(repoCards) do
+    table.insert(cards, repoCard(c))
+  end
+  local tokenRows = {}
+  for _, e in ipairs(bars.tokens) do
+    table.insert(tokenRows, barRow(e, tokenColor(e)))
+  end
+  local budgetRows = {}
+  for _, e in ipairs(bars.budgets) do
+    table.insert(budgetRows, barRow(e, budgetColor(e)))
+  end
+  local agentsNote = "repo → Conversation → subagent / Claude job"
+  if pane == "agents" then
+    agentsNote = agentsNote .. "  ·  keyboard"
+  end
+  local reposNote = "local git · worktrees open a terminal"
+  if pane == "repos" then
+    reposNote = reposNote .. "  ·  keyboard"
+  end
+  return ui.row({ key = "body", gap = 20, flexGrow = 1 }, {
+    ui.column({ key = "agents", gap = 8, flexGrow = 1 }, {
+      sectionHead("agents-h", "AGENTS", agentsNote),
+      ui.scroll({ key = "agents-s", gap = 3, flexGrow = 1, padding = 8, radius = 12, border = WELL, borderWidth = 1,
+        revealKey = pane == "agents" and (agentActions[agentIdx] or "") or "" }, agentRows),
+    }),
+    ui.column({ key = "repos", gap = 8, width = W_REPOS }, {
+      sectionHead("repos-h", "REPOS", reposNote),
+      ui.scroll({ key = "repos-s", gap = 10, flexGrow = 1, padding = 8, radius = 12, border = WELL, borderWidth = 1,
+        revealKey = pane == "repos" and (worktreeKeys[repoIdx] or "") or "" }, cards),
+    }),
+    ui.column({ key = "bars", gap = 8, width = W_BARS }, {
+      sectionHead("tok-h", "TODAY · TOKENS BY REPO", "state.db, last 24 h"),
+      ui.scroll({ key = "tok-s", gap = 3, flexGrow = 1, padding = 8, radius = 12, border = WELL, borderWidth = 1 }, tokenRows),
+      sectionHead("bud-h", "TASK BUDGETS", tostring(#bars.budgets) .. " tasks · task-state.py"),
+      ui.scroll({ key = "bud-s", gap = 3, flexGrow = 1, padding = 8, radius = 12, border = WELL, borderWidth = 1 }, budgetRows),
+    }),
+  })
+end
+
+-- ------------------------------------------------------------------ render
+render = function()
+  if not isOpen then
+    return
+  end
+  local stale = isStale()
+  wasStale = stale
+  local headInfo
+  if st == nil then
+    headInfo = collectorError and "No snapshot yet." or "Collecting…"
+  else
+    headInfo = "snapshot " .. noctalia.formatTime("%H:%M:%S", math.floor(st.generated_at or 0))
+  end
+  local header = {
+    ui.glyph({ name = "git-fork", size = 24, color = "primary" }),
+    ui.label({ text = "REPO GRID", fontSize = 19, fontWeight = "bold", color = "primary" }),
+    ui.box({ width = 10, height = 1, opacity = 0 }),
+    tabChip("overview", "layout-dashboard", "OVERVIEW"),
+    tabChip("details", "list-details", "DETAILS"),
+    ui.box({ width = 10, height = 1, opacity = 0 }),
+    ui.label({ text = headInfo, fontSize = 13, color = DIM, maxLines = 1, flexGrow = 1 }),
+  }
+  if stale then
+    table.insert(header, ui.label({ text = "STALE", fontSize = 13, fontWeight = "bold", color = AMBER }))
+  end
+  if collectorError then
+    table.insert(header, ui.label({ text = "COLLECTOR ERROR", fontSize = 13, fontWeight = "bold", color = RED }))
+  end
+  local hint = tab == "overview" and "←→ VIEW  ·  ↑↓  ·  ENTER STATE / GO-TO  ·  ESC"
+    or "←→ VIEW  ·  TAB AGENTS / REPOS  ·  ↑↓  ·  ENTER OPEN  ·  ESC"
+  table.insert(header, ui.label({ text = hint, fontSize = 12, color = DIM }))
+  table.insert(header, ui.button({ key = "refresh", glyph = "refresh", variant = "ghost", controlSize = "sm",
+    tooltip = "Refresh now", enabled = not collecting, onClick = function()
+      collect()
+      render()
+    end }))
+  if not winMode then
+    table.insert(header, ui.button({ key = "popout", glyph = "app-window", variant = "ghost", controlSize = "sm",
+      tooltip = "Pop out to a window", onClick = popOut }))
+  end
+
+  local body
+  if tab == "overview" then
+    body = { ui.row({ key = "head", gap = 12, align = "center" }, header), ui.separator({ key = "sep" }), tiles(),
+      overviewBody() }
+  else
+    body = { ui.row({ key = "head", gap = 12, align = "center" }, header), ui.separator({ key = "sep" }), detailsBody() }
+  end
+  panel.render(ui.column({ padding = 22, gap = 14, flexGrow = 1 }, body))
+end
+
+-- ------------------------------------------------------------------ lifecycle
+-- The bar glyph shows the open tint; the runtime marker lets `repo-grid` (SUPER+C) close an open grid without
+-- re-running its admission gates.
+local function tellButton(state)
+  if winMode then
+    return
+  end
+  noctalia.runAsync({ MSG, "plugin", BUTTON, "all", "state", state })
+  noctalia.writeFile(PANEL_STATE_PATH, state .. "\n")
+end
+
+function onOpen(_context)
+  gen += 1
+  isOpen = true
+  winMode = panel.isWindow ~= nil and panel.isWindow() == true -- lt14 API; nil on lt13 -> dropdown
+  selKey = nil
+  detail = nil
+  detailError = false
+  detailReq += 1
+  detailBusy = false
+  resetPin()
+  lastSynth = {}
+  showDetails = false
+  hovered = nil
+  collecting = false
+  collectorError = false
+  ticks = 0
+  tab = "overview"
+  pane = "agents"
+  agentIdx = 1
+  repoIdx = 1
+  diagIdx = 1
+  panel.setWantsSecondTicks(true)
+  tellButton("open")
+  render()
+  -- Collapsed repos are shared between the dropdown and the pop-out window through COLLAPSE_PATH.
+  local myGen = gen
+  noctalia.readFileAsync(COLLAPSE_PATH, function(contents, _err)
+    if myGen ~= gen then
+      return
+    end
+    applyCollapsed(contents)
+    rebuild()
+    render()
+  end)
+  readState(gen, false) -- last snapshot at once
+  collect()
+end
+
+function onClose()
+  gen += 1
+  isOpen = false
+  collecting = false
+  detailReq += 1
+  detailBusy = false
+  briefReq += 1
+  briefBusy = false
+  hovered = nil
+  panel.setWantsSecondTicks(false)
+  tellButton("closed")
+end
+
+function update()
+  if not isOpen then
+    return
+  end
+  ticks += 1
+  if ticks >= REFRESH_EVERY_S then
+    ticks = 0
+    collect()
+    if selKey ~= nil then
+      fetchDetail()
+    end
+  end
+  if selKey ~= nil and pinned == nil and detail ~= nil and nowSec() - pinStart > PIN_FALLBACK_S then
+    pinRules()
+    render()
+  end
+  if isStale() ~= wasStale then
+    render()
+  end
+end
+
+-- capture_keys = Tab, Left, Right, Up, Down, Return (the host consumes only these; Esc always closes).
+function onKey(chord, pressed)
+  if not pressed or not isOpen then
+    return
+  end
+  if chord == "Left" then
+    tab = "overview"
+  elseif chord == "Right" then
+    tab = "details"
+  elseif chord == "Tab" then
+    if tab == "overview" then
+      tab = "details"
+    else
+      pane = pane == "agents" and "repos" or "agents"
+    end
+  elseif chord == "Up" or chord == "Down" then
+    local d = chord == "Up" and -1 or 1
+    if tab == "overview" then
+      diagIdx = math.max(1, math.min(#diagramActions, diagIdx + d))
+    elseif pane == "agents" then
+      agentIdx = math.max(1, math.min(#agentActions, agentIdx + d))
+    else
+      repoIdx = math.max(1, math.min(#worktreeKeys, repoIdx + d))
+    end
+  elseif chord == "Return" then
+    if tab == "overview" then
+      local key = diagramActions[diagIdx]
+      if key ~= nil and key == selKey then
+        goToSelected()
+      elseif key ~= nil then
+        selectKey(key)
+      end
+    elseif pane == "agents" then
+      runAction(actionByKey[agentActions[agentIdx] or ""])
+    else
+      openWorktree(worktreePath[worktreeKeys[repoIdx] or ""])
+    end
+    return
+  end
+  hovered = nil
+  render()
+end

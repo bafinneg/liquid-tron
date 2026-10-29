@@ -1,0 +1,130 @@
+// Liquid Tron — rmpc 0.11 native theme.
+// Tokens: shared/themes/palettes/tron-compute.yaml; docs/aesthetic-design-system.md.
+// Cyan structure / blue fills / amber current state; metadata casing is preserved.
+#![enable(implicit_some)]
+#![enable(unwrap_newtypes)]
+#![enable(unwrap_variant_newtypes)]
+(
+    background_color: "#0a0a14",
+    text_color: "#c0c0d0",
+    header_background_color: "#0a0a14",
+    modal_background_color: "#0d0d1a",
+    modal_backdrop: true,
+    format_tag_separator: " / ",
+    browser_column_widths: [24, 36, 40],
+    preview_label_style: (fg: "#0abdc6"),
+    preview_metadata_group_style: (fg: "#0abdc6", modifiers: "Bold"),
+    highlighted_item_style: (fg: "#ff8c00", modifiers: "Bold"),
+    current_item_style: (fg: "#000000", bg: "#0072ff", modifiers: "Bold"),
+    borders_style: (fg: "#0abdc6"),
+    highlight_border_style: (fg: "#ff8c00"),
+    symbols: (
+        song: "·", dir: "/", playlist: "=", marker: ">", ellipsis: "…",
+        song_style: (fg: "#707080"),
+        dir_style: (fg: "#0abdc6"),
+        playlist_style: (fg: "#0abdc6"),
+    ),
+    level_styles: (
+        info: (fg: "#0abdc6", bg: "#0a0a14"),
+        warn: (fg: "#ff8c00", bg: "#0a0a14"),
+        error: (fg: "#ff003c", bg: "#0a0a14"),
+        debug: (fg: "#707080", bg: "#0a0a14"),
+        trace: (fg: "#707080", bg: "#0a0a14"),
+    ),
+    progress_bar: (
+        symbols: ["━", "━", "●", "─", "─"],
+        track_style: (fg: "#505060"),
+        elapsed_style: (fg: "#0072ff"),
+        thumb_style: (fg: "#ff8c00"),
+        use_track_when_empty: true,
+    ),
+    scrollbar: (
+        symbols: ["│", "┃", "╵", "╷"],
+        track_style: (fg: "#1a1a2a"),
+        ends_style: (fg: "#707080"),
+        thumb_style: (fg: "#0abdc6"),
+    ),
+    tab_bar: (
+        active_style: (fg: "#000000", bg: "#0072ff", modifiers: "Bold"),
+        inactive_style: (fg: "#0abdc6", bg: "#0a0a14"),
+    ),
+    cava: (
+        bg_color: "#0a0a14",
+        bar_color: Gradient({0: "#0abdc6", 100: "#0072ff"}),
+        bar_width: 1,
+        bar_spacing: 1,
+        orientation: Bottom,
+    ),
+    lyrics: (timestamp: false),
+    song_table_format: [
+        (prop: (kind: Property(Artist), default: (kind: Text("—"))), label_prop: (kind: Text("ARTIST")), width: "23%"),
+        (prop: (kind: Property(Title), default: (kind: Property(Filename))), label_prop: (kind: Text("TRACK")), width: "37%"),
+        (prop: (kind: Property(Album), default: (kind: Text("—"))), label_prop: (kind: Text("ALBUM")), width: "30%"),
+        (prop: (kind: Property(Duration), default: (kind: Text("—"))), label_prop: (kind: Text("TIME")), width: "10%", alignment: Right),
+    ],
+    layout: Split(
+        direction: Vertical,
+        panes: [
+            (size: "5", pane: Split(direction: Horizontal, panes: [
+                (size: "25%", borders: "ALL", border_symbols: Rounded,
+                 border_title: [(kind: Text(" TRANSPORT "))], pane: Component("transport")),
+                (size: "50%", borders: "ALL", border_symbols: Rounded,
+                 border_title: [(kind: Text(" NOW PLAYING "))], pane: Component("now_playing")),
+                (size: "25%", borders: "ALL", border_symbols: Rounded,
+                 border_title: [(kind: Text(" OUTPUT "))], pane: Component("output")),
+            ])),
+            (size: "2", borders: "BOTTOM", pane: Pane(Tabs)),
+            (size: "100%", pane: Pane(TabContent)),
+            (size: "7", borders: "ALL", border_symbols: Rounded,
+             border_title: [(kind: Text(" SPECTRUM / MOTU LINE OUT "))], pane: Pane(Cava)),
+            (size: "3", borders: "ALL", border_symbols: Rounded,
+             border_title: [
+                (kind: Text(" POSITION / ")),
+                (kind: Property(Status(Elapsed))), (kind: Text(" / ")),
+                (kind: Property(Status(Duration))), (kind: Text(" ")),
+             ], pane: Pane(ProgressBar)),
+            (size: "1", pane: Pane(Property(content: [
+                (kind: Text(" 1–8 VIEWS  /  TAB NAVIGATE  /  p PAUSE  /  < > TRACK  /  , . VOL  /  ? HELP  /  q EXIT"), style: (fg: "#707080")),
+             ], align: Left))),
+        ],
+    ),
+    components: {
+        "transport": Split(direction: Vertical, panes: [
+            (size: "1", pane: Pane(Property(content: [
+                (kind: Text(" ")),
+                (kind: Property(Status(StateV2(playing_label: "PLAYING", paused_label: "PAUSED", stopped_label: "STANDBY"))), style: (fg: "#ff8c00", modifiers: "Bold")),
+            ]))),
+            (size: "1", pane: Pane(Property(content: [
+                (kind: Text(" ")), (kind: Property(Status(Elapsed))),
+                (kind: Text(" / ")), (kind: Property(Status(Duration))),
+            ]))),
+            (size: "1", pane: Pane(Property(content: [
+                (kind: Text(" ")), (kind: Property(Status(QueueLength()))),
+                (kind: Text(" TRACKS / ")), (kind: Property(Status(QueueTimeTotal()))),
+            ],))),
+        ]),
+        "now_playing": Split(direction: Vertical, panes: [
+            (size: "1", pane: Pane(Property(content: [
+                (kind: Property(Song(Title)), style: (fg: "#e0e0f0", modifiers: "Bold"), default: (kind: Text("NO TRACK SELECTED"))),
+            ], align: Center, scroll_speed: 1))),
+            (size: "1", pane: Pane(Property(content: [
+                (kind: Property(Song(Artist)), default: (kind: Text("—"))),
+            ], align: Center, scroll_speed: 1))),
+            (size: "1", pane: Pane(Property(content: [
+                (kind: Property(Song(Album)), style: (fg: "#0abdc6"), default: (kind: Text("—"))),
+            ], align: Center, scroll_speed: 1))),
+        ]),
+        "output": Split(direction: Vertical, panes: [
+            (size: "1", pane: Pane(Property(content: [
+                (kind: Text(" VOL "), style: (fg: "#0abdc6")),
+                (kind: Property(Status(Volume))), (kind: Text("%")),
+            ]))),
+            (size: "1", pane: Pane(Volume(kind: Slider(symbols: (filled: "━", thumb: "●", track: "─"))))),
+            (size: "1", pane: Pane(Property(content: [
+                (kind: Text(" ")), (kind: Property(Status(SampleRate()))),
+                (kind: Text(" / ")), (kind: Property(Status(Bits()))), (kind: Text(" BIT / ")),
+                (kind: Property(Status(Channels()))), (kind: Text(" CH")),
+            ]))),
+        ]),
+    },
+)

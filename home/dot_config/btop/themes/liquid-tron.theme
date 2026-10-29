@@ -1,0 +1,74 @@
+# Liquid Tron — btop theme
+# Tron Compute palette — managed via Stow
+# Do not edit ~/.config/btop/themes/ directly
+
+# Main background — empty for terminal transparency
+theme[main_bg]=""
+
+# Main text
+theme[main_fg]="#c0c0d0"
+
+# Title color for boxes
+theme[title]="#e0e0f0"
+
+# Highlight color for keyboard shortcuts
+theme[hi_fg]="#0abdc6"
+
+# Selected item in processes box
+theme[selected_bg]="#0072ff"
+theme[selected_fg]="#000000"
+
+# Inactive/disabled text
+theme[inactive_fg]="#505060"
+
+# Misc colors for processes box (mini cpu graphs, details memory graph, status text)
+theme[proc_misc]="#0abdc6"
+
+# Box outline colors — one palette role per box
+theme[cpu_box]="#0abdc6"
+theme[mem_box]="#00ff9f"
+theme[net_box]="#0072ff"
+theme[proc_box]="#ff8c00"
+
+# Box divider line and small boxes line color
+theme[div_line]="#1a1a2a"
+
+# Temperature graph colors (cool → warm → hot)
+theme[temp_start]="#0072ff"
+theme[temp_mid]="#ff8c00"
+theme[temp_end]="#ff003c"
+
+# CPU graph colors (cyan → blue → green)
+theme[cpu_start]="#0abdc6"
+theme[cpu_mid]="#0072ff"
+theme[cpu_end]="#00ff9f"
+
+# Mem/Disk free meter
+theme[free_start]="#1a1a2a"
+theme[free_mid]="#505060"
+theme[free_end]="#707080"
+
+# Mem/Disk cached meter
+theme[cached_start]="#0072ff"
+theme[cached_mid]="#0abdc6"
+theme[cached_end]="#00ff9f"
+
+# Mem/Disk available meter
+theme[available_start]="#00ff9f"
+theme[available_mid]="#0abdc6"
+theme[available_end]="#0072ff"
+
+# Mem/Disk used meter
+theme[used_start]="#ff8c00"
+theme[used_mid]="#ff003c"
+theme[used_end]="#ff003c"
+
+# Download graph colors
+theme[download_start]="#0072ff"
+theme[download_mid]="#0abdc6"
+theme[download_end]="#00ff9f"
+
+# Upload graph colors
+theme[upload_start]="#ff8c00"
+theme[upload_mid]="#ff003c"
+theme[upload_end]="#ff003c"

@@ -1,0 +1,11 @@
+title = "liquid-tron"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Vendored third-party assets and binary models"
+paths = [
+  '''home/dot_config/quickshell/ares-lock/assets/.*''',
+  '''home/dot_themes/.*\.(css|svg)''',
+]

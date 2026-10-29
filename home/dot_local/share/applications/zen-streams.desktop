@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Zen — Streams
+GenericName=Web Browser (Twitch / YouTube)
+Comment=Zen Browser, zen-streams profile (FEAT-workspace-ux-overhaul)
+Exec=env MOZ_APP_REMOTINGNAME=zen-streams /opt/zen-browser-bin/zen-bin -P zen-streams --new-instance %u
+Icon=zen-browser
+Type=Application
+StartupNotify=true
+StartupWMClass=zen-streams
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;

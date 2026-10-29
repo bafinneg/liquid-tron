@@ -1,0 +1,26 @@
+# Library: {{ .nas_name }} /volume1/music, served read-only by CT 111 nginx WebDAV and
+# reached through navidrome-tunnel.service (127.0.0.1:4534). Same files Navidrome scans.
+music_directory    "http://127.0.0.1:4534/"
+playlist_directory "~/.config/mpd/playlists"
+db_file            "~/.config/mpd/database"
+log_file           "~/.config/mpd/log"
+pid_file           "~/.config/mpd/pid"
+state_file         "~/.config/mpd/state"
+sticker_file       "~/.config/mpd/sticker.sql"
+
+auto_update        "no"
+restore_paused     "yes"
+bind_to_address    "localhost"
+port               "6600"
+
+audio_output {
+    type  "pulse"
+    name  "PipeWire Output"
+}
+
+audio_output {
+    type   "fifo"
+    name   "cava_fifo"
+    path   "/tmp/mpd.fifo"
+    format "44100:16:2"
+}

@@ -1,0 +1,481 @@
+-- Return Brief panel (FEAT-lt32). Opened by ares-briefd (`panel-open liquidtron/ares:brief`) when Brian returns after
+-- a long absence, and by SUPER+SHIFT+A (`panel-toggle liquidtron/ares:brief replay`) to replay the last one.
+--
+-- Reads $XDG_RUNTIME_DIR/ares/brief.json (written by ares-briefd): a title, one row per count with a 60-point sparkline
+-- of the absence window, and one sentence. Layout follows the LT30 grammar: uppercase labels, flush glass (no panel
+-- fill), blue selection, amber only for WAITING ON YOU. Retracts by itself after 12 s unless Brian interacts; any other
+-- key, an outside click or Esc closes (host). Enter summons Hermes.
+-- Owner round 3: a click on a row expands it (one at a time) to the row's items from brief.json (`rows[].items`: task
+-- titles, open requests, notification summaries, GPU peak) and to GO TO buttons: a Conversation through
+-- `ares-summon --hermes <id>`, the {{ .board_name }} board, the control-centre notifications, or the GPU detail panel. Any expand
+-- pins the panel (no auto-close). Every go-to is one detached argv spawn (launch) followed by panel.close().
+-- On open it runs `ares-summon --guard` (lock, gaming mode, fullscreen) and closes itself on a non-zero exit.
+-- No frame ticks: one second tick while open drives the countdown/auto-close. Colour literals: #ff8c00 amber.
+-- Owner round 7: descriptions are rich prose, never raw log lines. Each item is a card: a tone glyph chip, a small
+-- uppercase source eyebrow and time (UI chrome, shell font), a semibold title and a wrapped body in a proportional
+-- face (PROSE). Only a command body (`code = true`) stays monospace, in a code block. The closing sentence is prose.
+
+local SUMMON = "{{ .chezmoi.homeDir }}/.local/bin/ares-summon"
+local MSG = "{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg"
+local XDG_OPEN = "/usr/bin/xdg-open"
+local BOARD_URL = "{{ .board_url }}"
+local OPEN_S = 12
+local FONT = 14
+local ITEM_FONT = 12.5
+
+-- Row id -> the place the row's GO TO button opens.
+local ROW_GO = {
+  done = { text = "OPEN BOARD", argv = { XDG_OPEN, BOARD_URL } },
+  failed = { text = "OPEN BOARD", argv = { XDG_OPEN, BOARD_URL } },
+  waiting = { text = "OPEN HERMES", argv = { SUMMON } },
+  notifications = { text = "OPEN NOTIFICATIONS", argv = { MSG, "panel-open", "control-center", "notifications" } },
+  system = { text = "OPEN GPU DETAIL", argv = { MSG, "panel-open", "liquidtron/gpu:detail" } },
+}
+local EMPTY = {
+  done = "No tasks finished while you were away.",
+  waiting = "Nothing is waiting on you.",
+  failed = "Nothing failed or blocked.",
+  notifications = "No notifications arrived.",
+  system = "No GPU samples were taken.",
+}
+local PROSE = "Adwaita Sans" -- proportional face for descriptions (installed); UI chrome keeps the shell font
+
+local AMBER = "#ff8c00"
+local AMBER_CHIP = "#ff8c0024"
+local CLEAR = "#00000000"
+local DIM = "on_surface_variant"
+local FAINT = "on_surface_variant/0.6"
+local SPARK = "primary"
+local SPARK_IDLE = "on_surface_variant/0.45"
+local HOVER_FILL = "primary/0.07"
+local HOVER_BORDER = "primary/0.28"
+local ITEM_FILL = "primary/0.035"
+local CODE_FILL = "on_surface_variant/0.10"
+local TONE = { done = "primary", info = "on_surface_variant", amber = AMBER, error = "error" }
+
+local runtimeDir = noctalia.getenv("XDG_RUNTIME_DIR")
+if runtimeDir == nil or runtimeDir == "" then
+  runtimeDir = "/run/user/1000"
+end
+local BRIEF = runtimeDir .. "/ares/brief.json"
+
+local isOpen = false
+local guarded = false
+local gen = 0 -- bumped on every open/close; stale async results are dropped
+local brief = nil
+local loaded = false
+local seconds = 0
+local hovered = nil
+local expanded = nil -- row id shown with its items
+local pinned = false -- an expand stops the auto-close
+
+local render -- forward declaration (hover callbacks re-render)
+
+local function str(v)
+  if type(v) == "string" then
+    return v
+  end
+  return ""
+end
+
+local function num(v)
+  local n = tonumber(v)
+  if n == nil then
+    return 0
+  end
+  return math.floor(n)
+end
+
+local function upper(s)
+  return string.upper(s)
+end
+
+-- The daemon's sentence is upper case (template and model); shown as a sentence, it reads as prose.
+local function proseCase(s)
+  if s == "" or s ~= string.upper(s) then
+    return s
+  end
+  local t = string.lower(s)
+  return string.upper(t:sub(1, 1)) .. t:sub(2)
+end
+
+local function launch(argv)
+  noctalia.runAsync(argv)
+  panel.close()
+end
+
+local function summon()
+  launch({ SUMMON })
+end
+
+-- Conversation ids come from ares-briefd, which already filters them; check again before they reach an argv.
+local function sessionId(v)
+  local s = str(v)
+  if #s > 0 and #s <= 128 and s:match("^[%w_.%-]+$") ~= nil then
+    return s
+  end
+  return nil
+end
+
+local function onHoverFor(key)
+  return function(st)
+    if not (isOpen and guarded) then
+      return
+    end
+    if st then
+      hovered = key
+    elseif hovered == key then
+      hovered = nil
+    end
+    render()
+  end
+end
+
+local function toggle(id)
+  if expanded == id then
+    expanded = nil
+  else
+    expanded = id
+  end
+  pinned = true
+  hovered = nil
+  render()
+end
+
+local function series(row)
+  local out = {}
+  local src = type(row.series) == "table" and row.series or {}
+  for i = 1, 60 do
+    local v = tonumber(src[i])
+    if v == nil or v ~= v then
+      v = 0
+    end
+    if v < 0 then
+      v = 0
+    elseif v > 1 then
+      v = 1
+    end
+    out[i] = v
+  end
+  return out
+end
+
+local function hasSignal(values)
+  for _, v in ipairs(values) do
+    if v > 0 then
+      return true
+    end
+  end
+  return false
+end
+
+local function chipFill(tone)
+  if tone:sub(1, 1) == "#" then
+    return tone .. "24"
+  end
+  return tone .. "/0.14"
+end
+
+local function itemNode(rowId, i, item)
+  local sid = sessionId(item.session)
+  local tone = TONE[str(item.tone)] or "primary"
+  local icon = str(item.icon)
+  if icon == "" then
+    icon = "point"
+  end
+  local lines = {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = upper(str(item.source)), fontSize = 10, fontWeight = "bold",
+        color = tone == TONE.info and FAINT or tone, maxLines = 1, flexGrow = 1 }),
+      ui.label({ text = str(item.meta), fontSize = 10.5, color = FAINT, maxLines = 1 }),
+    }),
+    ui.label({ text = str(item.text), fontFamily = PROSE, fontSize = 14.5, fontWeight = "semibold", maxLines = 2 }),
+  }
+  local detail = str(item.detail)
+  if detail ~= "" then
+    if item.code == true then
+      table.insert(lines, ui.row({ key = "code-" .. rowId .. "-" .. tostring(i), fill = CODE_FILL, radius = 6,
+        paddingH = 8, paddingV = 5 }, {
+        ui.label({ text = detail, fontSize = 11.5, color = DIM, maxLines = 2, flexGrow = 1 }),
+      }))
+    else
+      table.insert(lines, ui.label({ text = detail, fontFamily = PROSE, fontSize = 13, color = DIM, maxLines = 3 }))
+    end
+  end
+  return ui.row({ key = "item-" .. rowId .. "-" .. tostring(i), gap = 12, align = "start", paddingH = 10,
+    paddingV = 8, radius = 8, fill = ITEM_FILL }, {
+    ui.row({ width = 30, height = 30, radius = 15, fill = chipFill(tone), align = "center", justify = "center" }, {
+      ui.glyph({ name = icon, size = 16, color = tone }),
+    }),
+    ui.column({ gap = 3, flexGrow = 1 }, lines),
+    ui.button({
+      key = "go-" .. rowId .. "-" .. tostring(i),
+      text = "OPEN",
+      glyph = "chevron-right",
+      variant = "ghost",
+      controlSize = "sm",
+      visible = sid ~= nil,
+      onClick = function()
+        if sid ~= nil then
+          launch({ SUMMON, "--hermes", sid })
+        end
+      end,
+    }),
+  })
+end
+
+local function detailNode(row)
+  local id = str(row.id)
+  local items = type(row.items) == "table" and row.items or {}
+  local children = {}
+  for i, item in ipairs(items) do
+    if type(item) == "table" then
+      table.insert(children, itemNode(id, i, item))
+    end
+  end
+  if #children == 0 then
+    table.insert(children, ui.row({ key = "empty-" .. id, paddingH = 10, paddingV = 8 }, {
+      ui.label({ text = EMPTY[id] or "Nothing to show.", fontFamily = PROSE, fontSize = 13.5, color = DIM,
+        maxLines = 2 }),
+    }))
+  end
+  local foot = {}
+  local more = num(row.more)
+  table.insert(foot, ui.label({ text = more > 0 and ("+" .. tostring(more) .. " MORE") or "", fontSize = 10.5,
+    color = FAINT, maxLines = 1, flexGrow = 1 }))
+  local go = ROW_GO[id]
+  if go ~= nil then
+    table.insert(foot, ui.button({
+      key = "go-" .. id,
+      text = go.text,
+      glyph = "chevron-right",
+      variant = "outline",
+      controlSize = "sm",
+      onClick = function()
+        launch(go.argv)
+      end,
+    }))
+  end
+  table.insert(children, ui.row({ key = "foot-" .. id, gap = 10, align = "center", paddingH = 8 }, foot))
+  return ui.column({
+    key = "detail-" .. id,
+    gap = 6,
+    paddingV = 6,
+    radius = 8,
+    fill = HOVER_FILL,
+  }, children)
+end
+
+local function rowNode(row)
+  local id = str(row.id)
+  local key = "row-" .. id
+  local open = expanded == id
+  local compact = expanded ~= nil -- while a row is expanded every row is shorter, so its items fit the 360 px card
+  local amber = row.amber == true and num(row.n) > 0
+  local label = upper(str(row.label))
+  local text = label
+  if row.n ~= nil then
+    text = label .. " " .. tostring(num(row.n))
+  end
+  local values = series(row)
+  local color = SPARK
+  if amber then
+    color = AMBER
+  elseif not hasSignal(values) then
+    color = SPARK_IDLE
+  end
+  local hot = hovered == key or open
+  local title = {
+    ui.glyph({ name = open and "chevron-down" or "chevron-right", size = 14, color = open and SPARK or FAINT }),
+    ui.label({
+      text = text,
+      fontSize = FONT,
+      fontWeight = "bold",
+      color = amber and AMBER or nil,
+      maxLines = 1,
+      flexGrow = 1,
+    }),
+  }
+  if amber then
+    table.insert(title, ui.row({ fill = AMBER_CHIP, radius = 4, paddingH = 7, paddingV = 3, align = "center" }, {
+      ui.label({ text = "NEEDS YOU", fontSize = 10.5, color = AMBER, maxLines = 1 }),
+    }))
+  end
+  return ui.row({
+    key = key,
+    gap = 16,
+    align = "center",
+    paddingH = 8,
+    paddingV = compact and 3 or 6,
+    radius = 8,
+    fill = hot and HOVER_FILL or CLEAR,
+    border = hot and HOVER_BORDER or CLEAR,
+    onClick = function()
+      toggle(id)
+    end,
+    onHover = onHoverFor(key),
+  }, {
+    ui.row({ gap = 8, align = "center", flexGrow = 1 }, title),
+    ui.graph({
+      key = "spark-" .. str(row.id),
+      values = values,
+      color = color,
+      lineWidth = 2,
+      fillOpacity = 0.14,
+      width = 120,
+      height = compact and 18 or 28,
+    }),
+  })
+end
+
+render = function()
+  local children = {}
+  if not (isOpen and guarded) or brief == nil then
+    local text = "WHILE YOU WERE AWAY"
+    if guarded and loaded then
+      text = "NO BRIEF YET"
+    end
+    panel.render(ui.column({ padding = 16, gap = 8 }, {
+      ui.label({ text = text, fontSize = FONT, fontWeight = "bold", color = DIM, maxLines = 1 }),
+    }))
+    return
+  end
+  -- One hint line in the header (no footer line: the 360 px card has no room once the rows scroll).
+  local status = "CLICK A ROW FOR DETAILS // CLOSES IN " .. tostring(math.max(0, OPEN_S - seconds)) .. " S"
+  if expanded ~= nil then
+    status = "CLICK AGAIN TO COLLAPSE // ESC CLOSES"
+  elseif pinned then
+    status = "ENTER SUMMONS HERMES // ESC CLOSES"
+  end
+  table.insert(children, ui.row({ key = "head", gap = 12, align = "center" }, {
+    ui.label({
+      text = upper(str(brief.title)),
+      fontSize = 16,
+      fontWeight = "bold",
+      maxLines = 1,
+      flexGrow = 1,
+    }),
+    ui.label({ key = "status", text = status, fontSize = 10.5, color = FAINT, maxLines = 1 }),
+  }))
+  local body = {}
+  local rows = type(brief.rows) == "table" and brief.rows or {}
+  for _, row in ipairs(rows) do
+    if type(row) == "table" then
+      table.insert(body, rowNode(row))
+      if expanded ~= nil and str(row.id) == expanded then
+        table.insert(body, detailNode(row))
+      end
+    end
+  end
+  -- The panel height is fixed by the manifest; an expanded row can overflow it, so only the rows scroll and the
+  -- sentence and hint stay pinned underneath.
+  -- revealKey keeps the clicked row's header in view (a 6-item row otherwise opened scrolled past its own header).
+  table.insert(children, ui.scroll({ key = "body", gap = expanded ~= nil and 4 or 2, flexGrow = 1,
+    revealKey = expanded ~= nil and ("row-" .. expanded) or "row-done" }, body))
+  local sentence = proseCase(str(brief.sentence))
+  if expanded == nil and sentence ~= "" then
+    table.insert(children, ui.label({ key = "sentence", text = sentence, fontFamily = PROSE, fontSize = 14, color = DIM,
+      maxLines = 1 }))
+  end
+  panel.render(ui.column({ padding = 16, gap = 6, flexGrow = 1 }, children))
+end
+
+local function load()
+  local myGen = gen
+  local queued = noctalia.readFileAsync(BRIEF, function(contents, _err)
+    if myGen ~= gen or not isOpen then
+      return
+    end
+    loaded = true
+    if contents ~= nil then
+      local d = noctalia.json.decode(contents)
+      if type(d) == "table" then
+        brief = d
+      end
+    end
+    if brief == nil then
+      render()
+      return
+    end
+    render()
+  end)
+  if not queued then
+    loaded = true
+    render()
+  end
+end
+
+function onOpen(_context)
+  gen = gen + 1
+  local myGen = gen
+  isOpen = true
+  guarded = false
+  brief = nil
+  loaded = false
+  seconds = 0
+  hovered = nil
+  expanded = nil
+  pinned = false
+  render()
+  local launched = noctalia.runAsync({ SUMMON, "--guard" }, function(result)
+    if myGen ~= gen then
+      return
+    end
+    if result.exitCode ~= 0 then
+      panel.close()
+      return
+    end
+    guarded = true
+    seconds = 0
+    panel.setWantsSecondTicks(true)
+    load()
+  end)
+  if not launched then
+    panel.close()
+  end
+end
+
+function onClose()
+  gen = gen + 1
+  isOpen = false
+  guarded = false
+  hovered = nil
+  expanded = nil
+  pinned = false
+  panel.setWantsSecondTicks(false)
+end
+
+function update()
+  if not (isOpen and guarded) then
+    return
+  end
+  seconds = seconds + 1
+  if seconds >= OPEN_S and not pinned then
+    panel.close()
+    return
+  end
+  if pinned and seconds > 10 then
+    if seconds == 11 then
+      panel.setWantsSecondTicks(false) -- pinned and the model sentence window is over: nothing left to tick for
+    end
+    return
+  end
+  if brief ~= nil and brief.sentence_src ~= "model" and seconds <= 10 then
+    load() -- ares-briefd rewrites brief.json when the model sentence arrives (up to 10 s after the panel opens)
+    return
+  end
+  render()
+end
+
+-- The host only delivers chords listed in capture_keys, so "any key" is Return (summon), space (dismiss) and Esc
+-- (host); every other key is left to the host.
+function onKey(chord, pressed)
+  if not pressed or not (isOpen and guarded) then
+    return
+  end
+  if chord == "space" then
+    panel.close()
+  elseif chord == "Return" and brief ~= nil then
+    summon()
+  end
+end

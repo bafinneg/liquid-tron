@@ -1,0 +1,15 @@
+module modules
+Hostname 1.0 Hostname.qml
+Clock 1.0 Clock.qml
+Cpu 1.0 Cpu.qml
+Memory 1.0 Memory.qml
+Temperature 1.0 Temperature.qml
+Network 1.0 Network.qml
+Volume 1.0 Volume.qml
+Digest 1.0 Digest.qml
+Notifications 1.0 Notifications.qml
+Tray 1.0 Tray.qml
+Workspaces 1.0 Workspaces.qml
+ModeIndicator 1.0 ModeIndicator.qml
+Gpu 1.0 Gpu.qml
+Media 1.0 Media.qml

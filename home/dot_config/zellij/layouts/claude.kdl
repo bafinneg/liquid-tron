@@ -1,0 +1,19 @@
+// 2×2 Claude Code grid — zellij port of the retired t-claude tmux
+// session (FEAT-liquid-tron-desktop-polish-2 C5).
+layout {
+    tab name="claude" focus=true {
+        pane split_direction="vertical" {
+            pane split_direction="horizontal" {
+                pane command="claude" close_on_exit=true
+                pane command="claude" close_on_exit=true
+            }
+            pane split_direction="horizontal" {
+                pane command="claude" close_on_exit=true
+                pane command="claude" close_on_exit=true
+            }
+        }
+    }
+    default_tab_template {
+        children
+    }
+}

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# IPC wrapper for the pinned Noctalia-primary: verifies the binary hash on every
+# call, then runs `noctalia msg "$@"` under the same HOME / config / state /
+# runtime tuple as noctalia-primary. No shell-string evaluation. FEAT-lt26r-2
+# OD-A: real XDG config/cache homes; private homes only in NOCTALIA_*_HOME.
+#
+# SINGLE PIN SITE (INFRA-lt26r-1 OD-B). The two lines below are the only place
+# the Noctalia binary path and sha256 are written. noctalia-primary,
+# noctalia-primary-apply-visuals and wallpaper_control.py parse exactly these
+# two lines (`^binary=/...$`, `^expected_sha=<64 hex>$`) and fail closed if
+# either is missing, duplicated or malformed. Keep them unquoted, one per line.
+
+uid=$(id -u)
+runtime=${XDG_RUNTIME_DIR:-/run/user/$uid}
+binary={{ .chezmoi.homeDir }}/.local/lib/noctalia-pilot/5.3.0-lt16/bin/noctalia
+expected_sha=d8b1acf518104c0c78b6a56d97e029992f8f3d3d3a9c9656835fb71e8046c48d
+state_home={{ .chezmoi.homeDir }}/.local/state/noctalia-primary
+config_home=$state_home/config-home
+
+if [[ "$runtime" != "/run/user/$uid" || ! -d "$runtime" || -L "$runtime" ]]; then
+  printf 'Unsafe XDG_RUNTIME_DIR: %s\n' "$runtime" >&2
+  exit 1
+fi
+if [[ ! -x "$binary" ]]; then
+  printf 'Pinned Noctalia binary is unavailable: %s\n' "$binary" >&2
+  exit 1
+fi
+actual_sha=$(sha256sum "$binary" | cut -d' ' -f1)
+if [[ "$actual_sha" != "$expected_sha" ]]; then
+  printf 'Pinned Noctalia binary hash mismatch.\n' >&2
+  exit 1
+fi
+
+exec env HOME={{ .chezmoi.homeDir }} \
+  XDG_CONFIG_HOME={{ .chezmoi.homeDir }}/.config \
+  XDG_RUNTIME_DIR="$runtime" \
+  WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" \
+  NOCTALIA_CONFIG_HOME="$config_home" \
+  NOCTALIA_STATE_HOME="$state_home" \
+  NOCTALIA_DATA_HOME={{ .chezmoi.homeDir }}/.local/share/noctalia-primary \
+  XDG_CACHE_HOME={{ .chezmoi.homeDir }}/.cache \
+  "$binary" msg "$@"

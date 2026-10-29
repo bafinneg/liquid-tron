@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=kitty — System
+GenericName=System monitoring terminal
+Comment=Kitty with btop for the System workspace (FEAT-workspace-ux-overhaul)
+TryExec=kitty
+StartupNotify=true
+Exec=sh -c "kitty --class=kitty-system --session=\\$HOME/.config/kitty/system.conf"
+Icon=kitty
+StartupWMClass=kitty-system
+Terminal=false
+Categories=System;TerminalEmulator;Monitor;

@@ -1,0 +1,56 @@
+// Ares sentinel lock (FEAT-ares-sentinel-lock). Launched only through ~/.local/bin/ares-lock, which
+// falls back to hyprlock if this client exits without a verified unlock.
+//
+// Safety contract:
+//  - The session is released only by LockContext.unlockRequested, which fires only after PamResult.Success.
+//  - No IpcHandler exists in this config (the preview harness has its own, in preview.qml).
+//  - Exit code 42 (plus the unlock marker) tells the launcher the release was a genuine authentication.
+//  - Any other exit, including a surface without lock state (exit 4) or an unsecured lock (exit 3), makes the
+//    launcher start hyprlock.
+//  - LockContext is a singleton: surfaces inside the WlSessionLock component must never depend on an id lookup
+//    (that lookup resolved to undefined in the real lock on 2026-10-23, leaving surfaces without input).
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import Quickshell.Wayland
+
+ShellRoot {
+    id: root
+
+    readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/ares-lock"
+
+    Connections {
+        target: LockContext
+        function onUnlockRequested() {
+            marker.setText("unlocked " + Date.now() + "\n");
+            lock.locked = false;
+            quitTimer.start();
+        }
+    }
+
+    FileView { id: marker; path: root.runtimeDir + "/unlocked"; atomicWrites: true; printErrors: false }
+    Timer { id: quitTimer; interval: 250; onTriggered: Qt.exit(42) }
+
+    Timer {
+        interval: 5000; running: true
+        onTriggered: if (!lock.secure) { console.error("ares-lock: session lock not secured; exiting for fallback"); Qt.exit(3); }
+    }
+
+    WlSessionLock {
+        id: lock
+        locked: true
+
+        WlSessionLockSurface {
+            id: lockSurface
+            color: "black"
+            LockSurface {
+                anchors.fill: parent
+                // Centre PG42UQ by EDID model/serial; screen geometry comes from the surface itself.
+                primary: !!lockSurface.screen && ((lockSurface.screen.serialNumber || "") === "{{ .monitors.center.serial }}"
+                         || (lockSurface.screen.model || "").indexOf("PG42UQ") >= 0)
+                screenX: lockSurface.screen ? lockSurface.screen.x : 0
+                screenY: lockSurface.screen ? lockSurface.screen.y : 0
+            }
+        }
+    }
+}

@@ -1,0 +1,18 @@
+id          = "liquidtron/wallpaper"
+name        = "Wallpaper picker"
+version     = "1.0.0"
+plugin_api  = 34
+author      = "liquidtron"
+description = "One click sets a wallpaper (or a preset triptych) on all three monitors; FULL STUDIO opens the per-monitor studio."
+
+# Native replacement for the compact Quickshell picker (wallpaper-studio Compact.qml). Opened by the bar wallpaper
+# widget's left click and Super+W (`panel-toggle liquidtron/wallpaper:picker`); outside-click dismissal, the attached
+# look and adaptive glass are Noctalia's own. The full per-monitor Wallpaper Studio stays a Quickshell overlay.
+[[panel]]
+id              = "picker"
+entry           = "picker.luau"
+placement       = "attached"
+width           = 1120
+height          = 720
+open_near_click = true   # opens under the bar widget
+capture_keys    = ["e"]  # E = FULL STUDIO (Esc is the host's close)

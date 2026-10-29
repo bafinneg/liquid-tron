@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Zen — Web
+GenericName=Web Browser (research / general)
+Comment=Zen Browser, zen-web profile (FEAT-workspace-ux-overhaul)
+Exec=env MOZ_APP_REMOTINGNAME=zen-web /opt/zen-browser-bin/zen-bin -P zen-web --new-instance %u
+Icon=zen-browser
+Type=Application
+StartupNotify=true
+StartupWMClass=zen-web
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;

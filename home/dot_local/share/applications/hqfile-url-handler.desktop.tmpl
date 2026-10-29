@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Workboard file link
+Comment=Opens hqfile:// links from the {{ .board_name }} Workboard: folders in Thunar, notes as a readable page
+Exec={{ .chezmoi.homeDir }}/.local/bin/hqfile-open %u
+MimeType=x-scheme-handler/hqfile;
+NoDisplay=true
+Terminal=false

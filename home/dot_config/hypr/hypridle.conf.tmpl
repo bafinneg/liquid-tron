@@ -1,0 +1,56 @@
+# hypridle — idle daemon, two-tier
+#
+# Flattened from the original aesthetic-oled-burnin-mitigation Chunk 2
+# cascade (dim/lock/DPMS at 3/5/8 min) per user request on 2026-04-19:
+# no dim tier, lock at 15 min, DPMS off at 30 min. Drift wrapper
+# disabled — lock_cmd points at bare hyprlock, input field uses the
+# static position from hyprlock.conf. hypr-lock-drift.sh is retained
+# on disk but no longer invoked; retiring it formally is a future spec.
+#
+# PG42UQ deep-sleep wake bug: if DPMS off followed by resume leaves the
+# center display black, add the ddcutil workaround below as an `on-resume`
+# hook — see Chunk 2 spec notes. Currently disabled pending runtime test.
+
+general {
+    lock_cmd         = {{ .chezmoi.homeDir }}/.local/bin/ares-lock   # FEAT-ares-sentinel-lock; fails closed to hyprlock
+    before_sleep_cmd = loginctl lock-session
+    after_sleep_cmd  = hyprctl dispatch 'hl.dsp.dpms({ action = "on" })'
+
+    # session-idle-inhibit.service (oled-burnin Chunk 10) holds a
+    # systemd --what=idle --mode=block lock for the whole user session
+    # so logind's IdleAction=suspend only fires at the greeter. hypridle
+    # honors systemd idle inhibitors by default — without this override
+    # our timers never advance and lock/DPMS never fire.
+    ignore_systemd_inhibit = true
+}
+
+# Lock at 15 min idle (via logind, respects lock_cmd)
+listener {
+    timeout    = 900
+    on-timeout = loginctl lock-session
+}
+
+# DPMS off at 30 min idle
+listener {
+    timeout    = 1800
+    on-timeout = hyprctl dispatch 'hl.dsp.dpms({ action = "off" })'
+    on-resume  = hyprctl dispatch 'hl.dsp.dpms({ action = "on" })'
+    # PG42UQ deep-sleep wake workaround — uncomment if wake-from-DPMS fails
+    # on the center display after runtime test. `--model PG42UQ` is used
+    # instead of `-d N` because ddcutil display numbers can shift if
+    # devices come/go; model filter is stable as long as the PG42UQ is
+    # the only display with that model string (true on this rig — the
+    # other two are AW2725Q). `D6 01` = VCP Power Mode → DPMS ON.
+    # on-resume = hyprctl dispatch dpms on && sleep 1 && ddcutil --model PG42UQ setvcp D6 01
+}
+
+# Short-timeout presence signal for FEAT-nostromo-llm sentinel mode.
+# Writes a flag file that PresenceState polls at 3s cadence; does NOT
+# lock the session (the 900s listener above owns lock). The flag-file
+# idiom keeps quickshell decoupled from hypridle — no dbus binding, no
+# extra subprocess fanout, just one inode appearing and disappearing.
+listener {
+    timeout    = 300
+    on-timeout = mkdir -p ~/.local/state/nostromo && touch ~/.local/state/nostromo/hypridle-idle
+    on-resume  = rm -f ~/.local/state/nostromo/hypridle-idle
+}

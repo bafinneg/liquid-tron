@@ -1,0 +1,144 @@
+#!/usr/bin/python3 -I
+"""Read-only shortcut reference for the 7800x (FEAT-lt26r-5 OD-A).
+
+SUPER+/ runs this script. It lists every loaded Hyprland bind from `hyprctl -j binds`, uppercase and
+grouped, in the native Noctalia launcher (`noctalia dmenu`, pinned binary, hash-checked from the single
+pin site). Picking a row prints nothing and runs nothing: the selection is read and discarded.
+A second invocation while the reference is open closes it. Usage is never recorded (the dmenu stdin
+provider does not track usage). Without a running Noctalia (MOCR-Q fallback) it uses fuzzel.
+
+  shortcut-reference            open (or close, if already open)
+  shortcut-reference --rows     print the rows (no UI)
+  shortcut-reference --stats    print TOTAL=<n> UNLABELED=<n>
+  --binds-json <file>           read binds from a file instead of hyprctl (tests)
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+PIN_FILE = Path(os.environ.get("SHORTCUT_REFERENCE_PIN_FILE") or "{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg")
+PROMPT = "KEYS // "
+GROUP_ORDER = [
+    "LAUNCH", "SESSION", "WINDOW", "FOCUS", "MOVE", "RESIZE", "WORKSPACE", "MONITOR", "GROUP", "OVERLAY",
+    "CAPTURE", "CLIPBOARD", "MEDIA", "MOUSE", "GESTURE", "FALLBACK",
+]
+MODS = [(64, "SUPER"), (4, "CTRL"), (8, "ALT"), (1, "SHIFT")]
+KEY_NAMES = {
+    "slash": "/", "backslash": "\\", "bracketleft": "[", "bracketright": "]", "comma": ",", "period": ".",
+    "grave": "`", "return": "ENTER", "mouse_up": "WHEEL DOWN", "mouse_down": "WHEEL UP",
+    "mouse:272": "LEFT DRAG", "mouse:273": "RIGHT DRAG", "mouse:275": "MOUSE BACK", "mouse:276": "MOUSE FORWARD",
+    "code:156": "MX GESTURE UP", "code:157": "MX GESTURE DOWN", "code:210": "MX GESTURE LEFT",
+    "code:211": "MX GESTURE RIGHT", "xf86tools": "M1", "xf86launch5": "M2", "xf86launch6": "M3",
+    "xf86launch7": "M4",
+}
+
+
+def load_binds(path: str | None) -> list[dict]:
+    if path:
+        return json.loads(Path(path).read_text())
+    out = subprocess.run(["hyprctl", "-j", "binds"], check=True, capture_output=True, text=True).stdout
+    return json.loads(out)
+
+
+def chord(bind: dict) -> str:
+    mods = [name for bit, name in MODS if int(bind.get("modmask", 0)) & bit]
+    key = str(bind.get("key", ""))
+    mods.append(KEY_NAMES.get(key.lower(), key.upper()))
+    return "+".join(mods)
+
+
+def rows(binds: list[dict]) -> list[tuple[str, str, str]]:
+    out = []
+    for b in binds:
+        desc = str(b.get("description") or "").strip()
+        group, _, action = desc.partition(":")
+        if not action:
+            group, action = "UNLABELED", desc or "(NO DESCRIPTION)"
+        out.append((group.strip().upper(), chord(b), action.strip().upper()))
+    rank = {g: i for i, g in enumerate(GROUP_ORDER)}
+    return sorted(out, key=lambda r: (rank.get(r[0], len(rank)), r[1]))
+
+
+CHORD_WIDTH = 22
+
+
+def lines(binds: list[dict]) -> list[str]:
+    # One aligned title per row (the compact launcher hides subtitles): CHORD  GROUP // ACTION. Monospace shell font.
+    return [f"{keys:<{CHORD_WIDTH}}{group} // {action}" for group, keys, action in rows(binds)]
+
+
+def pinned_binary() -> str | None:
+    try:
+        text = PIN_FILE.read_text()
+    except OSError:
+        return None
+    binary = re.findall(r"^binary=(/\S+)$", text, re.M)
+    sha = re.findall(r"^expected_sha=([0-9a-f]{64})$", text, re.M)
+    if len(binary) != 1 or len(sha) != 1:
+        return None
+    try:
+        digest = hashlib.sha256(Path(binary[0]).read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return binary[0] if digest == sha[0] else None
+
+
+def runtime_dir() -> Path:
+    return Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+
+
+def open_reference(payload: str) -> int:
+    runtime = runtime_dir()
+    display = os.environ.get("WAYLAND_DISPLAY") or "wayland-1"
+    lock = open(runtime / "shortcut-reference.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Already open: the same chord closes it (the launcher is the only panel the reference uses).
+        subprocess.run([str(PIN_FILE), "panel-close", "launcher"], capture_output=True)
+        return 0
+    env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY=display)
+    binary = pinned_binary()
+    if binary and (runtime / f"noctalia-dmenu-{display}.sock").exists():
+        cmd = [binary, "dmenu", "--prompt", PROMPT]
+    else:
+        cmd = ["fuzzel", "--dmenu", "--prompt", PROMPT, "--width", "88", "--lines", "18",
+               "--background", "06060cf2", "--text-color", "c0c0d0ff", "--match-color", "0abdc6ff",
+               "--selection-color", "0072ffff", "--selection-text-color", "e0e0f0ff",
+               "--border-color", "0abdc6ff", "--border-width", "2", "--border-radius", "8",
+               "--font", "IosevkaTerm Nerd Font:size=11"]
+    # The selection is read and discarded: a reference row never executes anything.
+    subprocess.run(cmd, input=payload, text=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    args = list(argv)
+    path = None
+    if "--binds-json" in args:
+        i = args.index("--binds-json")
+        path = args[i + 1]
+        del args[i:i + 2]
+    binds = load_binds(path)
+    if args == ["--stats"]:
+        unlabeled = sum(1 for b in binds if not str(b.get("description") or "").strip())
+        print(f"TOTAL={len(binds)} UNLABELED={unlabeled}")
+        return 0
+    if args == ["--rows"]:
+        print("\n".join(lines(binds)))
+        return 0
+    if args:
+        print(__doc__, file=sys.stderr)
+        return 64
+    return open_reference("\n".join(lines(binds)) + "\n")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

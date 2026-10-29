@@ -1,0 +1,556 @@
+import Quickshell
+import Quickshell.Wayland
+import Quickshell.Hyprland
+import Quickshell.Io
+import QtQuick
+import "theme"
+
+// Wallpaper Studio panel (the expanded view; Compact.qml is the default).
+// Three monitor slots (LEFT / CENTER / RIGHT) mirror the physical desk. Pick a
+// target (ALL or one monitor), click a wallpaper to stage it, then APPLY.
+// Double-click applies immediately. COMPACT returns to the compact picker.
+// Keys: A/1/2/3 target, Enter apply, Esc close.
+PanelWindow {
+    id: root
+
+    signal openRequested()
+    signal compactRequested()
+
+    readonly property string ctl: "{{ .chezmoi.homeDir }}/.local/bin/wallpaper-control"
+    readonly property var roles: ["left", "center", "right"]
+    readonly property var roleTitle: ({ left: "LEFT", center: "CENTER", right: "RIGHT" })
+
+    property bool active: false
+    property bool loading: false
+    property bool applying: false
+    property string message: ""
+    property bool messageIsError: false
+
+    property var items: []
+    property var itemByPath: ({})
+    property var presets: []
+    property var current: ({ left: "", center: "", right: "" })
+    property var connectors: ({ left: "", center: "", right: "" })
+    property string currentMode: ""
+    property var staged: ({ left: "", center: "", right: "" })
+    property string target: "all"
+    property string filter: "all"
+
+    readonly property var filtered: {
+        var f = root.filter
+        return root.items.filter(function(it) { return f === "all" || it.kind === f })
+    }
+    readonly property bool complete: staged.left !== "" && staged.center !== "" && staged.right !== ""
+    readonly property bool dirty: staged.left !== current.left || staged.center !== current.center || staged.right !== current.right
+    readonly property bool uniform: complete && staged.left === staged.center && staged.center === staged.right
+    readonly property bool stagedIsMainframe: {
+        for (var i = 0; i < root.presets.length; i++) {
+            var l = root.presets[i].layout
+            if (l.left === staged.left && l.center === staged.center && l.right === staged.right) return true
+        }
+        return false
+    }
+    readonly property string outcome: {
+        if (!complete) return "Choose a wallpaper for every monitor."
+        if (stagedIsMainframe) return "Mainframe triptych · Liquid Tron colours"
+        if (uniform && kindOf(staged.left) === "image") return "One still on every monitor · shell colours follow the image"
+        if (uniform) return "One animated wallpaper on every monitor · Liquid Tron colours"
+        return "Per-monitor scene · Liquid Tron colours"
+    }
+
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.namespace: "liquid-tron-wallpaper-studio"
+    WlrLayershell.keyboardFocus: root.active ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+    anchors { top: true; bottom: true; left: true; right: true }
+    exclusiveZone: 0
+    color: "transparent"
+    visible: root.active
+
+    // ---------------------------------------------------------------- data
+    function kindOf(path) {
+        var it = root.itemByPath[path]
+        return it ? it.kind : (/\.(mp4|webm|mkv|mov)$/i.test(path) ? "video" : "image")
+    }
+    function nameOf(path) {
+        var it = root.itemByPath[path]
+        if (it) return it.name
+        if (!path) return "—"
+        var base = path.substring(path.lastIndexOf("/") + 1)
+        return base.replace(/\.[^.]+$/, "")
+    }
+    function thumbOf(path) {
+        var it = root.itemByPath[path]
+        return it && it.thumb ? "file://" + it.thumb : ""
+    }
+    function presetPath(role) {
+        return root.presets.length > 0 ? root.presets[0].layout[role] : ""
+    }
+
+    function open() {
+        root.message = ""
+        root.messageIsError = false
+        root.target = "all"
+        cardSpring.snap(0)  // the window hides at once on close, so always grow in from nothing
+        root.active = true
+        root.loading = true
+        libProc.running = false
+        statusProc.running = false
+        libProc.running = true
+        statusProc.running = true
+        focusSink.forceActiveFocus()
+    }
+    function close() {
+        if (root.applying) return
+        root.active = false
+    }
+    function toggle() {
+        if (root.active) root.close()
+        else root.openRequested()
+    }
+
+    function loadLibrary(text) {
+        try {
+            var data = JSON.parse(text)
+            var map = {}
+            for (var i = 0; i < data.items.length; i++) map[data.items[i].path] = data.items[i]
+            root.itemByPath = map
+            root.items = data.items
+            root.presets = data.presets || []
+        } catch (e) {
+            root.showError("Could not read the wallpaper library.")
+        }
+        root.loading = false
+        root.syncStaged()
+    }
+    function loadStatus(text) {
+        try {
+            var data = JSON.parse(text)
+            var lay = data.layout
+            root.currentMode = data.mode || ""
+            if (lay) {
+                root.current = { left: lay.left.path, center: lay.center.path, right: lay.right.path }
+                root.connectors = { left: lay.left.connector, center: lay.center.connector, right: lay.right.connector }
+            }
+        } catch (e) {
+            root.current = { left: "", center: "", right: "" }
+        }
+        root.syncStaged()
+    }
+    // Stage the committed layout; anything outside the library (e.g. the cached
+    // static triptych) is staged as its animated Mainframe counterpart.
+    function syncStaged() {
+        var s = {}
+        for (var i = 0; i < root.roles.length; i++) {
+            var r = root.roles[i]
+            var p = root.current[r]
+            s[r] = (p && root.itemByPath[p]) ? p : root.presetPath(r)
+        }
+        root.staged = s
+    }
+
+    function assign(path) {
+        if (root.applying) return
+        var s = { left: root.staged.left, center: root.staged.center, right: root.staged.right }
+        if (root.target === "all") {
+            s.left = path; s.center = path; s.right = path
+        } else {
+            s[root.target] = path
+            var idx = root.roles.indexOf(root.target)
+            if (idx < root.roles.length - 1) root.target = root.roles[idx + 1]
+        }
+        root.staged = s
+        root.message = ""
+    }
+    function stagePreset(p) {
+        if (root.applying) return
+        root.staged = { left: p.layout.left, center: p.layout.center, right: p.layout.right }
+        root.target = "all"
+        root.message = ""
+    }
+    function apply() {
+        if (root.applying || !root.complete || !root.dirty) return
+        root.applying = true
+        root.message = "Applying…"
+        root.messageIsError = false
+        applyProc.command = [root.ctl, "apply-scene",
+            "--left", root.staged.left, "--center", root.staged.center, "--right", root.staged.right]
+        applyProc.running = true
+    }
+    function showError(text) {
+        root.message = text
+        root.messageIsError = true
+    }
+
+    Process {
+        id: libProc
+        command: [root.ctl, "library"]
+        stdout: StdioCollector { id: libOut; onStreamFinished: root.loadLibrary(libOut.text) }
+    }
+    Process {
+        id: statusProc
+        command: [root.ctl, "status"]
+        stdout: StdioCollector { id: statusOut; onStreamFinished: root.loadStatus(statusOut.text) }
+    }
+    Process {
+        id: applyProc
+        stderr: StdioCollector { id: applyErr }
+        onExited: function(code, status) {
+            root.applying = false
+            if (code === 0) {
+                root.current = { left: root.staged.left, center: root.staged.center, right: root.staged.right }
+                root.message = "Applied."
+                root.messageIsError = false
+                closeTimer.restart()
+            } else {
+                var lines = applyErr.text.trim().split("\n")
+                var last = lines.length > 0 ? lines[lines.length - 1].replace(/^wallpaper-control:\s*/, "") : ""
+                root.showError("Not applied — the previous wallpaper was kept. " + last)
+                statusProc.running = true
+            }
+        }
+    }
+    Timer { id: closeTimer; interval: 650; onTriggered: root.close() }
+
+    HyprlandFocusGrab {
+        windows: [root]
+        active: root.active
+        onCleared: root.close()
+    }
+
+    // --------------------------------------------------------------- scene
+    Rectangle {
+        anchors.fill: parent
+        color: Qt.rgba(0.02, 0.02, 0.05, 0.62)
+        MouseArea { anchors.fill: parent; onClicked: root.close() }
+    }
+
+    Item {
+        id: focusSink
+        focus: root.active
+        Keys.onPressed: function(event) {
+            if (event.key === Qt.Key_Escape) { root.close(); event.accepted = true }
+            else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.apply(); event.accepted = true }
+            else if (event.key === Qt.Key_A) { root.target = "all"; event.accepted = true }
+            else if (event.key === Qt.Key_1) { root.target = "left"; event.accepted = true }
+            else if (event.key === Qt.Key_2) { root.target = "center"; event.accepted = true }
+            else if (event.key === Qt.Key_3) { root.target = "right"; event.accepted = true }
+        }
+    }
+
+    Rectangle {
+        id: card
+        width: Math.min(root.width - 200, 2480)
+        height: Math.min(root.height - 220, 1760)
+        anchors.centerIn: parent
+        color: Colors.bg_dark
+        border.color: Colors.cyan
+        border.width: Geometry.borderWidth
+        radius: Geometry.radiusChrome
+        // FEAT-lt28: one spring drives the card's opacity and scale together.
+        opacity: cardSpring.value
+        scale: 0.985 + 0.015 * cardSpring.value
+        Spring {
+            id: cardSpring
+            to: root.active ? 1 : 0
+            response: Motion.springCard
+            dampingRatio: Motion.springDamping
+        }
+
+        MouseArea { anchors.fill: parent }  // swallow clicks so the scrim does not close
+
+        // Header ------------------------------------------------------
+        Item {
+            id: header
+            anchors { left: parent.left; right: parent.right; top: parent.top; margins: 28 }
+            height: 48
+            Text {
+                anchors { left: parent.left; verticalCenter: parent.verticalCenter }
+                text: "WALLPAPER STUDIO"
+                color: Colors.cyan
+                font.family: Geometry.fontFamily
+                font.pixelSize: 29
+                font.weight: Font.DemiBold
+                font.letterSpacing: 2.4
+            }
+            Rectangle {
+                id: compactBtn
+                anchors { right: closeBtn.left; rightMargin: 12; verticalCenter: parent.verticalCenter }
+                width: compactText.implicitWidth + 32; height: 44; radius: Geometry.radiusInteractive
+                color: compactMa.containsMouse ? Colors.bg_inset : "transparent"
+                border.color: compactMa.containsMouse ? Colors.cyan : Colors.border_dark
+                Text { id: compactText; anchors.centerIn: parent; text: "⤡  COMPACT"; color: Colors.fg; font.family: Geometry.fontFamily; font.pixelSize: 18; font.weight: Font.DemiBold; font.letterSpacing: 1.2 }
+                MouseArea { id: compactMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (!root.applying) root.compactRequested() } }
+            }
+            Text {
+                anchors { right: compactBtn.left; rightMargin: 18; verticalCenter: parent.verticalCenter }
+                text: "A · 1 · 2 · 3 choose monitor    ENTER apply    ESC close"
+                color: Colors.fg_dark
+                font.family: Geometry.fontFamily
+                font.pixelSize: 18
+                font.letterSpacing: 1.0
+            }
+            Rectangle {
+                id: closeBtn
+                anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                width: 44; height: 44; radius: Geometry.radiusInteractive
+                color: closeMa.containsMouse ? Colors.bg_inset : "transparent"
+                border.color: Colors.border_dark
+                Text { anchors.centerIn: parent; text: "✕"; color: Colors.fg; font.pixelSize: 21 }
+                MouseArea { id: closeMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.close() }
+            }
+        }
+
+        // Desk: target chips + three monitor slots ---------------------
+        Item {
+            id: desk
+            anchors { left: parent.left; right: parent.right; top: header.bottom; margins: 28; topMargin: 18 }
+            height: slotsRow.height + targetRow.height + 16
+
+            Row {
+                id: targetRow
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: 10
+                Repeater {
+                    model: [{ id: "all", label: "ALL MONITORS" }, { id: "left", label: "LEFT" }, { id: "center", label: "CENTER" }, { id: "right", label: "RIGHT" }]
+                    delegate: Rectangle {
+                        required property var modelData
+                        readonly property bool on: root.target === modelData.id
+                        width: chipText.implicitWidth + 44; height: 44; radius: Geometry.radiusInteractive
+                        color: on ? Colors.cyan : (chipMa.containsMouse ? Colors.bg_inset : Colors.bg_alt)
+                        border.color: on ? Colors.cyan : Colors.border_dark
+                        Text {
+                            id: chipText
+                            anchors.centerIn: parent
+                            text: modelData.label
+                            color: parent.on ? Colors.bg_dark : Colors.fg
+                            font.family: Geometry.fontFamily
+                            font.pixelSize: 20
+                            font.weight: Font.DemiBold
+                            font.letterSpacing: 1.4
+                        }
+                        MouseArea { id: chipMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.target = modelData.id }
+                    }
+                }
+            }
+
+            Row {
+                id: slotsRow
+                anchors { top: targetRow.bottom; topMargin: 16; horizontalCenter: parent.horizontalCenter }
+                spacing: 18
+                readonly property real unit: Math.min((desk.width - 2 * spacing) / 3.3, 600)
+                Repeater {
+                    model: root.roles
+                    delegate: Rectangle {
+                        id: slot
+                        required property string modelData
+                        readonly property string role: modelData
+                        readonly property string path: root.staged[role] || ""
+                        readonly property bool targeted: root.target === "all" || root.target === role
+                        readonly property bool changed: path !== (root.current[role] || "")
+                        // The PG42UQ is physically larger than the AW2725Q pair.
+                        width: slotsRow.unit * (role === "center" ? 1.3 : 1.0)
+                        height: width * 9 / 16 + 54
+                        y: role === "center" ? 0 : (slotsRow.unit * 0.3 * 9 / 16)
+                        radius: Geometry.radiusInteractive
+                        color: Colors.bg_alt
+                        border.color: targeted ? Colors.cyan : Colors.border_dark
+                        border.width: targeted ? Geometry.borderWidthAccent : Geometry.borderWidth
+
+                        Rectangle {
+                            id: screenFace
+                            anchors { left: parent.left; right: parent.right; top: parent.top; margins: 6 }
+                            height: width * 9 / 16
+                            color: Colors.bg
+                            radius: 4
+                            clip: true
+                            Image {
+                                anchors.fill: parent
+                                source: root.thumbOf(slot.path)
+                                fillMode: Image.PreserveAspectCrop
+                                asynchronous: true
+                                sourceSize.width: 480
+                            }
+                            Rectangle {
+                                visible: root.kindOf(slot.path) === "video" && slot.path !== ""
+                                anchors { right: parent.right; top: parent.top; margins: 8 }
+                                width: motionText.implicitWidth + 14; height: 22; radius: 4
+                                color: Qt.rgba(0, 0, 0, 0.7)
+                                border.color: Colors.cyan
+                                Text { id: motionText; anchors.centerIn: parent; text: "◉ MOTION"; color: Colors.cyan; font.family: Geometry.fontFamily; font.pixelSize: 16; font.letterSpacing: 1.2 }
+                            }
+                        }
+                        Text {
+                            anchors { left: parent.left; leftMargin: 12; bottom: parent.bottom; bottomMargin: 11 }
+                            text: root.roleTitle[slot.role] + (root.connectors[slot.role] ? "  ·  " + root.connectors[slot.role] : "")
+                            color: slot.targeted ? Colors.cyan : Colors.fg_dim
+                            font.family: Geometry.fontFamily; font.pixelSize: 18; font.weight: Font.DemiBold; font.letterSpacing: 1.4
+                        }
+                        Text {
+                            anchors { right: parent.right; rightMargin: 12; bottom: parent.bottom; bottomMargin: 11 }
+                            width: parent.width * 0.55
+                            horizontalAlignment: Text.AlignRight
+                            elide: Text.ElideRight
+                            text: (slot.changed ? "● " : "") + root.nameOf(slot.path)
+                            color: slot.changed ? Colors.amber : Colors.fg
+                            font.family: Geometry.fontFamily; font.pixelSize: 18
+                        }
+                        MouseArea {
+                            anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                            onClicked: root.target = slot.role
+                        }
+                    }
+                }
+            }
+        }
+
+        // Filter + presets ---------------------------------------------
+        Row {
+            id: filterRow
+            anchors { left: parent.left; top: desk.bottom; margins: 28; topMargin: 22 }
+            spacing: 10
+            Repeater {
+                model: [{ id: "all", label: "EVERYTHING" }, { id: "video", label: "ANIMATED DEPTH" }, { id: "image", label: "STILLS" }]
+                delegate: Rectangle {
+                    required property var modelData
+                    readonly property bool on: root.filter === modelData.id
+                    width: fText.implicitWidth + 36; height: 40; radius: Geometry.radiusInteractive
+                    color: on ? Colors.bg_inset : "transparent"
+                    border.color: on ? Colors.cyan : Colors.border_dark
+                    Text { id: fText; anchors.centerIn: parent; text: modelData.label; color: parent.on ? Colors.cyan : Colors.fg_dim; font.family: Geometry.fontFamily; font.pixelSize: 18; font.letterSpacing: 1.2 }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.filter = modelData.id }
+                }
+            }
+        }
+        Row {
+            anchors { right: parent.right; rightMargin: 28; verticalCenter: filterRow.verticalCenter }
+            spacing: 10
+            Repeater {
+                model: root.presets
+                delegate: Rectangle {
+                    required property var modelData
+                    width: pText.implicitWidth + 36; height: 40; radius: Geometry.radiusInteractive
+                    color: pMa.containsMouse ? Colors.bg_inset : "transparent"
+                    border.color: root.stagedIsMainframe ? Colors.cyan : Colors.border_dark
+                    Text { id: pText; anchors.centerIn: parent; text: "★ " + modelData.name.toUpperCase(); color: Colors.cyan; font.family: Geometry.fontFamily; font.pixelSize: 18; font.letterSpacing: 1.2 }
+                    MouseArea { id: pMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.stagePreset(modelData) }
+                }
+            }
+        }
+
+        // Library grid -------------------------------------------------
+        Rectangle {
+            id: gridFrame
+            anchors { left: parent.left; right: parent.right; top: filterRow.bottom; bottom: footer.top; leftMargin: 28; rightMargin: 28; topMargin: 14; bottomMargin: 14 }
+            color: Colors.bg
+            radius: Geometry.radiusInteractive
+            border.color: Colors.border_dark
+            clip: true
+
+            GridView {
+                id: grid
+                anchors.fill: parent
+                anchors.margins: 14
+                readonly property int columns: Math.max(3, Math.floor(width / 400))
+                cellWidth: width / columns
+                cellHeight: cellWidth * 9 / 16 + 50
+                model: root.filtered
+                boundsBehavior: Flickable.StopAtBounds
+                delegate: Item {
+                    id: tile
+                    required property var modelData
+                    width: grid.cellWidth; height: grid.cellHeight
+                    readonly property bool inUse: modelData.path === root.staged.left || modelData.path === root.staged.center || modelData.path === root.staged.right
+                    Rectangle {
+                        anchors.fill: parent; anchors.margins: 7
+                        radius: Geometry.radiusInteractive
+                        color: tileMa.containsMouse ? Colors.bg_inset : Colors.bg_alt
+                        border.color: tileMa.containsMouse ? Colors.cyan : (tile.inUse ? Colors.blue : Colors.border_dark)
+                        border.width: tile.inUse ? Geometry.borderWidthAccent : Geometry.borderWidth
+                        Rectangle {
+                            id: thumbFace
+                            anchors { left: parent.left; right: parent.right; top: parent.top; margins: 5 }
+                            height: width * 9 / 16
+                            radius: 4; color: Colors.bg; clip: true
+                            Image {
+                                anchors.fill: parent
+                                source: tile.modelData.thumb ? "file://" + tile.modelData.thumb : ""
+                                fillMode: Image.PreserveAspectCrop
+                                asynchronous: true
+                                sourceSize.width: 480
+                            }
+                            Rectangle {
+                                visible: tile.modelData.kind === "video"
+                                anchors { right: parent.right; top: parent.top; margins: 6 }
+                                width: badge.implicitWidth + 12; height: 20; radius: 4
+                                color: Qt.rgba(0, 0, 0, 0.7); border.color: Colors.cyan
+                                Text { id: badge; anchors.centerIn: parent; text: tile.modelData.depth ? "◉ DEPTH" : "◉ MOTION"; color: Colors.cyan; font.family: Geometry.fontFamily; font.pixelSize: 14; font.letterSpacing: 1.1 }
+                            }
+                        }
+                        Text {
+                            anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: 10; bottomMargin: 9 }
+                            text: tile.modelData.name
+                            elide: Text.ElideRight
+                            color: tile.inUse ? Colors.cyan : Colors.fg
+                            font.family: Geometry.fontFamily; font.pixelSize: 18
+                        }
+                        MouseArea {
+                            id: tileMa
+                            anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            onClicked: root.assign(tile.modelData.path)
+                            onDoubleClicked: { root.assign(tile.modelData.path); root.apply() }
+                        }
+                    }
+                }
+            }
+            Text {
+                anchors.centerIn: parent
+                visible: root.loading
+                text: "INDEXING LIBRARY…"
+                color: Colors.fg_dim
+                font.family: Geometry.fontFamily; font.pixelSize: 21; font.letterSpacing: 2
+            }
+        }
+
+        // Footer -------------------------------------------------------
+        Item {
+            id: footer
+            anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: 28 }
+            height: 58
+            Text {
+                anchors { left: parent.left; verticalCenter: parent.verticalCenter; right: buttons.left; rightMargin: 20 }
+                elide: Text.ElideRight
+                text: root.message !== "" ? root.message : root.outcome
+                color: root.messageIsError ? Colors.red : (root.message !== "" ? Colors.green : Colors.fg_dim)
+                font.family: Geometry.fontFamily; font.pixelSize: 20
+            }
+            Row {
+                id: buttons
+                anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                spacing: 12
+                Rectangle {
+                    width: resetText.implicitWidth + 36; height: 54; radius: Geometry.radiusInteractive
+                    visible: root.dirty && !root.applying
+                    color: resetMa.containsMouse ? Colors.bg_inset : "transparent"
+                    border.color: Colors.border_dark
+                    Text { id: resetText; anchors.centerIn: parent; text: "UNDO CHANGES"; color: Colors.fg; font.family: Geometry.fontFamily; font.pixelSize: 20; font.letterSpacing: 1.3 }
+                    MouseArea { id: resetMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { root.syncStaged(); root.message = "" } }
+                }
+                Rectangle {
+                    readonly property bool enabledNow: root.complete && root.dirty && !root.applying
+                    width: applyText.implicitWidth + 48; height: 54; radius: Geometry.radiusInteractive
+                    color: enabledNow ? (applyMa.containsMouse ? Colors.white : Colors.cyan) : Colors.bg_inset
+                    border.color: enabledNow ? Colors.cyan : Colors.border_dark
+                    Text {
+                        id: applyText
+                        anchors.centerIn: parent
+                        text: root.applying ? "APPLYING…" : (root.uniform ? "APPLY TO ALL MONITORS" : "APPLY SCENE")
+                        color: parent.enabledNow ? Colors.bg_dark : Colors.fg_dark
+                        font.family: Geometry.fontFamily; font.pixelSize: 20; font.weight: Font.DemiBold; font.letterSpacing: 1.4
+                    }
+                    MouseArea { id: applyMa; anchors.fill: parent; hoverEnabled: true; cursorShape: parent.enabledNow ? Qt.PointingHandCursor : Qt.ArrowCursor; onClicked: root.apply() }
+                }
+            }
+        }
+    }
+
+}

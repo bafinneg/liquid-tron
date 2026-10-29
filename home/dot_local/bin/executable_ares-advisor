@@ -1,0 +1,1533 @@
+#!/usr/bin/env -S python3 -I
+"""ares-advisor: watches the machine and speaks through the centre meter (FEAT-ares-signal-meter C2).
+
+Every 5 s cheap, local, content-free collectors feed deterministic rules; each finding has a stable signature,
+a priority and a persistence window. The daemon is the only caller of `noctalia-primary-msg visualizer-signal`.
+
+Privacy: no window titles, prompts, clipboard, screen or journal text is read. Chat titles come from presence.json
+and go to the meter text, signals.json for the panel, and the local Ollama model that drafts the plain-English
+sentence (loopback only, never a cloud service).
+
+Usage: ares-advisor run | once [--json] | feedback <sig> dismiss|open
+"""
+import collections
+import datetime
+import glob
+import hashlib
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+
+TICK_S = 5
+SAVE_S = 300
+BASE_COOLDOWN_S = 30 * 60
+MAX_COOLDOWN_S = 8 * 3600
+MAX_MULT = 1.3
+MIN_BASELINE_N = 200
+MAX_TEXT = 140
+RESOLVED_KEEP = 20
+HIST_HALVE = 20000
+CLEAR_AFTER = 2                          # consecutive false samples before a condition clears
+TASK_WINDOW_S = 24 * 3600
+SEVERITY = {1: "needs_you", 2: "critical", 3: "advisory", 4: "done"}
+# Absolute path: the systemd user manager's PATH has no ~/.local/bin.
+MSG = os.environ.get("ARES_ADVISOR_MSG") or os.path.expanduser("~/.local/bin/noctalia-primary-msg")
+TTS_URL = "http://127.0.0.1:8765/v1/audio/speech"
+TTS_TOKEN = "local-data-voice"
+OLLAMA_URL = "http://127.0.0.1:11436/api/chat"  # zgx-02 ollama-zgx via zgx02-vllm-tunnel
+DEFAULT_MODEL = "qwen2.5:7b-instruct"
+OLLAMA_TIMEOUT_S = 3
+CACHE_S = 15 * 60
+CACHE_BUCKET = 5
+MAX_AI_TEXT = 140
+DRAFT_TIMEOUT_S = 8
+DRAFT_FAIL_S = 60                        # a failed or rejected draft is not retried for this long
+ACRONYMS = frozenset({"CPU", "GPU", "SSD", "UPS", "NAS", "NVMe"})
+TREND_EVERY_S = 30 * 60
+TREND_HOLD_S = 3600                      # how long a trend candidate stays a condition once raised
+TREND_GAP_S = 24 * 3600                  # at most one trend advisory per this window
+TREND_HORIZON_D = 14
+TREND_WINDOW_D = 7
+TREND_MIN_DAYS = 4
+TREND_MIN_N = 60                         # noise floor: samples a day needs to count toward the trend
+DAILY_KEEP = 15
+# metric -> (limit, direction): temperatures rise toward P2, free disk falls toward P2; NVMe has no P2, so its warn line
+TREND_LIMITS = {"temp.cpu": (90, 1), "temp.gpu": (87, 1), "temp.nvme": (70, 1), "disk.free": (5, -1)}
+VOICE_PHRASES = frozenset({
+    "Claude Code requires your permission.", "Hermes requires your approval.", "Network connectivity has been lost.",
+    "Main power has failed. Running on battery.", "Thermal limits are being approached."})
+ACTION_MAP = {"cpu": "panel:liquidtron/cpu:detail", "network": "panel:control-center network", "unit": None, "none": ""}
+CONTRACTION = re.compile(r"\b\w+['\u2019](t|s|re|ll|ve|d)\b", re.I)
+VOICE_RULES = (
+    "You are the mind of Brian's workstation, speaking in the voice of Data from Star Trek: The Next Generation: "
+    "precise, formal, no contractions, no exclamation marks. ")
+SYSTEM_PROMPT = (
+    VOICE_RULES + "You receive JSON telemetry about one unusual condition. "
+    "Decide whether Brian should look at it now. Prefer surface=false when the cause is an expected heavy process "
+    "(a compile, a game, a model run) and the value is below the hard limits (CPU 90 C, GPU 87 C, NVMe 70 C, "
+    "disk 5 percent free, memory pressure 20). "
+    'Reply with JSON only: {"surface": bool, "text": str, "action": "cpu"|"network"|"unit"|"none"}. '
+    "text is one plain-English sentence for a busy executive, in sentence case, at most 140 characters, with no "
+    "slashes, no dashes used as separators, no colons, no tags and no all-capital words, for example "
+    "The graphics card is warm because a game is loading, and it should settle soon. "
+    "action must be exactly one of those four words: cpu for any load, temperature, memory or disk matter (GPU "
+    "included), network for connectivity, unit for failed units and tasks, none when there is nothing to open.")
+DRAFT_PROMPT = (
+    VOICE_RULES + "You receive JSON about one finding, with a plain fact sentence. "
+    'Reply with JSON only: {"text": str}. text says the same fact in one sentence, two at most, at most 140 '
+    "characters, in sentence case, ending with a full stop, for a busy executive. Keep every number and every name "
+    "from the fact. Never use slashes, dashes as separators, tags or all-capital words (CPU, GPU, SSD, UPS and NAS "
+    'are allowed). If "alert" is true, text must begin with exactly "ALERT: " and nothing else may be tagged; '
+    'otherwise it must not begin with a tag. Example: {"text": "Your approval is needed for the Advisory Sim."}')
+
+
+def log(msg):
+    print(f"ares-advisor: {msg}", file=sys.stderr, flush=True)
+
+
+def runtime_base():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(runtime, "ares")
+
+
+class Paths:
+    def __init__(self, base=None, state=None, config=None, mode=None, tasks=None):
+        self.base = base or runtime_base()
+        self.adv = os.path.join(self.base, "advisor")
+        self.presence = os.path.join(self.base, "presence.json")
+        self.state = state or os.path.expanduser("~/.local/state/ares-advisor")
+        self.config = config or os.path.expanduser("~/.config/ares-advisor/config.json")
+        self.mode = mode or os.path.expanduser("~/.local/state/system-mode")
+        self.tasks = tasks or os.path.expanduser("~/.hermes/tasks")
+
+    @property
+    def baseline(self):
+        return os.path.join(self.state, "baseline.json")
+
+    @property
+    def feedback(self):
+        return os.path.join(self.state, "feedback.json")
+
+
+# ------------------------------------------------------------------ small io helpers
+
+def load_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_atomic(path, data):
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".adv.", suffix=".tmp", dir=d)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def run_out(argv, timeout=2):
+    """stdout of a command, or None if it is absent/failing. Never raises."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def fnum(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------ collectors
+
+class Collectors:
+    """Every method returns a plain value or None and may raise; the Advisor isolates failures."""
+
+    def __init__(self, paths, hwmon_root="/sys/class/hwmon", proc_root="/proc"):
+        self.paths, self.hwmon_root, self.proc = paths, hwmon_root, proc_root
+        self._cpu_prev = None
+        self._dns = {"thread": None, "ok": None}
+
+    def approvals(self):
+        d = load_json(self.paths.presence)
+        if not isinstance(d, dict):
+            return None
+        chats = {c["id"]: c for c in d.get("chats") or [] if isinstance(c, dict) and isinstance(c.get("id"), str)}
+        out, covered = [], set()
+        for r in d.get("requests") or []:
+            if isinstance(r, dict) and isinstance(r.get("request_id"), str):
+                sid = r.get("session_id") if isinstance(r.get("session_id"), str) else ""
+                covered.add(sid)
+                out.append({"id": r["request_id"], "kind": r.get("kind"), "client": r.get("client"), "chat": chats.get(sid)})
+        for cid, c in chats.items():
+            if c.get("state") == "needs_you" and cid not in covered:
+                out.append({"id": "chat:" + cid, "kind": None, "chat": c})
+        return out
+
+    def cpu(self):
+        txt = read_text(f"{self.proc}/stat")
+        res = {}
+        if txt:
+            parts = [int(x) for x in txt.split("\n", 1)[0].split()[1:]]
+            idle, total = parts[3] + (parts[4] if len(parts) > 4 else 0), sum(parts[:8])
+            if self._cpu_prev:
+                dt, di = total - self._cpu_prev[0], idle - self._cpu_prev[1]
+                if dt > 0:
+                    res["util"] = 100.0 * (dt - di) / dt
+            self._cpu_prev = (total, idle)
+        for name in ("cpu", "memory", "io"):
+            t = read_text(f"{self.proc}/pressure/{name}")
+            for line in (t or "").splitlines():
+                if line.startswith("some"):
+                    for kv in line.split()[1:]:
+                        if kv.startswith("avg10="):
+                            res["psi_" + name] = fnum(kv[6:])
+        return res
+
+    def temps(self):
+        res = {"nvme": {}}
+        for d in sorted(glob.glob(os.path.join(self.hwmon_root, "hwmon*"))):
+            name = (read_text(os.path.join(d, "name")) or "").strip()
+            if name not in ("asusec", "nvme"):
+                continue
+            for lf in sorted(glob.glob(os.path.join(d, "temp*_label"))):
+                label = (read_text(lf) or "").strip()
+                val = fnum((read_text(lf[:-6] + "_input") or "").strip())
+                if val is None:
+                    continue
+                if name == "asusec" and label == "CPU Package":
+                    res["cpu"] = val / 1000.0
+                elif name == "nvme" and label == "Composite":
+                    res["nvme"][os.path.basename(d)] = val / 1000.0
+        out = run_out(["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total",
+                       "--format=csv,noheader,nounits"], timeout=2)
+        if out:
+            f = [fnum(x) for x in out.strip().splitlines()[0].split(",")]
+            if len(f) == 4 and f[0] is not None:
+                res.update(gpu=f[0], gpu_util=f[1], gpu_mem_used=f[2], gpu_mem_total=f[3])
+        return res
+
+    def disk(self):
+        res = {}
+        for m in ("/", "/home"):
+            u = shutil.disk_usage(m)
+            res[m] = 100.0 * u.free / u.total if u.total else 100.0
+        return res
+
+    def gateway(self):
+        txt = read_text(f"{self.proc}/net/route")
+        for line in (txt or "").splitlines()[1:]:
+            f = line.split()
+            if len(f) > 3 and f[1] == "00000000" and int(f[3], 16) & 2:
+                return socket.inet_ntoa(struct.pack("<L", int(f[2], 16)))
+        return None
+
+    def ping(self, host):
+        return run_out(["ping", "-c1", "-W1", host], timeout=3) is not None
+
+    def dns(self):
+        st = self._dns
+        if st["thread"] is None or not st["thread"].is_alive():
+            def work():
+                try:
+                    socket.getaddrinfo("archlinux.org", None)
+                    st["ok"] = True
+                except OSError:
+                    st["ok"] = False
+            st["ok"] = None
+            st["thread"] = threading.Thread(target=work, name="ares-adv-dns", daemon=True)
+            st["thread"].start()
+        st["thread"].join(2)
+        return st["ok"] is True
+
+    def network(self):
+        gw = self.gateway()
+        target = os.environ.get("ARES_ADVISOR_PING_TARGET") or gw
+        res = {"route": gw is not None, "gw": target}
+        res["gw_ok"] = self.ping(target) if target else False
+        res["dns_ok"] = self.dns()
+        return res
+
+    def tailscale(self):
+        out = run_out(["tailscale", "status", "--json"], timeout=3)
+        if out is None:
+            return None
+        return {"state": json.loads(out).get("BackendState")}
+
+    def ups(self):
+        out = run_out(["upsc", "cyberpower"], timeout=2)
+        if out is None:
+            return None
+        kv = dict(line.split(": ", 1) for line in out.splitlines() if ": " in line)
+        rt = fnum(kv.get("battery.runtime"))
+        return {"status": kv.get("ups.status", ""), "runtime_min": None if rt is None else int(rt // 60)}
+
+    def units(self):
+        res = {}
+        for scope, argv in (("system", ["systemctl", "--failed", "--plain", "--no-legend"]),
+                            ("user", ["systemctl", "--user", "--failed", "--plain", "--no-legend"])):
+            out = run_out(argv, timeout=3)
+            res[scope] = None if out is None else [ln.split()[0] for ln in out.splitlines() if ln.split()]
+        return res
+
+    def tasks(self):
+        now = time.time()
+        blocked, done = [], []
+        for p in glob.glob(os.path.join(self.paths.tasks, "*", "state.json")):
+            d = load_json(p)
+            if not isinstance(d, dict):
+                continue
+            tid = os.path.basename(os.path.dirname(p))
+            title = d.get("title") if isinstance(d.get("title"), str) else tid
+            if d.get("status") == "done":
+                done.append({"id": tid, "title": title})
+            elif d.get("status") == "blocked":
+                try:
+                    fresh = now - os.stat(p).st_mtime < TASK_WINDOW_S
+                except OSError:
+                    fresh = False
+                if fresh:
+                    blocked.append({"id": tid, "title": title})
+        return {"blocked": blocked, "done": done}
+
+    def gaming(self):
+        return (read_text(self.paths.mode) or "").strip() == "gaming"
+
+    def locked(self):
+        if run_out(["pidof", "hyprlock"], timeout=1) is not None:
+            return True
+        return run_out(["pgrep", "-u", str(os.getuid()), "-f", "qs -n -c ares-lock"], timeout=1) is not None
+
+
+# min seconds between real runs of the slow collectors
+INTERVALS = {"tailscale": 30, "ups": 10, "units": 15}
+COLLECTOR_NAMES = ("approvals", "cpu", "temps", "disk", "network", "tailscale", "ups", "units", "tasks")
+
+
+# ------------------------------------------------------------------ baselines and feedback
+
+def how_bucket(ms):
+    t = time.localtime(ms / 1000.0)
+    return t.tm_wday * 24 + t.tm_hour
+
+
+class Baselines:
+    """Per metric: EWMA and a per hour-of-week integer histogram (bounded) for p95/p99."""
+
+    ALPHA = 0.01
+
+    def __init__(self, path):
+        self.path = path
+        d = load_json(path, {})
+        self.m = d.get("metrics", {}) if isinstance(d, dict) else {}
+        self.daily = d.get("daily", {}) if isinstance(d, dict) and isinstance(d.get("daily"), dict) else {}
+        self.last_trend_ms = d.get("last_trend_ms") if isinstance(d, dict) else None
+        self._last_save = None
+
+    def update_daily(self, metric, value, ms):
+        """Per-day [sum, n] for the trend pass; only the newest DAILY_KEEP days are kept."""
+        if value is None:
+            return
+        day = time.strftime("%Y-%m-%d", time.localtime(ms / 1000.0))
+        d = self.daily.setdefault(metric, {})
+        e = d.setdefault(day, [0.0, 0])
+        e[0] += value
+        e[1] += 1
+        for k in sorted(d)[:-DAILY_KEEP]:
+            del d[k]
+
+    def trends(self, ms):
+        """Metrics whose 7-day slope (complete days only) reaches their limit within TREND_HORIZON_D days."""
+        today = datetime.date.fromtimestamp(ms / 1000.0).toordinal()
+        out = []
+        for metric, days in self.daily.items():
+            lim = TREND_LIMITS.get(metric.split(":", 1)[0])
+            if not lim:
+                continue
+            limit, sign = lim
+            pts = []
+            for k, e in days.items():
+                try:
+                    o = datetime.date.fromisoformat(k).toordinal()
+                    total, n = float(e[0]), int(e[1])
+                except (ValueError, TypeError, IndexError):
+                    continue
+                if 1 <= today - o <= TREND_WINDOW_D and n >= TREND_MIN_N:
+                    pts.append((o, total / n))
+            if len(pts) < TREND_MIN_DAYS:
+                continue
+            mx, my = sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+            den = sum((p[0] - mx) ** 2 for p in pts)
+            slope = sum((p[0] - mx) * (p[1] - my) for p in pts) / den
+            rate = slope * sign
+            last = max(pts)[1]
+            gap = (limit - last) * sign
+            if rate <= 0 or gap <= 0 or gap / rate > TREND_HORIZON_D:
+                continue
+            out.append({"metric": metric, "last": last, "slope": slope, "days": gap / rate, "limit": limit})
+        return sorted(out, key=lambda t: t["days"])
+
+    def update(self, metric, value, ms):
+        if value is None:
+            return
+        self.update_daily(metric, value, ms)
+        e = self.m.setdefault(metric, {"ewma": value, "n": 0, "buckets": {}})
+        e["ewma"] += self.ALPHA * (value - e["ewma"])
+        e["n"] += 1
+        h = e["buckets"].setdefault(str(how_bucket(ms)), {})
+        k = str(max(0, min(127, int(value))))
+        h[k] = h.get(k, 0) + 1
+        if sum(h.values()) > HIST_HALVE:
+            for key in list(h):
+                h[key] //= 2
+                if not h[key]:
+                    del h[key]
+
+    def pct(self, metric, ms, q):
+        """Upper bin edge for quantile q of the current hour-of-week bucket, or None under MIN_BASELINE_N samples."""
+        h = self.m.get(metric, {}).get("buckets", {}).get(str(how_bucket(ms)))
+        if not h:
+            return None
+        total = sum(h.values())
+        if total < MIN_BASELINE_N:
+            return None
+        acc = 0
+        for k in sorted(h, key=int):
+            acc += h[k]
+            if acc >= q * total:
+                return int(k) + 1.0
+        return None
+
+    def save(self, ms, force=False):
+        if not force and self._last_save is not None and ms - self._last_save < SAVE_S * 1000:
+            return
+        self._last_save = ms
+        write_atomic(self.path, json.dumps({"v": 1, "metrics": self.m, "daily": self.daily, "last_trend_ms": self.last_trend_ms},
+                                           separators=(",", ":")))
+
+
+METER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,63}$")
+
+
+def meter_id(sig):
+    """The id the lt5 meter accepts for a signature: itself when valid, else a stable hash of it."""
+    if METER_ID.fullmatch(sig):
+        return sig
+    return "h-" + hashlib.sha1(sig.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def sig_owner(sig):
+    """The collector whose data decides whether a signature can be judged absent (None: no single owner)."""
+    head = sig.split(":", 1)[0]
+    return {"approval": "approvals", "net.down": "network", "net.dns": "network", "ts.down": "tailscale",
+            "ups.battery": "ups", "temp.cpu": "temps", "temp.gpu": "temps", "cpu.util": "cpu", "psi.mem": "cpu",
+            "disk.crit": "disk", "disk.low": "disk", "unit.failed": "units", "task.blocked": "tasks",
+            "task.done": "tasks"}.get(head)
+
+
+def sig_class(sig):
+    return sig.split(":", 1)[0]
+
+
+class Feedback:
+    def __init__(self, path):
+        self.path = path
+        d = load_json(path, {})
+        self.d = d if isinstance(d, dict) else {}
+
+    def _net(self, cls):
+        e = self.d.get(cls) or {}
+        return max(0, int(e.get("dismissed", 0)) - int(e.get("opened", 0)))
+
+    def mult(self, sig):
+        return min(MAX_MULT, 1.0 + 0.05 * self._net(sig_class(sig)))
+
+    def cooldown_s(self, sig):
+        return min(MAX_COOLDOWN_S, BASE_COOLDOWN_S * (2 ** self._net(sig_class(sig))))
+
+    def record(self, sig, action):
+        key = {"dismiss": "dismissed", "open": "opened"}[action]
+        e = self.d.setdefault(sig_class(sig), {"dismissed": 0, "opened": 0})
+        e[key] = int(e.get(key, 0)) + 1
+        write_atomic(self.path, json.dumps(self.d, indent=1, sort_keys=True))
+
+
+# ------------------------------------------------------------------ findings and rules
+
+SHARE_WORDS = {"homes": "home folders", "photo": "photos", "music": "music", "video": "videos", "media": "media"}
+
+
+def unit_headline(unit):
+    """Plain sentence for a failed unit: the thing that stopped, not the systemd name."""
+    stem, _, kind = unit.rpartition(".")
+    if kind == "mount":
+        parts = stem.split("-")
+        host = parts[1].upper() if len(parts) > 1 else "network"
+        what = SHARE_WORDS.get(parts[-1], parts[-1]) if len(parts) > 2 else "share"
+        return f"The {host} {what} share is offline." if what != "share" else f"The {host} share is offline."
+    name = re.sub(r"[@._-]+", " ", stem).strip().lower() or "background"
+    return f"The {name[:1].upper() + name[1:]} service has stopped."
+
+
+def sentence_problem(text, priority):
+    """Reason string if a drafted advisory breaks the plain-voice rules (spec D1/D3), else ''."""
+    t = (text or "").strip()
+    if not t:
+        return "empty"
+    if len(t) > MAX_AI_TEXT:
+        return "too long"
+    if CONTRACTION.search(t):
+        return "contraction"
+    if "!" in t:
+        return "exclamation mark"
+    if "//" in t:
+        return "double slash"
+    if "\u2014" in t or "\u2013" in t:
+        return "dash headline"
+    alert = t.startswith("ALERT: ")
+    if alert != (priority == 2):
+        return "ALERT tag must be on priority 2 only" if alert else "priority 2 needs the ALERT tag"
+    body = t[7:] if alert else t
+    if re.match(r"[A-Z][A-Za-z]*:\s", body) or re.search(r"\b[A-Z]{2,}:", body):
+        return "other tag"
+    for w in re.findall(r"[A-Za-z]{5,}", body):
+        if w.isupper() and w not in ACRONYMS:
+            return "all-caps word"
+    if len(re.findall(r"[.?](?:\s|$)", body)) > 2:
+        return "more than two sentences"
+    return ""
+
+
+def cond(sig, priority, text, voice=None, hold_s=0, min_samples=1, oneshot=False, action="",
+         metric=None, value=None, unit="", trend=None, gpu=False, suffix="", keep=()):
+    ttl = {3: 12000, 4: 4000}.get(priority, 0)
+    return {"sig": sig, "priority": priority, "severity": SEVERITY[priority], "text": text,
+            "sticky": priority <= 2, "ttl_ms": ttl, "residual": priority == 3, "voice": voice,
+            "hold_s": hold_s, "min_samples": min_samples, "oneshot": oneshot, "action": action,
+            "metric": metric, "value": value, "unit": unit, "trend": trend, "gpu": gpu, "suffix": suffix, "keep": list(keep)}
+
+
+class Rules:
+    def __init__(self, baselines, feedback):
+        self.bl, self.fb = baselines, feedback
+        self._seen_units = {}                       # scope -> failed units at its first successful sample
+        self._seen_done = None
+
+    def evaluate(self, s, ms):
+        out = []
+        out += self._approvals(s.get("approvals"))
+        out += self._net(s.get("network"))
+        out += self._ups(s.get("ups"))
+        out += self._temps(s.get("temps"), ms)
+        out += self._cpu(s.get("cpu"))
+        out += self._disk(s.get("disk"))
+        out += self._units(s.get("units"))
+        out += self._tailscale(s.get("tailscale"))
+        out += self._tasks(s.get("tasks"))
+        return out
+
+    def _approvals(self, items):
+        out = []
+        for a in items or []:
+            chat = a.get("chat") or {}
+            client = chat.get("client") or a.get("client")
+            kind = a.get("kind")
+            claude = client == "claude" or (not client and kind in ("permission", "claude"))
+            title = chat.get("title").strip().rstrip(".") if isinstance(chat.get("title"), str) else ""
+            if re.match(r"^(Hermes chat|Subagent) · ", title):
+                title = ""                          # ares-presence-hub's stand-in for an untitled chat: not a name
+            voice = "Claude Code requires your permission." if claude else "Hermes requires your approval."
+            sid = chat.get("id", "")
+            the = "" if title.lower().startswith("the ") else "the "
+            if claude:
+                text = f"Claude Code is waiting for your permission in {the}{title}." if title else \
+                    "Claude Code is waiting for your permission."
+            else:
+                text = f"Your approval is needed for {the}{title}." if title else \
+                    "Your approval is needed in a Hermes Conversation."
+            suffix = ""
+            if a["id"].startswith(("sim-", "chat:sim-")) or str(sid).startswith("sim-"):
+                suffix, voice = " This is a test.", None   # a simulated request (sim-*) must never pass for a real one
+            out.append(cond("approval:" + a["id"], 1, text + suffix, voice=voice, suffix=suffix, keep=[title] if title else (),
+                            action=f"open:{'claude' if claude else 'hermes'}:{sid}"))
+        return out
+
+    def _net(self, n):
+        if not n:
+            return []
+        voice = "Network connectivity has been lost."
+        act = "panel:control-center network"
+        if not n["route"]:
+            return [cond("net.down", 2, "ALERT: This computer has lost its internet connection.", voice,
+                         min_samples=2, action=act)]
+        if not n["gw_ok"]:
+            return [cond("net.down", 2, "ALERT: The internet is down because the router is not answering.", voice,
+                         min_samples=2, action=act)]
+        if not n["dns_ok"]:
+            return [cond("net.dns", 2, "ALERT: The internet is down because websites will not load.", voice,
+                         min_samples=2, action=act)]
+        return []
+
+    def _ups(self, u):
+        if u and "OB" in u["status"].split():
+            rt = u.get("runtime_min")
+            text = (f"ALERT: Main power has failed; the battery has about {rt} minutes left." if rt is not None
+                    else "ALERT: Main power has failed and the computer is running on battery.")
+            return [cond("ups.battery", 2, text, "Main power has failed. Running on battery.", value=rt, unit="min",
+                         action="panel:liquidtron/cpu:detail")]
+        return []
+
+    def _temps(self, t, ms):
+        if not t:
+            return []
+        out, m = [], self.fb.mult
+        voice = "Thermal limits are being approached."
+        if t.get("cpu") is not None and t["cpu"] >= 90:
+            out.append(cond("temp.cpu", 2, f"ALERT: The processor is too hot, at {t['cpu']:.0f} degrees.", voice, hold_s=30,
+                            value=t["cpu"], unit="C", action="panel:liquidtron/cpu:detail"))
+        if t.get("gpu") is not None and t["gpu"] >= 87:
+            out.append(cond("temp.gpu", 2, f"ALERT: The graphics card is too hot, at {t['gpu']:.0f} degrees.", voice, hold_s=30,
+                            value=t["gpu"], unit="C", action="panel:liquidtron/cpu:detail"))
+        for name, label in (("cpu", "processor"), ("gpu", "graphics card")):
+            v = t.get(name)
+            p99 = self.bl.pct("temp." + name, ms, 0.99)
+            sig = "temp.p99." + name
+            if v is not None and p99 is not None and v > p99 * m(sig):
+                out.append(cond(sig, 3, f"The {label} is warmer than usual, at {v:.0f} degrees.", hold_s=30, action="panel:liquidtron/cpu:detail",
+                                metric="temp." + name, value=v, unit="°C", gpu=name == "gpu"))
+        for dev, v in t.get("nvme", {}).items():
+            sig = f"temp.nvme:{dev}"
+            if v > 70 * m(sig):
+                out.append(cond(sig, 3, f"The SSD is running warm, at {v:.0f} degrees.", action="panel:liquidtron/cpu:detail",
+                                metric="temp.nvme", value=v, unit="°C"))
+        return out
+
+    def _cpu(self, c):
+        out = []
+        if c and c.get("util") is not None and c["util"] > 90 * self.fb.mult("cpu.util"):
+            out.append(cond("cpu.util", 3, f"The computer is working hard, with the processor {c['util']:.0f} percent busy.", hold_s=60, action="panel:liquidtron/cpu:detail",
+                            metric="cpu.util", value=c["util"], unit="%"))
+        if c and c.get("psi_memory") is not None and c["psi_memory"] > 20 * self.fb.mult("psi.mem"):
+            out.append(cond("psi.mem", 3, "The computer is running low on memory.", hold_s=60, action="panel:liquidtron/cpu:detail",
+                            metric="psi.mem", value=c["psi_memory"], unit="psi avg10"))
+        return out
+
+    def _disk(self, d):
+        out = []
+        for mount, free in (d or {}).items():
+            if free < 5:
+                out.append(cond(f"disk.crit:{mount}", 2, f"ALERT: The disk is almost full, with {free:.0f} percent left.",
+                            value=free, unit="%", action="panel:liquidtron/cpu:detail"))
+            elif free < 10 / self.fb.mult(f"disk.low:{mount}"):
+                out.append(cond(f"disk.low:{mount}", 3, f"The disk is getting full, with {free:.0f} percent left.", action="panel:liquidtron/cpu:detail",
+                                metric="disk.free." + {"/": "root", "/home": "home"}.get(mount, "other"),
+                                value=free, unit="%"))
+        return out
+
+    def _units(self, u):
+        if u is None:
+            return []
+        out = []
+        for sc in ("system", "user"):
+            lst = u.get(sc)
+            if lst is None:
+                continue                            # this scope's sample failed; not a baseline
+            if sc not in self._seen_units:
+                self._seen_units[sc] = set(lst)     # failures already present at start are not "new"
+                continue
+            out += [cond(f"unit.failed:{sc}:{n}", 3, unit_headline(n), action=f"journal:{sc}:{n}",
+                         metric="unit.failed") for n in sorted(set(lst) - self._seen_units[sc])]
+        return out
+
+    def _tailscale(self, t):
+        if t and t.get("state") not in (None, "Running"):
+            return [cond("ts.down", 3, "Remote access through Tailscale is turned off.", hold_s=60, action="panel:control-center network",
+                         metric="tailscale.down")]
+        return []
+
+    def _tasks(self, t):
+        if not t:
+            return []
+        out = [cond(f"task.blocked:{b['id']}", 3, f"Hermes paused a task: {b['title'].strip().rstrip('.')}.",
+                    action=f"open:task:{b['id']}", metric="task.blocked", keep=[b["title"].strip().rstrip(".")])
+               for b in t["blocked"]]
+        ids = {d["id"] for d in t["done"]}
+        if self._seen_done is None:
+            self._seen_done = set(ids)
+        for d in t["done"]:
+            if d["id"] not in self._seen_done:
+                out.append(cond(f"task.done:{d['id']}", 4, f"Hermes finished a task: {d['title'].strip().rstrip('.')}.", oneshot=True,
+                                action=f"open:task:{d['id']}", keep=[d["title"].strip().rstrip(".")]))
+        self._seen_done |= ids
+        return out
+
+
+# ------------------------------------------------------------------ C3: local-model triage
+
+def build_request(model, payload):
+    return {"model": model, "stream": False, "format": "json", "think": False, "keep_alive": "2m",
+            "options": {"temperature": 0.2, "num_predict": 96},
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]}
+
+
+def ollama_url():
+    url = os.environ.get("ARES_ADVISOR_OLLAMA_URL") or OLLAMA_URL
+    return url if url.rstrip("/").endswith("/api/chat") else url.rstrip("/") + "/api/chat"
+
+
+def ollama_chat(url, body, timeout=OLLAMA_TIMEOUT_S):
+    """The model's reply text. Raises on any transport or protocol failure."""
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())["message"]["content"]
+
+
+def parse_reply(content):
+    """(dict, "") when content is the JSON shape we asked for, else (None, reason)."""
+    try:
+        d = json.loads(content)
+    except (TypeError, ValueError):
+        return None, "not JSON"
+    if (not isinstance(d, dict) or not isinstance(d.get("surface"), bool) or not isinstance(d.get("text"), str)
+            or d.get("action") not in ACTION_MAP):
+        return None, "wrong keys"
+    return d, ""
+
+
+def check_reply(d):
+    """Reason string if the text breaks the voice or length rules, else ''."""
+    text = d["text"].strip()
+    if len(text) > MAX_AI_TEXT:
+        return "text too long"
+    if d["surface"] and not text:
+        return "empty text"
+    return sentence_problem(text, 3) if text else ""
+
+
+def validate_reply(content):
+    d, why = parse_reply(content)
+    if d is None:
+        return None, why
+    why = check_reply(d)
+    return (None, why) if why else (d, "")
+
+
+def comm_of(proc, pid):
+    """Process name from /proc/<pid>/stat and the stat fields after it; never the command line."""
+    txt = read_text(f"{proc}/{pid}/stat")
+    if not txt or "(" not in txt or ")" not in txt:
+        return None, []
+    return txt[txt.index("(") + 1:txt.rindex(")")], txt[txt.rindex(")") + 2:].split()
+
+
+def clean_comm(name):
+    return re.sub(r"[^\w.+:-]", "", name)[:15]
+
+
+class Triage:
+    """Judges P3 candidates with the local model; any failure returns the candidate unchanged (rule text)."""
+
+    def __init__(self, paths, proc_root="/proc", sleep=time.sleep):
+        self.paths, self.proc, self.sleep = paths, proc_root, sleep
+        self._cache = {}
+        self._lock = threading.Lock()
+        self._failing = False
+
+    def _snapshot(self):
+        out = {}
+        try:
+            names = os.listdir(self.proc)
+        except OSError:
+            return out
+        for pid in names:
+            if pid.isdigit():
+                comm, f = comm_of(self.proc, pid)
+                if comm is not None and len(f) > 12:
+                    try:
+                        out[pid] = (comm, int(f[11]) + int(f[12]))
+                    except ValueError:
+                        pass
+        return out
+
+    def top_cpu(self):
+        a = self._snapshot()
+        self.sleep(0.25)
+        use = collections.Counter()
+        for pid, (comm, ticks) in self._snapshot().items():
+            if pid in a and ticks > a[pid][1]:
+                use[clean_comm(comm)] += ticks - a[pid][1]
+        return [n for n, _ in use.most_common(3) if n]
+
+    def top_gpu_mem(self):
+        out = run_out(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"], timeout=2)
+        use = collections.Counter()
+        for line in (out or "").splitlines():
+            pid, _, mem = line.partition(",")
+            comm, _ = comm_of(self.proc, pid.strip()) if pid.strip().isdigit() else (None, [])
+            if comm is not None and fnum(mem) is not None:
+                use[clean_comm(comm)] += fnum(mem)
+        return [n for n, _ in use.most_common(3) if n]
+
+    def mode(self):
+        return (read_text(self.paths.mode) or "").strip()
+
+    def payload(self, cand, ctx):
+        """Everything the model sees: numbers, process names, feedback counts, time, mode. No titles or paths."""
+        t = time.localtime(ctx["ms"] / 1000.0)
+        metric = cand["metric"]
+        p = {"metric": metric, "value": round(cand["value"], 1), "unit": cand.get("unit") or "",
+             "fact": cand.get("text"), "p95": ctx.get("p95"), "p99": ctx.get("p99"),
+             "held_s": ctx.get("held_s"), "top_cpu": self.top_cpu()}
+        if cand.get("gpu"):
+            p["top_gpu_mem"] = self.top_gpu_mem()
+        if cand.get("trend"):
+            p["trend"] = {k: round(cand["trend"][k], 1) for k in ("per_day", "days_to_limit", "limit")}
+        p.update(feedback=ctx.get("feedback"), hour=t.tm_hour, weekday=time.strftime("%a", t), mode=self.mode())
+        return p
+
+    def _fail(self, why):
+        if not self._failing:
+            log(f"triage fell back to rule text ({why})")
+        self._failing = True
+
+    def __call__(self, cand, ctx):
+        if cand.get("value") is None or not cand.get("metric"):
+            return cand                                  # nothing numeric to judge: the rule text stands
+        if self.mode() == "gaming":
+            return cand                                  # the model yields to the game; no call
+        key = (cand["sig"], int(cand["value"] // CACHE_BUCKET))
+        with self._lock:
+            hit = self._cache.get(key)
+        if hit and hit[0] > ctx["ms"]:
+            return self._result(cand, hit[1])
+        cfg = load_json(self.paths.config, {})
+        model = cfg.get("model") if isinstance(cfg, dict) and isinstance(cfg.get("model"), str) else DEFAULT_MODEL
+        try:
+            content = ollama_chat(ollama_url(), build_request(model, self.payload(cand, ctx)), OLLAMA_TIMEOUT_S)
+        except Exception as e:
+            self._fail(type(e).__name__)
+            return cand
+        d, why = validate_reply(content)
+        if d is None:
+            self._fail(why)
+            return cand
+        if self._failing:
+            log("triage recovered")
+        self._failing = False
+        with self._lock:
+            self._cache[key] = (ctx["ms"] + CACHE_S * 1000, d)
+            for k in [k for k, v in self._cache.items() if v[0] <= ctx["ms"]]:
+                del self._cache[k]
+        return self._result(cand, d)
+
+    @staticmethod
+    def _result(cand, d):
+        if not d["surface"]:
+            return None
+        action = ACTION_MAP[d["action"]]
+        return {**cand, "text": d["text"].strip(), "action": cand.get("action", "") if action is None else action}
+
+
+class Drafter:
+    """Asks the local model for one plain sentence from a finding's rule sentence. Returns None when it declines."""
+
+    def __init__(self, paths):
+        self.paths = paths
+
+    def __call__(self, c):
+        cfg = load_json(self.paths.config, {})
+        model = cfg.get("model") if isinstance(cfg, dict) and isinstance(cfg.get("model"), str) else DEFAULT_MODEL
+        fact = c["text"][7:] if c["text"].startswith("ALERT: ") else c["text"]
+        if c.get("suffix"):
+            fact = fact[:-len(c["suffix"])]
+        payload = {"class": sig_class(c["sig"]), "fact": fact, "alert": c["priority"] == 2}
+        if c.get("value") is not None:
+            payload["number"] = round(c["value"], 1)
+        body = {"model": model, "stream": False, "format": "json", "think": False, "keep_alive": "2m",
+                "options": {"temperature": 0.2, "num_predict": 80},
+                "messages": [{"role": "system", "content": DRAFT_PROMPT},
+                             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]}
+        content = ollama_chat(ollama_url(), body, DRAFT_TIMEOUT_S)
+        d = json.loads(content)
+        text = d.get("text") if isinstance(d, dict) else None
+        if not isinstance(text, str):
+            raise ValueError("wrong keys")
+        return text.strip()
+
+
+# ------------------------------------------------------------------ output: ordered pusher and voice
+
+class OrderedPusher:
+    """Worker thread; newest message per id wins, but different ids keep their order (clear-all is key '')."""
+
+    def __init__(self, push):
+        self._push = push
+        self._cond = threading.Condition()
+        self._pending = collections.OrderedDict()
+        self._thread = None
+        self._busy = False
+        self._failing = True                # until the first success: that success counts as a recovery
+        self._recovered = False
+
+    def __call__(self, key, argv):
+        with self._cond:
+            self._pending.pop(key, None)
+            self._pending[key] = argv
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name="ares-adv-push", daemon=True)
+                self._thread.start()
+            self._cond.notify()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while not self._pending:
+                    self._cond.wait()
+                _, argv = self._pending.popitem(last=False)
+                self._busy = True
+            try:
+                ok = self._push(argv) is not False
+            except Exception:
+                ok = False
+            with self._cond:
+                self._busy = False
+                if ok and self._failing:
+                    self._recovered = True
+                self._failing = not ok
+                self._cond.notify_all()
+
+    def take_recovered(self):
+        """True once after a push succeeds following a failure streak (or the first success after start)."""
+        with self._cond:
+            r, self._recovered = self._recovered, False
+            return r
+
+    def drain(self, timeout=3):
+        end = time.monotonic() + timeout
+        with self._cond:
+            while (self._pending or self._busy) and time.monotonic() < end:
+                self._cond.wait(0.1)
+
+
+_push_failing = [False]
+
+
+def default_push(argv):
+    try:
+        rc = subprocess.run(argv, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode
+        err = None if rc == 0 else f"exit {rc}"
+    except (OSError, subprocess.SubprocessError) as e:
+        err = type(e).__name__
+    if err and not _push_failing[0]:
+        log(f"push to Noctalia failed ({err}): {argv[0]}")
+    elif not err and _push_failing[0]:
+        log("push to Noctalia recovered")
+    _push_failing[0] = bool(err)
+    return not err
+
+
+def default_play(wav):
+    """Plays WAV bytes: pipe to pw-play, falling back to a temp file in the runtime dir."""
+    try:
+        p = subprocess.run(["pw-play", "-"], input=wav, timeout=30, capture_output=True, check=False)
+        if p.returncode == 0:
+            return
+    except (OSError, subprocess.SubprocessError):
+        pass
+    fd, tmp = tempfile.mkstemp(prefix="advisor-", suffix=".wav", dir=os.environ.get("XDG_RUNTIME_DIR") or None)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(wav)
+        subprocess.run(["pw-play", tmp], timeout=30, capture_output=True, check=False)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+class Voice:
+    def __init__(self, play=default_play, url=None):
+        self.play = play
+        self.url = url or os.environ.get("ARES_ADVISOR_TTS_URL") or TTS_URL
+        self.q = queue.Queue()
+        self._thread = None
+        self._failed = False
+
+    def speak(self, phrase):
+        self.q.put(phrase)
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="ares-adv-voice", daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        while True:
+            phrase = self.q.get()
+            try:
+                body = json.dumps({"model": "data", "voice": "data", "input": phrase,
+                                   "response_format": "wav"}).encode()
+                req = urllib.request.Request(self.url, data=body, method="POST", headers={
+                    "Content-Type": "application/json", "Authorization": f"Bearer {TTS_TOKEN}"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    wav = r.read()
+                self.play(wav)
+            except Exception as e:
+                if not self._failed:
+                    log(f"voice failed ({type(e).__name__}); visual only, no retry")
+                self._failed = True
+            finally:
+                self.q.task_done()
+
+
+# ------------------------------------------------------------------ the advisor
+
+def clip(text):
+    """Collapse whitespace and cap at MAX_TEXT, never mid-word; the bar scrolls what is long."""
+    t = " ".join(str(text).split())
+    if len(t) <= MAX_TEXT:
+        return t
+    cut = t[:MAX_TEXT]
+    return (cut.rsplit(" ", 1)[0] if t[MAX_TEXT] != " " and " " in cut else cut).rstrip()
+
+
+class Advisor:
+    def __init__(self, paths=None, collectors=None, clock=None, push=None, voice=None, triage_fn=None, draft_fn=None):
+        self.paths = paths or Paths()
+        self.col = collectors or Collectors(self.paths)
+        self.clock = clock or (lambda: int(time.time() * 1000))
+        self.push = push                    # callable(key, argv) or None
+        self.voice = voice
+        self.triage = triage_fn or Triage(self.paths)
+        # a caller that injects its own triage (tests, tools) gets no model drafting unless it injects that too
+        self.drafter = draft_fn or (Drafter(self.paths) if triage_fn is None else (lambda c: None))
+        self._drafts = {}                   # (sig, bucket) -> (expires_ms, sentence)
+        self._draft_busy = {}               # (sig, bucket) -> worker thread
+        self._draft_cool = {}               # (sig, bucket) -> ms before which it is not retried
+        self._draft_lock = threading.Lock()
+        self._draft_failing = False
+        self.bl = Baselines(self.paths.baseline)
+        self.fb = Feedback(self.paths.feedback)
+        self.rules = Rules(self.bl, self.fb)
+        self.intervals = dict(INTERVALS)
+        self.inject = os.environ.get("ARES_ADVISOR_INJECT")
+        self.state = {}                     # sig -> {n_true, true_since, false, active}
+        self.active = {}                    # sig -> finding (+ opened_ms, expires_ms)
+        self.resolved = collections.deque(maxlen=RESOLVED_KEEP)
+        self.cooldown = {}                  # sig -> ms until which a P3 may not re-fire
+        self.declined = set()               # triage said no; until the condition clears
+        self.muted = set()                  # dismissed from the meter; until the condition clears
+        self.pushed = {}                    # sig -> json payload last sent
+        self._conds = {}                    # sig -> latest rule finding (for draft refresh)
+        self.pending = {}                   # sig -> in-flight triage on a worker thread
+        self.trend_cond, self.trend_until, self._trend_at = None, 0, None
+        sp = load_json(os.path.join(self.paths.adv, "spoken.json"), [])
+        self.spoken = {x for x in sp if isinstance(x, str)} if isinstance(sp, list) else set()
+        self._stale_spoken = {}
+        self._cache = {}
+        self._logged = set()
+        self._signals_json = None
+        self.started = False
+        self._resync = False
+
+    # ---- collection
+    def collect(self, ms):
+        s = {}
+        for name in COLLECTOR_NAMES:
+            iv = self.intervals.get(name)
+            hit = self._cache.get(name)
+            if iv and hit and ms - hit[0] < iv * 1000:
+                s[name] = hit[1]
+                continue
+            try:
+                s[name] = getattr(self.col, name)()
+            except Exception as e:
+                if name not in self._logged:
+                    self._logged.add(name)
+                    log(f"collector {name} failed ({type(e).__name__}: {e})")
+                s[name] = None
+            self._cache[name] = (ms, s[name])
+        return s
+
+    def injected(self):
+        d = load_json(self.inject, None) if self.inject else None
+        out = []
+        for f in d if isinstance(d, list) else []:
+            if isinstance(f, dict) and isinstance(f.get("sig"), str):
+                p = f.get("priority") if f.get("priority") in SEVERITY else 3
+                voice = f.get("voice") if f.get("voice") in VOICE_PHRASES else None
+                c = cond(f["sig"], p, str(f.get("text", f["sig"])), voice)
+                for k in ("severity", "sticky", "ttl_ms", "residual"):
+                    if k in f:
+                        c[k] = f[k]
+                out.append(c)
+        return out
+
+    def is_gaming(self):
+        try:
+            return bool(self.col.gaming())
+        except Exception:
+            return False
+
+    # ---- one pass: sample -> conditions -> findings
+    def evaluate(self, ms):
+        s = self.collect(ms)
+        conds = {c["sig"]: c for c in self.rules.evaluate(s, ms) + self.injected()}
+        for name, v in (("cpu.util", (s.get("cpu") or {}).get("util")), ("temp.cpu", (s.get("temps") or {}).get("cpu")),
+                        ("temp.gpu", (s.get("temps") or {}).get("gpu"))):
+            self.bl.update(name, v, ms)
+        for dev, v in ((s.get("temps") or {}).get("nvme") or {}).items():
+            self.bl.update_daily(f"temp.nvme:{dev}", v, ms)
+        for mount, free in (s.get("disk") or {}).items():
+            self.bl.update_daily(f"disk.free:{mount}", free, ms)
+        self._trend_pass(ms)
+        if self.trend_cond and ms < self.trend_until:
+            conds[self.trend_cond["sig"]] = self.trend_cond
+        else:
+            self.trend_cond = None
+        return s, conds
+
+    def _trend_pass(self, ms):
+        """Every 30 min: at most one `trend:<metric>` P3 candidate per 24 h, for the nearest projected crossing."""
+        if self._trend_at is not None and ms - self._trend_at < TREND_EVERY_S * 1000:
+            return
+        self._trend_at = ms
+        last = self.bl.last_trend_ms
+        if self.trend_cond or (last is not None and 0 <= ms - last < TREND_GAP_S * 1000):
+            return
+        found = self.bl.trends(ms)
+        if not found:
+            return
+        t = found[0]
+        base, _, dev = t["metric"].partition(":")
+        rate = abs(t["slope"])
+        if base == "disk.free":
+            text = f"The disk is filling up and will be full in about {max(1, round(t['days']))} days."
+            metric, unit = "disk.free." + {"/": "root", "/home": "home"}.get(dev, "other"), "%"
+        else:
+            part = {"cpu": "processor", "gpu": "graphics card", "nvme": "SSD"}.get(base.split(".")[1], "hardware")
+            text = (f"The {part} is running warmer each day and will reach its limit in about "
+                    f"{max(1, round(t['days']))} days.")
+            metric, unit = base, "°C"
+        self.trend_cond = cond("trend:" + t["metric"], 3, text, action="panel:liquidtron/cpu:detail", metric=metric,
+                               value=t["last"], unit=unit,
+                               trend={"per_day": t["slope"], "days_to_limit": t["days"], "limit": t["limit"]},
+                               gpu=base == "temp.gpu")
+        self.trend_until = ms + TREND_HOLD_S * 1000
+        self.bl.last_trend_ms = ms
+        try:
+            self.bl.save(ms, force=True)
+        except OSError:
+            pass
+
+    def step(self, ms):
+        """Advance persistence/hysteresis one sample. Returns the sample."""
+        self.apply_triage(ms)
+        s, conds = self.evaluate(ms)
+        self._conds = conds
+        self._age_stale_spoken(conds, ms, s)
+        for sig, c in conds.items():
+            st = self.state.setdefault(sig, {"n_true": 0, "true_since": None, "false": 0, "active": False})
+            st["false"] = 0
+            st["n_true"] += 1
+            if st["true_since"] is None:
+                st["true_since"] = ms
+            if st["active"]:
+                f = self.active.get(sig)
+                if f is not None:
+                    if not f.get("ai"):
+                        f["text"] = self._text_for(c, ms)
+                        self._start_draft(c, ms)
+                    f["voice"] = c["voice"]
+                continue
+            if st["n_true"] < c["min_samples"] or ms - st["true_since"] < c["hold_s"] * 1000:
+                continue
+            if sig in self.declined or sig in self.muted:
+                continue
+            if c["priority"] == 3 and self.cooldown.get(sig, 0) > ms:
+                continue
+            if c["priority"] == 3:
+                if sig not in self.pending:
+                    self._start_triage(c, s, ms, st)
+                continue
+            st["active"] = True
+            self._open(c, ms)
+        self._refresh_texts(ms)
+        for sig in list(self.state):
+            if sig in conds:
+                continue
+            st = self.state[sig]
+            f = self.active.get(sig)
+            if f is not None and f.get("oneshot"):
+                if f["expires_ms"] is not None and ms >= f["expires_ms"]:
+                    self._resolve(sig, ms)
+                continue
+            st["false"] += 1
+            if st["active"] and st["false"] >= CLEAR_AFTER:
+                self._resolve(sig, ms)
+            elif not st["active"]:
+                del self.state[sig]
+                self.declined.discard(sig)
+                self.muted.discard(sig)
+        return s
+
+    # ---- drafting (all priorities; never on the tick's critical path)
+    @staticmethod
+    def _draft_key(c):
+        v = c.get("value")
+        return (c["sig"], int(v // CACHE_BUCKET) if v is not None else c["text"])
+
+    def _text_for(self, c, ms):
+        """The cached model draft for this finding when there is one, else the rule sentence."""
+        with self._draft_lock:
+            hit = self._drafts.get(self._draft_key(c))
+        return clip(hit[1] + c.get("suffix", "")) if hit and hit[0] > ms else clip(c["text"])
+
+    def _start_draft(self, c, ms):
+        key = self._draft_key(c)
+        with self._draft_lock:
+            hit = self._drafts.get(key)
+            if (hit and hit[0] > ms) or key in self._draft_busy or self._draft_cool.get(key, 0) > ms:
+                return
+        if self.is_gaming():
+            return
+        c = dict(c)
+
+        def work():
+            try:
+                text = self.drafter(c)
+                why = "no draft" if text is None else sentence_problem(text, c["priority"])
+                if not why:
+                    low = text.lower()
+                    have = set(re.findall(r"[a-z0-9]+", low))     # every title word must survive, spelt exactly
+                    why = next((f"lost {k!r}" for k in c.get("keep") or ()
+                                if not set(re.findall(r"[a-z0-9]+", k.lower())) <= have), "")
+                if not why:
+                    nums = set(re.findall(r"\d+", c["text"])) - set(re.findall(r"\d+", text))
+                    why = f"lost number {sorted(nums)[0]}" if nums and c.get("value") is not None else ""
+            except Exception as e:
+                text, why = None, type(e).__name__
+            with self._draft_lock:
+                self._draft_busy.pop(key, None)
+                if why:
+                    self._draft_cool[key] = self.clock() + DRAFT_FAIL_S * 1000
+                else:
+                    self._drafts[key] = (self.clock() + CACHE_S * 1000, text)
+                    for k in [k for k, v in self._drafts.items() if v[0] <= self.clock()]:
+                        del self._drafts[k]
+            if why and why != "no draft":
+                if not self._draft_failing:
+                    log(f"draft rejected, keeping rule sentence ({why})")
+                self._draft_failing = True
+            elif not why:
+                self._draft_failing = False
+        t = threading.Thread(target=work, name="ares-adv-draft", daemon=True)
+        with self._draft_lock:
+            self._draft_busy[key] = t
+        t.start()
+
+    def _refresh_texts(self, ms):
+        for sig, f in self.active.items():
+            c = self._conds.get(sig)
+            if c is not None and not f.get("ai"):
+                f["text"] = self._text_for(c, ms)
+
+    def _start_triage(self, c, s, ms, st):
+        """P3 only, on a worker thread: the tick never waits on the model. P1, P2 and P4 never come here."""
+        sig, m = c["sig"], c.get("metric")
+        fb = self.fb.d.get(sig_class(sig))
+        ctx = {"sample": s, "ms": ms, "held_s": int((ms - st["true_since"]) / 1000),
+               "p95": self.bl.pct(m, ms, 0.95) if m else None, "p99": self.bl.pct(m, ms, 0.99) if m else None,
+               "feedback": {"dismissed": int((fb or {}).get("dismissed", 0)), "opened": int((fb or {}).get("opened", 0))}}
+        box = {"cond": c, "res": None}
+
+        def work():
+            try:
+                box["res"] = ("ok", self.triage(dict(c), ctx))
+            except Exception as e:
+                box["res"] = ("err", type(e).__name__)
+        box["thread"] = threading.Thread(target=work, name="ares-adv-triage", daemon=True)
+        self.pending[sig] = box
+        box["thread"].start()
+
+    def apply_triage(self, ms):
+        """Open (or drop) the P3 candidates whose triage finished, if their condition still holds."""
+        for sig in list(self.pending):
+            box = self.pending[sig]
+            if box["thread"].is_alive():
+                continue
+            del self.pending[sig]
+            st = self.state.get(sig)
+            if st is None or st["active"] or st["false"] or sig in self.muted:
+                continue
+            kind, cand = box["res"] or ("err", None)
+            c = box["cond"]
+            if kind == "ok" and cand is None:
+                self.declined.add(sig)
+                continue
+            if kind == "ok":
+                if cand.get("text") != c["text"]:
+                    cand = {**cand, "ai": True}
+                c = cand
+            elif "triage" not in self._logged:
+                self._logged.add("triage")
+                log(f"triage failed ({cand}); using rule text")
+            st["active"] = True
+            self._open(c, ms)
+
+    def wait_triage(self, timeout=10):
+        """Join in-flight triage and open the results (tests and `once`)."""
+        for box in list(self.pending.values()):
+            box["thread"].join(timeout)
+        self.apply_triage(self.clock())
+        for t in list(self._draft_busy.values()):
+            t.join(timeout)
+        self._refresh_texts(self.clock())
+
+    def _age_stale_spoken(self, conds, ms, s):
+        """A spoken signature that resolved while the daemon was down is new again. It is forgotten through _resolve,
+        after CLEAR_AFTER consecutive samples without it (like any condition), never on a single absent first tick."""
+        for sig in list(self._stale_spoken):
+            if sig in conds or sig in self.state:
+                del self._stale_spoken[sig]
+        for sig in self.spoken - set(conds) - set(self.state):
+            owner = sig_owner(sig)
+            if owner is not None and s.get(owner) is None:
+                continue                            # its collector returned nothing this tick: not evidence of absence
+            n = self._stale_spoken[sig] = self._stale_spoken.get(sig, 0) + 1
+            if n >= CLEAR_AFTER:
+                del self._stale_spoken[sig]
+                self._resolve(sig, ms)
+
+    def _forget_spoken(self, sigs):
+        if sigs & self.spoken:
+            self.spoken -= sigs
+            self._save_spoken()
+
+    def _save_spoken(self):
+        try:
+            write_atomic(os.path.join(self.paths.adv, "spoken.json"), json.dumps(sorted(self.spoken)))
+        except OSError:
+            pass
+
+    def _open(self, c, ms):
+        f = {k: c[k] for k in ("sig", "priority", "severity", "sticky", "ttl_ms", "residual", "voice", "action", "oneshot",
+                               "ai")
+             if k in c}
+        f.update(text=clip(c["text"]) if f.get("ai") else self._text_for(c, ms), opened_ms=ms)
+        f.setdefault("action", "")
+        if f.get("oneshot"):
+            f["expires_ms"] = None                  # the ttl starts when the finding is first sent (flush)
+        self.active[f["sig"]] = f
+        if not f.get("ai"):
+            self._start_draft(c, ms)
+        if f["priority"] <= 2 and f.get("voice") and f["sig"] not in self.spoken:
+            if self._maybe_speak(f["voice"]):
+                self.spoken.add(f["sig"])
+                self._save_spoken()
+
+    def _resolve(self, sig, ms):
+        f = self.active.pop(sig, None)
+        st = self.state.pop(sig, None)
+        self.declined.discard(sig)
+        self.muted.discard(sig)
+        self._forget_spoken({sig})
+        if f is None:
+            return
+        if f["priority"] == 3:
+            self.cooldown[sig] = ms + self.fb.cooldown_s(sig) * 1000
+        self.resolved.append({"sig": sig, "text": f["text"], "priority": f["priority"], "opened_ms": f["opened_ms"],
+                              "resolved_ms": ms, "action": f["action"]})
+
+    # ---- voice
+    def _maybe_speak(self, phrase):
+        """True when a voice is configured and the phrase was handed to it (a suppressed one is not "spoken")."""
+        if self.voice is None or phrase not in VOICE_PHRASES:
+            return False
+        cfg = load_json(self.paths.config, {})
+        if isinstance(cfg, dict) and cfg.get("voice") is False:
+            return False
+        # Owner decision 2026-10-24: the voice is always on (no quiet hours, no gaming or lock suppression);
+        # the only off switch is "voice": false in the config file.
+        self.voice.speak(phrase)
+        return True
+
+    # ---- output
+    def desired(self):
+        gaming = self.is_gaming()
+        out = {}
+        for sig, f in self.active.items():
+            if sig in self.muted or (gaming and f["priority"] >= 3):
+                continue
+            out[sig] = {"id": meter_id(sig), "priority": f["priority"], "severity": f["severity"], "text": f["text"],
+                        "sticky": f["sticky"], "ttl_ms": f["ttl_ms"], "residual": f["residual"]}
+        return out
+
+    def flush(self):
+        want = self.desired()
+        ms = self.clock()
+        if self.push:
+            if getattr(self.push, "take_recovered", lambda: False)():
+                self._resync = True
+            if self._resync:                # after a push failure: wipe the meter, then resend everything active
+                if self.push("", [MSG, "visualizer-signal", "clear"]) is False:
+                    want = {}
+                else:
+                    self._resync = False
+                    self.pushed.clear()
+            if not self._resync:
+                for sig in [s for s in self.pushed if s not in want]:
+                    if self.push(sig, [MSG, "visualizer-signal", "clear", meter_id(sig)]) is False:
+                        self._resync = True
+                        break
+                    del self.pushed[sig]
+            if not self._resync:
+                for sig, p in want.items():
+                    js = json.dumps(p, separators=(",", ":"), ensure_ascii=False)
+                    if self.pushed.get(sig) != js:
+                        if self.push(sig, [MSG, "visualizer-signal", "set", js]) is False:
+                            self._resync = True
+                            break
+                        self.pushed[sig] = js
+        for sig in want:                    # a one-shot's ttl runs from its first send, never while it is held back
+            f = self.active[sig]
+            if f.get("oneshot") and f.get("expires_ms") is None and (not self.push or sig in self.pushed):
+                f["expires_ms"] = ms + f["ttl_ms"]
+        doc = json.dumps({"v": 1, "active": [{k: f[k] for k in ("sig", "text", "priority", "opened_ms", "action")} | {"id": meter_id(f["sig"])}
+                                              for f in sorted(self.active.values(), key=lambda f: (f["priority"], f["opened_ms"]))],
+                          "resolved": list(self.resolved)}, separators=(",", ":"))
+        if doc != self._signals_json:
+            write_atomic(os.path.join(self.paths.adv, "signals.json"), doc)
+            self._signals_json = doc
+
+    def start(self):
+        if self.push and self.push("", [MSG, "visualizer-signal", "clear"]) is False:
+            self._resync = True
+        self.pushed.clear()
+        self.started = True
+
+    def shutdown(self):
+        """Leave the meter clean: clear everything, and wait for the pusher to deliver it."""
+        if self.push:
+            self.push("", [MSG, "visualizer-signal", "clear"])
+            getattr(self.push, "drain", lambda: None)()
+
+    def read_commands(self, ms):
+        for p in sorted(glob.glob(os.path.join(self.paths.adv, "cmd-*.json"))):
+            d = load_json(p, None)
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+            if isinstance(d, dict) and isinstance(d.get("sig"), str) and d.get("action") in ("dismiss", "open"):
+                if d["sig"] in self.active:
+                    self.muted.add(d["sig"])
+                self.fb = self.rules.fb = Feedback(self.paths.feedback)
+
+    def tick(self):
+        ms = self.clock()
+        if not self.started:
+            self.start()
+        self.read_commands(ms)
+        self.step(ms)
+        self.flush()
+        try:
+            self.bl.save(ms)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------ cli
+
+def cmd_feedback(paths, sig, action):
+    Feedback(paths.feedback).record(sig, action)
+    ts = int(time.time() * 1000)
+    write_atomic(os.path.join(paths.adv, f"cmd-{ts}.json"), json.dumps({"sig": sig, "action": action, "ts": ts}))
+
+
+def run_loop(adv, stop, tick_s=TICK_S):
+    """Tick until `stop` is set (it also cuts the wait short), then clear the meter and save baselines."""
+    while not stop.is_set():
+        t0 = time.monotonic()
+        try:
+            adv.tick()
+        except Exception as e:
+            if "tick" not in adv._logged:
+                adv._logged.add("tick")
+                log(f"tick failed ({type(e).__name__}: {e})")
+        stop.wait(max(0.5, tick_s - (time.monotonic() - t0)))
+    try:
+        adv.shutdown()
+    except Exception:
+        pass
+    try:
+        adv.bl.save(adv.clock(), force=True)
+    except OSError:
+        pass
+
+
+def main(argv=None):
+    a = sys.argv[1:] if argv is None else argv
+    paths = Paths()
+    if a[:1] == ["feedback"] and len(a) == 3 and a[2] in ("dismiss", "open"):
+        cmd_feedback(paths, a[1], a[2])
+        return 0
+    if a[:1] == ["once"]:
+        adv = Advisor(paths)
+        adv.col.cpu()                               # prime the utilisation delta
+        time.sleep(1)
+        adv.step(adv.clock())
+        adv.wait_triage()
+        findings = [{k: v for k, v in f.items() if k in ("sig", "priority", "severity", "text", "sticky", "ttl_ms",
+                                                          "residual", "voice")} for f in adv.active.values()]
+        print(json.dumps(findings, indent=None if "--json" in a else 1))
+        return 0
+    if a[:1] == ["run"]:
+        stop = threading.Event()
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        run_loop(Advisor(paths, push=OrderedPusher(default_push), voice=Voice()), stop)
+        return 0
+    print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

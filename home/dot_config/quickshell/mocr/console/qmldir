@@ -1,0 +1,4 @@
+module console
+ActionExecutor 1.0 ActionExecutor.qml
+ConsoleRow 1.0 ConsoleRow.qml
+Console 1.0 Console.qml

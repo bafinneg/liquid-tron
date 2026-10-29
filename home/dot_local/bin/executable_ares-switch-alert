@@ -1,0 +1,130 @@
+#!/usr/bin/python3 -I
+"""ares-switch-alert deny|clear: turn the USW Pro HD 24 Etherlighting blood red on a wrong Ares password, restore on the right one.
+
+The Pro HD runs Etherlighting in Network mode, so each port shows its network's colour. Network colours are a
+site setting (`ether_lighting.network_overrides`), so deny sets every network to #FF0000 and clear writes the
+saved overrides back. The controller re-provisions the switch in about 8-11 s.
+
+deny:  save the current overrides to ~/.local/state/ares-lock/switch-saved.json (only if no save exists and the
+       current set is not already all red, so repeated denials never save red), then set every network red.
+clear: write the saved overrides back and remove the save. With no save it does nothing.
+
+Same semantics as the office Hue lights: red until the correct password (ares-hue-alert). The console
+certificate is checked against the owner-approved pin in /etc/sentinel/fetch.json before the key is sent;
+the X-API-KEY is read with `sudo -n` from the sentinel-cred store and never printed or stored.
+Exits 0 when the console or key is unreachable; never blocks the lock (called detached). Serialised by flock.
+"""
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import ssl
+import subprocess
+import sys
+import time
+
+RED = "FF0000"
+SETTING = "/proxy/network/api/s/default/get/setting/ether_lighting"
+SET = "/proxy/network/api/s/default/set/setting/ether_lighting/"
+CRED = "/var/lib/sentinel-cred/creds/unifi-network"
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "ares-lock")
+SAVE = os.path.join(STATE, "switch-saved.json")
+LOG = os.path.join(STATE, "switch-alert.log")
+
+
+class Api:
+    def __init__(self):
+        t = json.load(open("/etc/sentinel/fetch.json"))["targets"]["unifi-network"]
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE          # self-signed; the pin below is the check
+        self.c = http.client.HTTPSConnection(t["host"], t.get("port", 443), context=ctx, timeout=8)
+        self.c.connect()
+        fp = hashlib.sha256(self.c.sock.getpeercert(binary_form=True)).hexdigest().upper()
+        if fp != t["sha256"].replace(":", "").upper():
+            raise OSError("console certificate does not match the pin; nothing sent")
+        r = subprocess.run(["sudo", "-n", "cat", CRED], capture_output=True, timeout=5)
+        if r.returncode != 0:
+            raise OSError("API key not readable")
+        self.k = r.stdout.decode().strip()
+
+    def req(self, method, path, body=None):
+        h = {"X-API-KEY": self.k, "Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            h["Content-Type"] = "application/json"
+        self.c.request(method, path, body=data, headers=h)
+        r = self.c.getresponse()
+        js = json.loads(r.read() or b"{}")
+        if r.status != 200 or js.get("meta", {}).get("rc") != "ok":
+            raise OSError(f"{method} {path}: HTTP {r.status} {js.get('meta')}")
+        return js["data"]
+
+    def setting(self):
+        return self.req("GET", SETTING)[0]
+
+    def put_overrides(self, sid, overrides):
+        self.req("PUT", SET + sid, {"network_overrides": overrides})
+        now = self.setting()["network_overrides"]
+        if now != overrides:
+            raise OSError("read-back differs from what was written")
+
+
+def all_red(overrides, keys):
+    have = {o["key"]: o["raw_color_hex"].upper() for o in overrides}
+    return all(have.get(k) == RED for k in keys)
+
+
+def deny(api):
+    s = api.setting()
+    keys = [d["key"] for d in s["network_defaults"]]
+    if not os.path.exists(SAVE) and not all_red(s["network_overrides"], keys):
+        tmp = SAVE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"_id": s["_id"], "network_overrides": s["network_overrides"]}, f)
+        os.replace(tmp, SAVE)
+    red = [{"key": k, "raw_color_hex": RED} for k in keys]
+    if not all_red(s["network_overrides"], keys):
+        api.put_overrides(s["_id"], red)
+    return "red"
+
+
+def clear(api):
+    try:
+        with open(SAVE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return "no save; nothing to restore"
+    api.put_overrides(saved["_id"], saved["network_overrides"])
+    os.remove(SAVE)
+    return "restored"
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {msg}\n")
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in ("deny", "clear"):
+        print("usage: ares-switch-alert deny|clear", file=sys.stderr)
+        return 2
+    os.makedirs(STATE, exist_ok=True)
+    if argv[1] == "clear" and not os.path.exists(SAVE):
+        return 0                                  # nothing red to undo: no network call
+    with open(os.path.join(STATE, "switch-alert.lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            api = Api()
+            result = (deny if argv[1] == "deny" else clear)(api)
+            log(f"{argv[1]}: {result}")
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+            log(f"{argv[1]}: failed: {e}")
+            return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

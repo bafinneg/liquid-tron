@@ -1,0 +1,18 @@
+// Tron Compute — Zellij theme
+// Managed via Stow — do not edit ~/.config/zellij/themes/ directly
+
+themes {
+    liquid-tron {
+        fg "#c0c0d0"
+        bg "#0a0a14"
+        black "#06060c"
+        red "#ff003c"
+        green "#00ff9f"
+        yellow "#ff8c00"
+        blue "#0072ff"
+        magenta "#ff003c"
+        cyan "#0abdc6"
+        white "#e0e0f0"
+        orange "#ff8c00"
+    }
+}

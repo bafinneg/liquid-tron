@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Zen — Focus
+GenericName=Web Browser (guitar tabs / focus)
+Comment=Zen Browser, zen-focus profile (FEAT-workspace-ux-overhaul)
+Exec=env MOZ_APP_REMOTINGNAME=zen-focus /opt/zen-browser-bin/zen-bin -P zen-focus --new-instance %u
+Icon=zen-browser
+Type=Application
+StartupNotify=true
+StartupWMClass=zen-focus
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;

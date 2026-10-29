@@ -1,0 +1,24 @@
+[general]
+bars = 0
+bar_width = 2
+bar_spacing = 1
+framerate = 60
+
+[input]
+method = pipewire
+source = auto
+
+[output]
+method = ncurses
+
+[color]
+gradient = 1
+gradient_count = 4
+gradient_color_1 = '#00ff9f'
+gradient_color_2 = '#0abdc6'
+gradient_color_3 = '#0072ff'
+gradient_color_4 = '#ff003c'
+
+[smoothing]
+monstercat = 1
+gravity = 80

@@ -1,0 +1,901 @@
+#!{{ .chezmoi.homeDir }}/.local/share/hand-gesture/venv/bin/python -I
+"""hand-gesture-lab: record labelled hand-tracking sessions and replay them through the gesture engine (HQ-0221).
+
+Usage:
+  hand-gesture-lab record [--sections natural,grammar,everyday] [--quick] [--out DIR] [--no-window] [--then CMD]
+  hand-gesture-lab replay REC_DIR [--engine PATH] [--config PATH] [--out PREFIX]
+  hand-gesture-lab protocol
+
+record   Guided prompts (large kitty window, sound cues) while the EagleEye Mini runs the same MediaPipe model as
+         hand-gesture.service. Numbers only are kept: per hand the 21 landmarks in image and world coordinates, every
+         canned gesture score, handedness, plus frame timing, inference time and mean luma. No image is stored.
+         hand-gesture.service is stopped for the recording (the camera is exclusive) and restarted afterwards when it
+         was running. Keys: Enter start a section, s skip a section, space pause (the current prompt restarts),
+         x mark the current or previous prompt as botched, q stop and save.
+         Output: ~/workspace/handgesture-review/data/rec-<stamp>/ {frames.jsonl.gz, labels.json, meta.json}.
+
+replay   Feeds a recording through a GestureEngine (default: the installed hand-gesture next to this file; --engine
+         takes a candidate) with a fake Hyprland world, at the daemon's frame cadence, in two passes:
+         forced  - before each prompt the engine is put in the state the prompt assumes (armed, or idle for "arm";
+                   a fullscreen window for "leave fullscreen"), so each gesture is scored on its own;
+         natural - the engine runs uninterrupted from the first frame, as the daemon would.
+         Writes <PREFIX>.md (tables) and <PREFIX>.json (every segment, event and log line); PREFIX defaults to
+         REC_DIR/replay-<engine file name>.
+
+Engine contract (what replay needs from a candidate): module attributes DEFAULT_MONITORS, CAPTURE_FPS, PROCESS_HZ,
+ARMED_STATES, load_config(path); class GestureEngine(cfg, runner, wall_ms=, dispatch=, active=, windows=, monitors=,
+pointer=) with update(now, frame, others), attributes state and mode; runner("down") = next workspace,
+runner("up") = previous; Hyprland Lua dispatch strings for fullscreen and monitor moves; pointer.button(name, down)
+for clicks. A module-level lab_force_arm(engine, now) / lab_force_idle(engine, now) overrides the built-in forcing.
+"""
+import argparse
+import collections
+import contextlib
+import datetime
+import gzip
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import math
+import os
+import re
+import select
+import shlex
+import socket
+import statistics
+import subprocess
+import sys
+import time
+import zlib
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ENGINE = os.path.join(HERE, "hand-gesture")
+DATA = os.path.expanduser("~/workspace/handgesture-review/data")
+UNIT = "hand-gesture.service"
+SOUNDS = "/usr/share/sounds/freedesktop/stereo"
+PROTOCOL_VERSION = 1
+READY_S, REST_S = 1.5, 1.5
+TAIL_S = 0.7                     # an event this long after the GO window still counts as on time
+EARLY_S = 0.3                    # an event this long before GO still counts (the user anticipated the cue)
+AIM_WINDOW_S = 1.5               # aim error and jitter come from the last part of the GO window
+COMMANDS = ("arm", "disarm", "ws_next", "ws_prev", "move_right", "move_left", "click_left", "click_right",
+            "drag", "resize", "fullscreen_on", "fullscreen_off")
+
+# -- protocol --------------------------------------------------------------------------------------
+NATURAL = [
+    ("arm", "Turn gesture control ON", 3, 3.5),
+    ("ws_next", "Go to the NEXT workspace", 3, 3.5),
+    ("ws_prev", "Go to the PREVIOUS workspace", 3, 3.5),
+    ("move_right", "Send this window to the monitor on your RIGHT", 3, 3.5),
+    ("move_left", "Send this window to the monitor on your LEFT", 3, 3.5),
+    ("click_left", "CLICK the thing you are pointing at", 3, 3.5),
+    ("click_right", "RIGHT-CLICK the thing you are pointing at", 3, 3.5),
+    ("drag", "GRAB a window and move it somewhere else", 3, 5.0),
+    ("resize", "Make a window BIGGER", 3, 5.0),
+    ("fullscreen_on", "Make the window FULLSCREEN", 3, 3.5),
+    ("fullscreen_off", "LEAVE fullscreen", 3, 3.5),
+    ("disarm", "Turn gesture control OFF", 3, 3.5),
+]
+GRAMMAR = [
+    ("arm", "ARM: open palm", "Open palm toward the camera, held still about half a second.", 3, 3.0),
+    ("ws_next", "Swipe UP (next workspace)", "Open palm, one quick upward stroke, then let your hand settle.", 4, 2.5),
+    ("ws_prev", "Swipe DOWN (previous workspace)", "Open palm, one quick downward stroke, then let your hand settle.", 4, 2.5),
+    ("move_right", "Flick RIGHT (window to the right monitor)", "Open palm, one quick sideways stroke to your right.", 4, 2.5),
+    ("move_left", "Flick LEFT (window to the left monitor)", "Open palm, one quick sideways stroke to your left.", 4, 2.5),
+    ("click_left", "Pinch tap (left click)", "Point, then tap thumb and index together once, quickly, hand still.", 4, 2.5),
+    ("click_right", "Middle pinch tap (right click)", "Tap thumb and middle finger together once, quickly.", 3, 2.5),
+    ("drag", "Pinch-hold drag", "Pinch thumb and index, hold still a moment, move your hand, then release.", 3, 5.0),
+    ("resize", "Two-hand resize", "Pinch with BOTH hands, spread them apart, then release.", 3, 5.0),
+    ("fullscreen_on", "Victory (fullscreen)", "Index and middle finger up (V sign), held still about half a second.", 3, 3.0),
+    ("fullscreen_off", "Two palms (leave fullscreen)", "Both open palms toward the camera, held half a second.", 3, 3.0),
+    ("aim_left", "Aim at the LEFT monitor", "Point your index finger at the centre of the LEFT monitor and hold steady.", 1, 3.5),
+    ("aim_center", "Aim at the CENTRE monitor", "Point your index finger at the centre of the CENTRE monitor and hold steady.", 1, 3.5),
+    ("aim_right", "Aim at the RIGHT monitor", "Point your index finger at the centre of the RIGHT monitor and hold steady.", 1, 3.5),
+    ("disarm", "Fist (disarm)", "Close your hand into a fist and hold it about a second.", 3, 3.0),
+]
+EVERYDAY = [
+    ("typing", "Type on your keyboard"),
+    ("mouse", "Use your mouse"),
+    ("drink", "Pick up a drink and take a sip"),
+    ("talk", "Talk with your hands, as on a call"),
+    ("face", "Touch your face: scratch, rub your eyes, adjust glasses or headset"),
+    ("stretch", "Stretch, lean back, run a hand through your hair"),
+    ("reach", "Reach across the desk for something"),
+    ("wave", "Wave at someone in the room"),
+    ("rest", "Rest: hands relaxed wherever they normally sit"),
+]
+SECTIONS = {
+    "natural": ("Natural motions",
+                "For each prompt, do whatever hand motion feels most natural to you for that action. There is no "
+                "wrong answer and nothing will happen on screen. Keep your hand where the camera can see it."),
+    "grammar": ("Current gestures",
+                "Now use the current HQ-0114 gestures exactly as each prompt describes. Nothing will happen on "
+                "screen. Do each one the way you would in real use."),
+    "everyday": ("Everyday desk motions",
+                 "Nothing should fire during these. Do each activity naturally for the whole countdown, with your "
+                 "hands wherever they would normally be."),
+}
+
+
+def build_steps(sections, quick=False):
+    """[{"kind": "intro", ...} | {"kind": "seg", ...}] in recording order."""
+    steps = []
+    for sec in sections:
+        title, intro = SECTIONS[sec]
+        steps.append({"kind": "intro", "sec": sec, "title": title, "text": intro})
+        if sec == "natural":
+            items = [(lab, txt, "Do whatever motion feels natural.", reps, go) for lab, txt, reps, go in NATURAL]
+        elif sec == "grammar":
+            items = list(GRAMMAR)
+        else:
+            items = [("none", txt, "Nothing should fire.", 1, 15.0, act) for act, txt in EVERYDAY]
+        for n, it in enumerate(items, 1):
+            label, title_i, how, reps, go = it[:5]
+            act = it[5] if len(it) > 5 else None
+            if quick:
+                reps, go = 1, (min(go, 5.0) if sec == "everyday" else go)
+            for r in range(1, reps + 1):
+                steps.append({"kind": "seg", "sec": sec, "label": label, "activity": act, "title": title_i,
+                              "how": how, "rep": r, "reps": reps, "item": n, "items": len(items), "go": go})
+    return steps
+
+
+# -- data --------------------------------------------------------------------------------------------
+def r4(v):
+    return round(float(v), 4)
+
+
+def hands_from_result(res):
+    """MediaPipe GestureRecognizerResult -> list of numbers-only hand dicts (recording format)."""
+    out = []
+    for i, lm in enumerate(res.hand_landmarks or ()):
+        g = res.gestures[i] if res.gestures and len(res.gestures) > i else []
+        hd = res.handedness[i][0] if res.handedness and len(res.handedness) > i and res.handedness[i] else None
+        wl = res.hand_world_landmarks[i] if res.hand_world_landmarks and len(res.hand_world_landmarks) > i else []
+        out.append({"hd": hd.category_name if hd else None, "hs": r4(hd.score) if hd else 1.0,
+                    "g": [[c.category_name, r4(c.score)] for c in g],
+                    "lm": [[r4(p.x), r4(p.y), r4(p.z)] for p in lm],
+                    "wl": [[r4(p.x), r4(p.y), r4(p.z)] for p in wl]})
+    return out
+
+
+def engine_frame(h):
+    """Recording hand dict -> the daemon's engine frame dict (same fields recognize() builds)."""
+    g = h.get("g") or []
+    top = max(g, key=lambda c: c[1]) if g else None
+    return {"gesture": top[0] if top else "None", "score": top[1] if top else 0.0,
+            "handedness": h.get("hs", 1.0), "lms": [(p[0], p[1]) for p in h["lm"]]}
+
+
+def read_frames(path):
+    rows = []
+    try:
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    break
+    except (EOFError, OSError, zlib.error):
+        pass                                   # a recording cut short keeps every complete line
+    return rows
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+
+
+def sha256(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def load_engine(path):
+    name = "hg_engine_" + hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:8]
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# -- record ---------------------------------------------------------------------------------------------
+class Keys:
+    def __init__(self, on):
+        self.on = on and sys.stdin.isatty()
+        self.saved = None
+        if self.on:
+            import termios
+            import tty
+            self.saved = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+
+    def get(self):
+        if not self.on:
+            return None
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        return sys.stdin.read(1) if r else None
+
+    def close(self):
+        if self.saved is not None:
+            import termios
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.saved)
+            self.saved = None
+
+
+def play(name):
+    try:
+        subprocess.Popen(["pw-play", os.path.join(SOUNDS, name)], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+AMBER, GREEN, GREY, BOLD, RESET = "\x1b[38;5;214m", "\x1b[1;38;5;46m", "\x1b[38;5;244m", "\x1b[1m", "\x1b[0m"
+
+
+class Session:
+    """Prompt state machine, driven once per camera frame. Times are time.monotonic(), the frame clock."""
+
+    def __init__(self, steps, interactive, out=sys.stdout):
+        self.steps = steps
+        self.i = 0
+        self.phase = None
+        self.t0 = 0.0
+        self.cur = None
+        self.segs = []
+        self.paused = False
+        self.quit = False
+        self.interactive = interactive
+        self.out = out
+        self.hands = 0
+        self.fps = 0.0
+        self._shown = None
+        self.sections_done = []
+
+    @property
+    def done(self):
+        return self.quit or self.i >= len(self.steps)
+
+    def _sec_total(self):
+        return len([s for s in self.steps if s["kind"] == "intro"])
+
+    def _sec_no(self):
+        return len([s for s in self.steps[:self.i + 1] if s["kind"] == "intro"])
+
+    def _start(self, now):
+        if self.i >= len(self.steps):
+            return
+        st = self.steps[self.i]
+        if st["kind"] == "intro":
+            self.phase = "intro"
+        else:
+            self.phase = "ready"
+            self.cur = {"sec": st["sec"], "label": st["label"], "activity": st["activity"], "rep": st["rep"],
+                        "prompt": st["title"], "ready_t": round(now, 3), "botched": False}
+        self.t0 = now
+        self._shown = None
+
+    def _next(self, now):
+        st = self.steps[self.i]
+        if st["kind"] == "seg" and (self.i + 1 >= len(self.steps) or self.steps[self.i + 1]["kind"] == "intro"):
+            self.sections_done.append(st["sec"])
+            play("complete.oga")
+        self.i += 1
+        self._start(now)
+
+    def key(self, k, now):
+        if k in ("q", "Q"):
+            self.quit = True
+        elif k in ("x", "X"):
+            if self.phase in ("go", "rest") and self.cur:
+                self.cur["botched"] = True
+            elif self.segs:
+                self.segs[-1]["botched"] = True
+            self._shown = None
+        elif k == " " and self.phase != "intro":
+            self.paused = not self.paused
+            if not self.paused:
+                self._start(now)                    # the interrupted prompt starts again from READY
+            self._shown = None
+        elif self.phase == "intro" and k in ("\n", "\r"):
+            self.i += 1
+            self._start(now)
+        elif self.phase == "intro" and k in ("s", "S"):
+            j = self.i + 1
+            while j < len(self.steps) and self.steps[j]["kind"] != "intro":
+                j += 1
+            self.i = j
+            self._start(now)
+
+    def tick(self, now):
+        if self.phase is None:
+            self._start(now)
+        if self.done or self.paused:
+            self.draw(now)
+            return
+        st = self.steps[self.i]
+        el = now - self.t0
+        if self.phase == "intro":
+            if not self.interactive:
+                self.i += 1
+                self._start(now)
+        elif self.phase == "ready" and el >= READY_S:
+            self.phase, self.t0 = "go", now
+            self.cur["go_t"] = round(now, 3)
+            play("message-new-instant.oga")
+        elif self.phase == "go" and el >= st["go"]:
+            self.phase, self.t0 = "rest", now
+            self.cur["end_t"] = round(now, 3)
+            play("audio-volume-change.oga")
+        elif self.phase == "rest" and el >= REST_S:
+            self.cur["rest_end_t"] = round(now, 3)
+            self.segs.append(self.cur)
+            self.cur = None
+            self._next(now)
+        self.draw(now)
+
+    def draw(self, now):
+        if self.done:
+            return
+        st = self.steps[self.i]
+        left = 0.0
+        if st["kind"] == "seg" and self.phase in ("ready", "go", "rest"):
+            dur = {"ready": READY_S, "go": st["go"], "rest": REST_S}[self.phase]
+            left = max(0.0, dur - (now - self.t0))
+        key = (self.i, self.phase, self.paused, round(left * 2), self.hands, self.cur and self.cur.get("botched"),
+               self.segs and self.segs[-1].get("botched"))
+        if key == self._shown:
+            return
+        self._shown = key
+        w = self.out.write
+        w("\x1b[2J\x1b[H")
+        w(f"{GREY}HAND GESTURE LAB  ·  section {self._sec_no()}/{self._sec_total()}: {SECTIONS[st['sec']][0]}{RESET}\n\n")
+        if st["kind"] == "intro":
+            w(f"{BOLD}{SECTIONS[st['sec']][0]}{RESET}\n\n{st['text']}\n\n")
+            w(f"{GREEN}Press Enter to begin{RESET}   (s skips this section, q stops and saves)\n")
+        else:
+            w(f"{GREY}item {st['item']}/{st['items']}  ·  rep {st['rep']}/{st['reps']}{RESET}\n\n")
+            w(f"  {BOLD}{st['title']}{RESET}\n  {st['how']}\n\n")
+            if self.paused:
+                w(f"  {AMBER}PAUSED{RESET}  (space resumes; this prompt starts again)\n")
+            elif self.phase == "ready":
+                w(f"  {AMBER}○ get ready{RESET}   {left:4.1f} s\n")
+            elif self.phase == "go":
+                w(f"  {GREEN}● GO — now{RESET}     {left:4.1f} s\n")
+            else:
+                w(f"  {GREY}○ rest{RESET}        {left:4.1f} s\n")
+            if self.cur and self.cur.get("botched"):
+                w(f"\n  {AMBER}marked botched{RESET}\n")
+        hand = f"{GREEN}hand seen ({self.hands}){RESET}" if self.hands else f"{AMBER}no hand in view{RESET}"
+        w(f"\n\n{GREY}space pause · x botched · q stop and save{RESET}      {hand}   {GREY}{self.fps:4.1f} fps{RESET}\n")
+        self.out.flush()
+
+
+def make_lab_recognizer(hg):
+    """The daemon's recogniser settings (make_recognizer), but returning every canned gesture score."""
+    from mediapipe.tasks.python import vision, BaseOptions
+    from mediapipe.tasks.python.components.processors.classifier_options import ClassifierOptions
+    opt = vision.GestureRecognizerOptions(
+        base_options=BaseOptions(model_asset_path=hg.MODEL),
+        running_mode=vision.RunningMode.VIDEO, num_hands=2,
+        min_hand_presence_confidence=0.3, min_tracking_confidence=0.3,
+        canned_gesture_classifier_options=ClassifierOptions(max_results=8, score_threshold=0.0))
+    return vision.GestureRecognizer.create_from_options(opt)
+
+
+def unit_active():
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", UNIT]).returncode == 0
+
+
+def spawn_window(argv):
+    exe = os.path.realpath(__file__)
+    cmd = ["kitty", "--class", "hand-gesture-lab", "--title", "Hand gesture lab", "-o", "font_size=22",
+           "env", "HGLAB_CHILD=1", exe] + argv
+    try:
+        return subprocess.run(cmd).returncode
+    except OSError as e:
+        print(f"hand-gesture-lab: cannot open kitty ({e}); re-run with --no-window", file=sys.stderr)
+        return 2
+
+
+def cmd_record(a, argv):
+    interactive = sys.stdin.isatty()
+    if interactive and not a.no_window and not os.environ.get("HGLAB_CHILD"):
+        return spawn_window(argv)
+    sections = [s.strip() for s in a.sections.split(",") if s.strip()]
+    bad = [s for s in sections if s not in SECTIONS]
+    if bad or not sections:
+        print(f"hand-gesture-lab: unknown section(s) {bad}; use {','.join(SECTIONS)}", file=sys.stderr)
+        return 64
+    hg = load_engine(ENGINE)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = a.out or os.path.join(DATA, f"rec-{stamp}{'-quick' if a.quick else ''}")
+    os.makedirs(out, exist_ok=True)
+    meta = {"protocol": PROTOCOL_VERSION, "sections": sections, "quick": a.quick, "complete": False,
+            "started": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "host": socket.gethostname(), "camera": hg.CAMERA,
+            "capture": [hg.CAPTURE_W, hg.CAPTURE_H, hg.CAPTURE_FPS], "model": hg.MODEL,
+            "model_sha256": sha256(hg.MODEL), "engine_sha256": sha256(ENGINE),
+            "recogniser": {"num_hands": 2, "min_hand_presence_confidence": 0.3, "min_tracking_confidence": 0.3,
+                           "min_hand_detection_confidence": "default (0.5)"},
+            "clock": "time.monotonic seconds; labels use the same clock",
+            "frame_format": {"i": "frame number", "t": "monotonic s after read", "ms": "recogniser ms",
+                             "luma": "mean of the BGR frame", "hands": "[{hd: handedness label, hs: its score, "
+                             "g: [[gesture, score]] all canned classes, lm: 21x[x,y,z] image-normalised, "
+                             "wl: 21x[x,y,z] world metres}]"}}
+    was_active = unit_active()
+    if was_active:
+        subprocess.run(["systemctl", "--user", "stop", UNIT])
+        meta["service_stopped"] = True
+    keys = Keys(interactive)
+    sess = Session(build_steps(sections, a.quick), interactive)
+    cap = writer = None
+    n = 0
+    t_first = None
+    ms_all = []
+    rc = 0
+    try:
+        import cv2
+        import mediapipe as mp
+        meta["mediapipe"] = getattr(mp, "__version__", None)
+        cap = hg.open_camera()
+        if cap is None:
+            print("hand-gesture-lab: camera not available", file=sys.stderr)
+            return 2
+        rec = make_lab_recognizer(hg)
+        writer = gzip.open(os.path.join(out, "frames.jsonl.gz"), "wt", compresslevel=6)
+        recent = collections.deque(maxlen=30)
+        last_ts = -1
+        while not sess.done:
+            if a.limit_s and t_first and time.monotonic() - t_first >= a.limit_s:
+                sess.quit = True
+                break
+            k = keys.get()
+            while k:
+                sess.key(k, time.monotonic())
+                k = keys.get()
+            ok, frame = cap.read()
+            now = time.monotonic()
+            if not ok:
+                time.sleep(0.02)
+                continue
+            n += 1
+            t_first = t_first or now
+            ts = max(last_ts + 1, int(now * 1000))
+            last_ts = ts
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            s = time.perf_counter()
+            res = rec.recognize_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts)
+            ms = (time.perf_counter() - s) * 1000
+            ms_all.append(ms)
+            hands = hands_from_result(res)
+            writer.write(json.dumps({"i": n, "t": round(now, 4), "ms": round(ms, 1),
+                                     "luma": round(float(frame.mean()), 1), "hands": hands},
+                                    separators=(",", ":")) + "\n")
+            recent.append(now)
+            sess.hands = len(hands)
+            sess.fps = (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) > 1 and recent[-1] > recent[0] else 0.0
+            nsegs = len(sess.segs)
+            sess.tick(now)
+            if len(sess.segs) != nsegs:
+                write_json(os.path.join(out, "labels.json"), {"segments": sess.segs})
+    except KeyboardInterrupt:
+        sess.quit = True
+    finally:
+        keys.close()
+        if cap is not None:
+            cap.release()
+        if writer is not None:
+            writer.close()
+        write_json(os.path.join(out, "labels.json"), {"segments": sess.segs})
+        meta.update({"frames": n, "seconds": round((time.monotonic() - t_first), 1) if t_first else 0,
+                     "segments": len(sess.segs), "sections_done": sess.sections_done,
+                     "complete": not sess.quit and sess.i >= len(sess.steps),
+                     "ms_p50": round(statistics.median(ms_all), 1) if ms_all else None,
+                     "ms_p95": round(sorted(ms_all)[int(len(ms_all) * 0.95)], 1) if ms_all else None,
+                     "ended": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
+        meta["fps"] = round(n / meta["seconds"], 1) if meta["seconds"] else 0
+        write_json(os.path.join(out, "meta.json"), meta)
+        if was_active:
+            subprocess.run(["systemctl", "--user", "start", UNIT])
+    sys.stdout.write("\x1b[2J\x1b[H")
+    print(f"Saved {n} frames, {len(sess.segs)} prompts ({'complete' if meta['complete'] else 'partial'}) to\n  {out}")
+    if meta["complete"] and a.then:
+        print(f"\nRunning: {a.then}")
+        r = subprocess.run(shlex.split(a.then) + [out], capture_output=True, text=True, timeout=120)
+        print((r.stdout + r.stderr).strip())
+        rc = r.returncode
+    if os.environ.get("HGLAB_CHILD") and interactive:
+        input("\nPress Enter to close.")
+    return rc
+
+
+# -- replay ---------------------------------------------------------------------------------------------
+class FakePointer:
+    def __init__(self, world):
+        self.w = world
+
+    def move(self, x, y):
+        self.w.ptr = (x, y)
+
+    def button(self, name, down):
+        if down:
+            self.w.event(f"click_{name}")
+
+    def set_active(self, on):
+        pass
+
+    def release_all(self):
+        pass
+
+    def cursor_pos(self):
+        return self.w.ptr
+
+
+class World:
+    """A three-monitor desktop with one tiled window on the middle monitor. Dispatches become events."""
+
+    def __init__(self, hg):
+        self.mons = list(hg.DEFAULT_MONITORS)
+        srt = sorted(self.mons, key=lambda m: m["x"])
+        self.home = srt[len(srt) // 2]
+        h = self.home
+        self.win = {"address": "0x1ab0", "at": [h["x"] + 400, h["y"] + 300], "size": [1600, 1000],
+                    "floating": False, "fullscreen": False, "monitor": h["id"], "focusHistoryID": 0,
+                    "mapped": True, "hidden": False, "workspace": {"id": 1}, "class": "lab"}
+        self.t = 0.0
+        self.events = []
+        self.logs = []
+        self.ptr = None
+        self.pointer = FakePointer(self)
+
+    def event(self, name, **kw):
+        self.events.append(dict(t=round(self.t, 3), ev=name, **kw))
+
+    def runner(self, arg):
+        self.event({"down": "ws_next", "up": "ws_prev"}.get(arg, f"ws_{arg}"))
+
+    def dispatch(self, expr):
+        if "fullscreen" in expr:
+            self.win["fullscreen"] = not self.win["fullscreen"]
+            self.event("fullscreen_on" if self.win["fullscreen"] else "fullscreen_off")
+            return "ok"
+        m = re.search(r'monitor\s*=\s*"([^"]+)"', expr)
+        if m:
+            tgt = next((x for x in self.mons if x["name"] == m.group(1)), None)
+            if tgt is not None:
+                self.event("move_right" if tgt["x"] > self.home["x"] else "move_left")
+        return "ok"
+
+    def active(self):
+        return dict(self.win)
+
+    def windows(self):
+        return [dict(self.win)]
+
+    def monitors(self):
+        return self.mons
+
+
+def force_arm(hg, eng, now):
+    if hasattr(hg, "lab_force_arm"):
+        return hg.lab_force_arm(eng, now)
+    eng._now = now
+    eng.state = "armed"
+    eng.progress = 0.0
+    for k, v in (("_palm_since", None), ("_fist_since", None), ("_settled", True), ("_fire_dir", None),
+                 ("_sm", "REST"), ("_sm_still", None), ("_last_hand_t", now)):
+        if hasattr(eng, k):
+            setattr(eng, k, v)
+    if hasattr(eng, "_quiet_until"):
+        eng._quiet_until = now + getattr(hg, "ARM_QUIET_S", 0.25)
+
+
+def force_idle(hg, eng, now):
+    if hasattr(hg, "lab_force_idle"):
+        return hg.lab_force_idle(eng, now)
+    eng._now = now
+    if hasattr(eng, "_disarm"):
+        eng._disarm()
+    else:
+        eng.state = "idle"
+
+
+def run_pass(hg, frames, segs, cfg, forced):
+    world = World(hg)
+    armed_states = tuple(getattr(hg, "ARMED_STATES", ("arming", "armed", "cooldown")))
+    live = ("armed", "cooldown")
+    eng = hg.GestureEngine(cfg, world.runner, wall_ms=lambda: int(world.t * 1000), dispatch=world.dispatch,
+                           active=world.active, windows=world.windows, monitors=world.monitors,
+                           pointer=world.pointer)
+    every_idle = max(1, int(getattr(hg, "CAPTURE_FPS", 30)) // int(getattr(hg, "PROCESS_HZ", 15)))
+    order = sorted(segs, key=lambda s: s["ready_t"])
+    si = 0
+    cur = None
+    track = []
+    frame_no = 0
+    for fr in frames:
+        t = fr["t"]
+        world.t = t
+        while si < len(order) and t >= order[si]["ready_t"]:
+            cur = order[si]
+            si += 1
+            if forced:
+                world.win["fullscreen"] = cur["label"] == "fullscreen_off"
+                if cur["label"] == "arm":
+                    force_idle(hg, eng, t)
+                else:
+                    force_arm(hg, eng, t)
+        if forced and cur is not None and cur["sec"] == "everyday" and eng.state == "idle" \
+                and t <= cur.get("rest_end_t", t):
+            force_arm(hg, eng, t)                   # an everyday prompt is scored with the engine armed throughout
+        frame_no += 1
+        every = 1 if eng.state in armed_states or getattr(eng, "mode", None) else every_idle
+        if frame_no % every:
+            continue
+        hands = [engine_frame(h) for h in fr.get("hands") or ()]
+        prev_state, prev_mode = eng.state, getattr(eng, "mode", None)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+            eng.update(t, hands[0] if hands else None, hands[1:])
+        for line in buf.getvalue().splitlines():
+            world.logs.append({"t": round(t, 3), "line": line.replace("hand-gesture: ", "", 1)})
+        st, mode = eng.state, getattr(eng, "mode", None)
+        if prev_state not in live and st in live:
+            world.event("arm")
+        elif prev_state in armed_states and st == "idle":
+            world.event("disarm" if hands else "disarm_timeout")       # a timeout with no hand is not a command
+        if mode != prev_mode and mode in ("drag", "resize"):
+            world.event(mode)
+        if world.ptr is not None and st in live:
+            track.append((t, world.ptr[0], world.ptr[1]))
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            eng.close()
+        except Exception:
+            pass
+    return world, track
+
+
+def aim_target(mons, label):
+    srt = sorted(mons, key=lambda m: m["x"])
+    m = {"aim_left": srt[0], "aim_center": srt[len(srt) // 2], "aim_right": srt[-1]}[label]
+    return m["x"] + m["width"] / 2, m["y"] + m["height"] / 2
+
+
+def score(segs, events, logs, track, mons):
+    order = sorted(segs, key=lambda s: s["ready_t"])
+    rows = []
+    for k, s in enumerate(order):
+        go = s.get("go_t")
+        if go is None:
+            continue
+        stop = order[k + 1]["ready_t"] if k + 1 < len(order) else float("inf")
+        evs = [e for e in events if s["ready_t"] <= e["t"] < stop and e["ev"] in COMMANDS]
+        exp = s["label"] if s["label"] in COMMANDS else None
+        first = next((e for e in evs if e["ev"] == exp and go - EARLY_S <= e["t"] <= s["end_t"] + TAIL_S), None) \
+            if exp else None
+        others = [e for e in evs if e is not first]
+        if exp is None:
+            outcome = "clean" if not evs else "false"
+        elif first is None and any(e["ev"] == exp and e["t"] < go - EARLY_S for e in evs):
+            outcome = "early"                   # fired during the get-ready countdown, before the motion was asked for
+        elif first and not others:
+            outcome = "hit"
+        elif first:
+            outcome = "hit+extra"
+        elif any(e["ev"] == exp for e in evs):
+            outcome = "late"
+        else:
+            outcome = "wrong" if evs else "miss"
+        row = {"sec": s["sec"], "label": s["label"], "activity": s.get("activity"), "rep": s["rep"],
+               "botched": s.get("botched", False), "outcome": outcome,
+               "latency": round(first["t"] - go, 3) if first else None,
+               "events": [[e["ev"], round(e["t"] - go, 3)] for e in evs],
+               "log": [[round(x["t"] - go, 3), x["line"]] for x in logs if s["ready_t"] <= x["t"] < stop][:20],
+               "seconds": round(s["end_t"] - go, 2)}
+        if s["label"].startswith("aim_"):
+            pts = [(x, y) for t, x, y in track if s["end_t"] - AIM_WINDOW_S <= t <= s["end_t"]]
+            if pts:
+                tx, ty = aim_target(mons, s["label"])
+                mx, my = statistics.median(p[0] for p in pts), statistics.median(p[1] for p in pts)
+                row["aim_error_px"] = round(math.hypot(mx - tx, my - ty))
+                row["aim_jitter_px"] = round(math.sqrt(sum((p[0] - mx) ** 2 + (p[1] - my) ** 2 for p in pts) / len(pts)), 1)
+            else:
+                row["aim_error_px"] = None
+        rows.append(row)
+    return rows
+
+
+def summarise(rows):
+    use = [r for r in rows if not r["botched"]]
+    out = {}
+    for sec in ("natural", "grammar"):
+        rs = [r for r in use if r["sec"] == sec and r["label"] in COMMANDS]
+        n = len(rs)
+        if n:
+            cnt = collections.Counter(r["outcome"] for r in rs)
+            lat = [r["latency"] for r in rs if r["latency"] is not None]
+            out[sec] = {"reps": n, "hit": cnt["hit"], "hit_extra": cnt["hit+extra"], "late": cnt["late"],
+                        "early": cnt["early"],
+                        "miss": cnt["miss"], "wrong": cnt["wrong"],
+                        "hit_rate": round((cnt["hit"] + cnt["hit+extra"]) / n, 3),
+                        "clean_hit_rate": round(cnt["hit"] / n, 3),
+                        "extra_events": sum(len(r["events"]) - (1 if r["latency"] is not None else 0) for r in rs),
+                        "latency_p50": round(statistics.median(lat), 3) if lat else None}
+    ev = [r for r in use if r["sec"] == "everyday"]
+    if ev:
+        mins = sum(r["seconds"] for r in ev) / 60
+        fe = [e for r in ev for e in r["events"]]
+        out["everyday"] = {"minutes": round(mins, 2), "false_events": len(fe),
+                           "per_minute": round(len(fe) / mins, 2) if mins else None,
+                           "by_event": dict(collections.Counter(e[0] for e in fe))}
+    aim = [r for r in use if r["label"].startswith("aim_") and r.get("aim_error_px") is not None]
+    if aim:
+        out["aim"] = {"n": len(aim), "error_px_median": statistics.median(r["aim_error_px"] for r in aim),
+                      "jitter_px_median": statistics.median(r["aim_jitter_px"] for r in aim)}
+    return out
+
+
+def by_label(rows, sec):
+    t = collections.OrderedDict()
+    for r in rows:
+        if r["sec"] != sec or r["botched"]:
+            continue
+        key = r["label"] if sec != "everyday" else r["activity"]
+        t.setdefault(key, []).append(r)
+    return t
+
+
+def quality(frames, segs):
+    out = {}
+    for sec in ("natural", "grammar", "everyday"):
+        ss = [s for s in segs if s["sec"] == sec and s.get("go_t")]
+        fr = [f for s in ss for f in frames if s["go_t"] <= f["t"] <= s["end_t"]]
+        if fr:
+            ms = sorted(f["ms"] for f in fr)
+            out[sec] = {"frames": len(fr), "hand_rate": round(sum(1 for f in fr if f["hands"]) / len(fr), 3),
+                        "two_hand_rate": round(sum(1 for f in fr if len(f["hands"]) > 1) / len(fr), 3),
+                        "ms_p50": ms[len(ms) // 2], "ms_p95": ms[int(len(ms) * 0.95)],
+                        "luma": round(statistics.mean(f["luma"] for f in fr), 1)}
+    return out
+
+
+def fmt_md(rec, engine, meta, q, forced_rows, natural_rows, s_forced, s_nat, natural_events):
+    L = [f"# hand-gesture replay: {os.path.basename(os.path.normpath(rec))}", "",
+         f"Engine `{engine}` (sha256 {str(sha256(engine))[:12]}); recording {meta.get('frames')} frames, "
+         f"{meta.get('seconds')} s at {meta.get('fps')} fps, complete={meta.get('complete')}. "
+         "Forced pass: each prompt starts in the state it assumes. Natural pass: the engine runs uninterrupted.", ""]
+    L += ["## Headline (forced pass)", "", "| Measure | Value |", "|---|---|"]
+    g, n, e, a = s_forced.get("grammar"), s_forced.get("natural"), s_forced.get("everyday"), s_forced.get("aim")
+    if g:
+        L.append(f"| Current gestures: fired as intended | {g['hit_rate']:.0%} of {g['reps']} ({g['clean_hit_rate']:.0%} with no extra event) |")
+        L.append(f"| Current gestures: missed / wrong / late / early | {g['miss']} / {g['wrong']} / {g['late']} / {g['early']} |")
+        L.append(f"| Current gestures: extra events | {g['extra_events']} |")
+        L.append(f"| Current gestures: median GO-to-fire | {g['latency_p50']} s |")
+    if n:
+        L.append(f"| Natural motions recognised as intended | {n['hit_rate']:.0%} of {n['reps']} |")
+    if e:
+        L.append(f"| Everyday motions, armed: false events | {e['false_events']} in {e['minutes']} min ({e['per_minute']}/min) {e['by_event']} |")
+    ne = s_nat.get("everyday")
+    if ne:
+        L.append(f"| Everyday motions, natural pass: events | {ne['false_events']} in {ne['minutes']} min {ne['by_event']} |")
+    if a:
+        L.append(f"| Aim: median error / jitter | {a['error_px_median']} px / {a['jitter_px_median']} px |")
+    L += ["", "## Data quality (GO windows)", "", "| Section | Frames | Hand seen | Two hands | Recogniser ms p50/p95 | Luma |",
+          "|---|---|---|---|---|---|"]
+    for sec, d in q.items():
+        L.append(f"| {sec} | {d['frames']} | {d['hand_rate']:.0%} | {d['two_hand_rate']:.0%} | {d['ms_p50']}/{d['ms_p95']} | {d['luma']} |")
+    for sec, title in (("grammar", "Current gestures"), ("natural", "Natural motions (current engine)"),
+                       ("everyday", "Everyday motions (armed)")):
+        t = by_label(forced_rows, sec)
+        if not t:
+            continue
+        L += ["", f"## {title}", "", "| Prompt | Reps | Outcomes | Latency p50 | Events (s from GO) |", "|---|---|---|---|---|"]
+        for lab, rs in t.items():
+            oc = collections.Counter(r["outcome"] for r in rs)
+            lat = [r["latency"] for r in rs if r["latency"] is not None]
+            evs = "; ".join(" ".join(f"{ev}@{dt:+.2f}" for ev, dt in r["events"]) or "–" for r in rs)
+            aim = ""
+            if lab.startswith("aim_"):
+                aim = " ".join(f"err {r.get('aim_error_px')} px, jitter {r.get('aim_jitter_px')} px" for r in rs)
+            L.append(f"| {lab} | {len(rs)} | {', '.join(f'{k} {v}' for k, v in oc.items())} {aim} | "
+                     f"{statistics.median(lat) if lat else '–'} | {evs} |")
+    L += ["", "## Natural pass timeline (commands only)", ""]
+    L.append(", ".join(f"{e['ev']}@{e['t']:.1f}" for e in natural_events if e["ev"] in COMMANDS) or "none")
+    return "\n".join(L) + "\n"
+
+
+def cmd_replay(a):
+    rec = a.rec
+    frames = read_frames(os.path.join(rec, "frames.jsonl.gz"))
+    try:
+        segs = json.load(open(os.path.join(rec, "labels.json")))["segments"]
+    except (OSError, ValueError, KeyError):
+        print("hand-gesture-lab: no labels.json", file=sys.stderr)
+        return 2
+    try:
+        meta = json.load(open(os.path.join(rec, "meta.json")))
+    except (OSError, ValueError):
+        meta = {}
+    segs = [s for s in segs if s.get("go_t") is not None and s.get("end_t") is not None]
+    if not frames or not segs:
+        print("hand-gesture-lab: recording has no frames or no finished prompts", file=sys.stderr)
+        return 2
+    engine = os.path.abspath(a.engine)
+    hg = load_engine(engine)
+    cfg = hg.load_config(a.config) if a.config else dict(hg.DEFAULTS)
+    wf, tf = run_pass(hg, frames, segs, cfg, forced=True)
+    wn, tn = run_pass(hg, frames, segs, cfg, forced=False)
+    rf = score(segs, wf.events, wf.logs, tf, wf.mons)
+    rn = score(segs, wn.events, wn.logs, tn, wn.mons)
+    sf, sn = summarise(rf), summarise(rn)
+    q = quality(frames, segs)
+    prefix = a.out or os.path.join(rec, "replay-" + os.path.basename(engine))
+    os.makedirs(os.path.dirname(os.path.abspath(prefix)), exist_ok=True)
+    write_json(prefix + ".json", {"engine": engine, "engine_sha256": sha256(engine), "config": cfg,
+                                  "quality": q, "forced": {"summary": sf, "segments": rf, "events": wf.events},
+                                  "natural": {"summary": sn, "segments": rn, "events": wn.events}})
+    md = fmt_md(rec, engine, meta, q, rf, rn, sf, sn, wn.events)
+    with open(prefix + ".md", "w") as f:
+        f.write(md)
+    print(json.dumps({"forced": sf, "natural": sn}, indent=1))
+    print(f"wrote {prefix}.md and {prefix}.json")
+    return 0
+
+
+def cmd_protocol(a):
+    steps = build_steps([s for s in a.sections.split(",") if s], a.quick)
+    total = 0.0
+    for st in steps:
+        if st["kind"] == "intro":
+            print(f"\n== {st['title']} ==\n{st['text']}")
+        elif st["rep"] == 1:
+            print(f"  {st['label']:<15} x{st['reps']}  GO {st['go']:.1f} s  {st['title']}")
+        if st["kind"] == "seg":
+            total += READY_S + st["go"] + REST_S
+    print(f"\n{sum(1 for s in steps if s['kind'] == 'seg')} prompts, about {total / 60:.1f} min plus section intros")
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ap = argparse.ArgumentParser(prog="hand-gesture-lab", description="record and replay labelled hand-gesture sessions")
+    sub = ap.add_subparsers(dest="cmd")
+    r = sub.add_parser("record")
+    r.add_argument("--sections", default="natural,grammar,everyday")
+    r.add_argument("--quick", action="store_true", help="one rep per prompt, short everyday prompts")
+    r.add_argument("--out")
+    r.add_argument("--no-window", action="store_true", help="prompt in this terminal instead of a large kitty window")
+    r.add_argument("--then", help="command run after a complete recording, with the recording dir appended")
+    r.add_argument("--limit-s", type=float, default=0.0, help=argparse.SUPPRESS)      # smoke tests
+    p = sub.add_parser("replay")
+    p.add_argument("rec")
+    p.add_argument("--engine", default=ENGINE)
+    p.add_argument("--config")
+    p.add_argument("--out")
+    pr = sub.add_parser("protocol")
+    pr.add_argument("--sections", default="natural,grammar,everyday")
+    pr.add_argument("--quick", action="store_true")
+    a = ap.parse_args(argv)
+    if a.cmd == "record":
+        return cmd_record(a, argv)
+    if a.cmd == "replay":
+        return cmd_replay(a)
+    if a.cmd == "protocol":
+        return cmd_protocol(a)
+    ap.print_help()
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main())

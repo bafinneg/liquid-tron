@@ -1,0 +1,245 @@
+#!/usr/bin/python3 -I
+"""cpu-procs — what is using the CPU, for the Liquid Tron CPU detail dropdown.
+
+  cpu-procs stream [--interval S] [--limit N]   JSON line per sample until killed (runs only while the dropdown is open)
+  cpu-procs snapshot [--limit N]                one JSON sample over 0.5 s
+  cpu-procs end <pid> <starttime> [--force]     SIGTERM (or SIGKILL) one of your own processes
+  cpu-procs alive <pid> <starttime>             exit 0 if that exact process still runs (not a zombie), else 1
+
+Percentages are shares of the whole machine, the same scale as the bar's CPU gauge, so the rows add up to the
+gauge. `cores` is the same load in whole logical CPUs (1.0 = one thread pinned). `end` refuses another user's
+process, a protected session process, or a pid whose start time no longer matches (the pid was reused).
+Exit codes for `end`: 0 signalled, 3 refused, 4 already gone, 2 usage.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import sys
+import time
+
+PROC = os.environ.get("CPU_PROCS_PROC_ROOT", "/proc")
+PAGE_MB = os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+NCPU = os.cpu_count() or 1
+MY_UID = os.getuid()
+
+# Ending any of these takes the desktop session with it. Matched against comm (15 chars) and the exe basename.
+PROTECTED = {
+    "systemd", "Hyprland", "hyprland", "Xwayland", "noctalia", "hyprlock", "hypridle",
+    "dbus-broker", "dbus-broker-lau", "dbus-broker-launch", "dbus-daemon",
+    "pipewire", "pipewire-pulse", "wireplumber", "gnome-keyring-d", "gnome-keyring-daemon",
+    "polkitd", "xdg-desktop-por", "xdg-desktop-portal", "xdg-desktop-portal-hyprland",
+    "ssh-agent", "gpg-agent", "uwsm", "greetd", "sddm", "login",
+}
+
+
+def read(path: str) -> str:
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "replace")
+
+
+def machine_ticks() -> tuple[int, int]:
+    """(total, busy) jiffies summed over all CPUs."""
+    fields = [int(x) for x in read(f"{PROC}/stat").splitlines()[0].split()[1:]]
+    total = sum(fields[:8])  # user nice system idle iowait irq softirq steal (guest is already in user)
+    idle = fields[3] + fields[4]
+    return total, total - idle
+
+
+def proc_stat(pid: str) -> tuple[str, int, int, int, int] | None:
+    """(comm, ppid, cpu ticks, start time, rss pages) or None if the process vanished."""
+    try:
+        raw = read(f"{PROC}/{pid}/stat")
+    except OSError:
+        return None
+    lp, rp = raw.find("("), raw.rfind(")")
+    comm = raw[lp + 1:rp]
+    rest = raw[rp + 2:].split()
+    return comm, int(rest[1]), int(rest[11]) + int(rest[12]), int(rest[19]), int(rest[21])
+
+
+def exe_name(pid: str) -> str:
+    try:
+        return os.path.basename(os.readlink(f"{PROC}/{pid}/exe")).removesuffix(" (deleted)")
+    except OSError:
+        return ""
+
+
+def cmdline(pid: str) -> list[str]:
+    try:
+        return [a for a in read(f"{PROC}/{pid}/cmdline").split("\0") if a]
+    except OSError:
+        return []
+
+
+def owner(pid: str) -> int:
+    try:
+        return os.stat(f"{PROC}/{pid}").st_uid
+    except OSError:
+        return -1
+
+
+def display_name(comm: str, argv: list[str]) -> str:
+    """A readable name: the exe, or the script for interpreters (python3 foo.py -> foo.py)."""
+    if not argv:
+        return comm
+    base = os.path.basename(argv[0])
+    if base.startswith(("python", "node", "bash", "sh", "zsh", "perl", "ruby")) and len(argv) > 1:
+        for a in argv[1:]:
+            if not a.startswith("-"):
+                return os.path.basename(a)
+    return base if base and len(base) <= 32 else comm
+
+
+def is_protected(pid: str, comm: str) -> bool:
+    if pid in ("1", str(os.getpid()), str(os.getppid())):
+        return True
+    return comm in PROTECTED or exe_name(pid) in PROTECTED
+
+
+def scan() -> dict[str, tuple]:
+    out = {}
+    for pid in os.listdir(PROC):
+        if pid.isdigit():
+            st = proc_stat(pid)
+            if st is not None:
+                out[pid] = st
+    return out
+
+
+def sample(prev: tuple, cur: tuple, limit: int) -> dict:
+    (t0, b0, p0), (t1, b1, p1) = prev, cur
+    dtotal = max(1, t1 - t0)
+    rows = []
+    for pid, (comm, ppid, ticks, start, rss) in p1.items():
+        before = p0.get(pid)
+        if before is None or before[3] != start:
+            continue  # new this interval (or pid reused): no honest rate yet
+        d = ticks - before[2]
+        if d <= 0 or pid == str(os.getpid()):
+            continue
+        rows.append((d, pid, comm, ppid, start, rss))
+    rows.sort(reverse=True)
+
+    groups: dict[str, list] = {}
+    procs = []
+    for i, (d, pid, comm, ppid, start, rss) in enumerate(rows):
+        argv = cmdline(pid)
+        name = display_name(comm, argv)
+        pct = 100.0 * d / dtotal
+        g = groups.setdefault(name, [0, 0.0])
+        g[0] += 1
+        g[1] += pct
+        if i < limit:
+            uid = owner(pid)
+            procs.append({
+                "pid": int(pid), "start": start, "name": name, "comm": comm,
+                "cmd": " ".join(" ".join(argv).split())[:240] if argv else f"[{comm}]",  # one line: argv can hold newlines
+                "cpu": round(pct, 1), "cores": round(pct * NCPU / 100.0, 2),
+                "mem_mb": round(rss * PAGE_MB), "mine": uid == MY_UID,
+                "protected": uid != MY_UID or is_protected(pid, comm),
+            })
+    cause = None
+    if groups:
+        name, (count, pct) = max(groups.items(), key=lambda kv: kv[1][1])
+        cause = {"name": name, "count": count, "cpu": round(pct, 1)}
+    return {
+        "t": time.time(), "total": round(100.0 * (b1 - b0) / dtotal, 1), "ncpu": NCPU,
+        "procs": procs, "cause": cause,
+    }
+
+
+def take() -> tuple:
+    t, b = machine_ticks()
+    return t, b, scan()
+
+
+def cmd_stream(interval: float, limit: int, once: bool = False) -> int:
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+    prev = take()
+    time.sleep(0.4 if not once else 0.5)  # quick first sample so the dropdown fills almost at once
+    while True:
+        cur = take()
+        try:
+            sys.stdout.write(json.dumps(sample(prev, cur, limit), separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:
+            return 0
+        if once:
+            return 0
+        prev = cur
+        time.sleep(interval)
+
+
+def cmd_end(pid: int, start: int, force: bool) -> int:
+    p = str(pid)
+    st = proc_stat(p)
+    if st is None:
+        print("already gone", file=sys.stderr)
+        return 4
+    comm, _ppid, _ticks, cur_start, _rss = st
+    if cur_start != start:
+        print("that process has already exited (its pid now belongs to another process)", file=sys.stderr)
+        return 4
+    if owner(p) != MY_UID:
+        print(f"{comm} belongs to another user", file=sys.stderr)
+        return 3
+    if is_protected(p, comm):
+        print(f"{comm} is part of the desktop session and is protected", file=sys.stderr)
+        return 3
+    try:
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        return 4
+    except PermissionError as e:
+        print(str(e), file=sys.stderr)
+        return 3
+    return 0
+
+
+def cmd_alive(pid: int, start: int) -> int:
+    st = proc_stat(str(pid))
+    if st is None or st[3] != start:
+        return 1
+    try:
+        state = read(f"{PROC}/{pid}/stat").rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return 1
+    return 1 if state in ("Z", "X") else 0
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="cpu-procs")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("stream")
+    s.add_argument("--interval", type=float, default=1.5)
+    s.add_argument("--limit", type=int, default=8)
+    n = sub.add_parser("snapshot")
+    n.add_argument("--limit", type=int, default=8)
+    e = sub.add_parser("end")
+    e.add_argument("pid", type=int)
+    e.add_argument("start", type=int)
+    e.add_argument("--force", action="store_true")
+    v = sub.add_parser("alive")
+    v.add_argument("pid", type=int)
+    v.add_argument("start", type=int)
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit as exc:
+        return 2 if exc.code else 0
+    if a.cmd == "stream":
+        return cmd_stream(max(0.5, a.interval), max(1, a.limit))
+    if a.cmd == "snapshot":
+        return cmd_stream(0, max(1, a.limit), once=True)
+    if a.cmd == "alive":
+        return cmd_alive(a.pid, a.start)
+    return cmd_end(a.pid, a.start, a.force)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

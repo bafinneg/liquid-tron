@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# hypr-summon-on-monitor — target hypr-summon at a specific Hyprland monitor.
+
+set -euo pipefail
+
+err() { printf 'hypr-summon-on-monitor: %s\n' "$*" >&2; }
+
+monitor="${1:-}"
+target="${2:-}"
+
+case "$monitor" in
+    "") err "expected monitor name"; exit 2 ;;
+    *[!A-Za-z0-9_.-]*) err "invalid monitor name '$monitor'"; exit 2 ;;
+esac
+
+case "$target" in
+    [1-7]) ;;
+    *) err "expected workspace number 1-7, got '${target}'"; exit 2 ;;
+esac
+
+hyprctl dispatch focusmonitor "$monitor" >/dev/null
+"{{ .chezmoi.homeDir }}/.local/bin/hypr-summon" "$target"

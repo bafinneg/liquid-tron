@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# ares-lock: lock the session with the Ares sentinel (Quickshell `ares-lock` config), failing closed to hyprlock.
+# FEAT-ares-sentinel-lock.
+#
+# Fail-closed rule: unless the Quickshell locker leaves a fresh "unlocked" marker (written only after
+# PamResult.Success), this script starts hyprlock. misc:allow_session_lock_restore = true lets hyprlock take over
+# a lock that a crashed client left behind. A crash therefore never unlocks the session.
+#
+# Usage: ares-lock            lock now (no-op if a locker is already running)
+#        ares-lock --hyprlock lock with plain hyprlock (emergency / comparison)
+set -uo pipefail
+
+# Detach from the caller's process group, so that killing the caller (a terminal, a timed-out tool, a key-bind
+# helper) can never take the locker down without its hyprlock fallback (2026-10-23 incident).
+if [[ -z ${ARES_LOCK_DETACHED:-} ]]; then
+  case ${1:-} in ''|--hyprlock) ;; *) echo "usage: ares-lock [--hyprlock]" >&2; exit 2 ;; esac
+  ARES_LOCK_DETACHED=1 exec setsid -f "$0" "$@"
+fi
+
+export HOME={{ .chezmoi.homeDir }}
+export XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+export QT_QPA_PLATFORM=wayland
+
+state_dir=$XDG_RUNTIME_DIR/ares-lock
+marker=$state_dir/unlocked
+log=$state_dir/lock.log
+mkdir -p "$state_dir"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$log"; }
+
+if pidof hyprlock >/dev/null || pgrep -u "$(id -u)" -f 'qs -n -c ares-lock' >/dev/null; then
+  exit 0
+fi
+
+case ${1:-} in
+  '') ;;
+  --hyprlock) exec hyprlock ;;
+  *) echo "usage: ares-lock [--hyprlock]   (any other argument is rejected; it never locks)" >&2; exit 2 ;;
+esac
+
+# Single-flight guard for near-simultaneous triggers (hypridle + key bind).
+exec 9>"$state_dir/launch.lock"
+flock -n 9 || exit 0
+
+rm -f "$marker"
+start=$(date +%s)
+
+# Voice lines are generated in parallel; the locker starts at once with built-in lines.
+if [[ -x $HOME/.local/bin/ares-voice ]]; then
+  timeout 25 "$HOME/.local/bin/ares-voice" >>"$log" 2>&1 &
+fi
+
+log "ares: start"
+qs -n -c ares-lock >>"$state_dir/qs.log" 2>&1
+rc=$?
+
+# Case RGB: if the lock client ended while still red (crash, or unlock during the hold), restore the colours.
+rgb_restore() {
+  if [[ -e $state_dir/rgb-saved.json && -x $HOME/.local/bin/ares-rgb-alert ]]; then
+    "$HOME/.local/bin/ares-rgb-alert" clear >/dev/null 2>&1 &
+  fi
+}
+
+if (( rc == 42 )) || { [[ -s $marker ]] && (( $(stat -c %Y "$marker") >= start )); }; then
+  log "ares: unlocked by PAM (rc=$rc)"
+  rgb_restore
+  exit 0
+fi
+
+log "ares: exited without verified unlock (rc=$rc); failing closed to hyprlock"
+hyprlock
+hrc=$?
+log "hyprlock fallback: exited rc=$hrc"
+# hyprlock exits 0 only after a successful unlock: release the office lights (ares-hue-alert).
+if (( hrc == 0 )) && [[ -x $HOME/.local/bin/ares-hue-alert ]]; then
+  "$HOME/.local/bin/ares-hue-alert" clear >/dev/null 2>&1 &
+fi
+if (( hrc == 0 )) && [[ -x $HOME/.local/bin/ares-switch-alert ]]; then
+  "$HOME/.local/bin/ares-switch-alert" clear >/dev/null 2>&1 &
+fi
+(( hrc == 0 )) && rgb_restore

@@ -1,0 +1,18 @@
+# Generic defaults. A host overrides these in its own chezmoi.toml [data] (kept outside this repo).
+login = "user"
+board_url = ""
+backup_host = "backup-host"
+board_name = "Workboard"
+nas_name = "NAS"
+camera_by_id = "/dev/v4l/by-id/usb-Camera-video-index0"
+
+[git]
+name = "Your Name"
+email = "you@example.com"
+
+[monitors.left]
+serial = "LEFT-SERIAL"
+[monitors.center]
+serial = "CENTER-SERIAL"
+[monitors.right]
+serial = "RIGHT-SERIAL"

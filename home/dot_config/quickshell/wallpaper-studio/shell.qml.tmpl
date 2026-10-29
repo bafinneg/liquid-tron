@@ -1,0 +1,60 @@
+import Quickshell
+import Quickshell.Hyprland
+import Quickshell.Io
+import QtQuick
+
+// Wallpaper Studio — on-demand Liquid Tron companion: per-monitor scenes with an explicit apply, full screen on the
+// focused monitor. The compact one-click picker under the bar is a native Noctalia plugin panel now
+// (liquidtron/wallpaper:picker), so it shares Noctalia's open animation and outside-click dismissal; COMPACT here
+// closes the studio and opens that panel. State and renderers belong to wallpaper-control.
+// ~/.local/bin/wallpaper-studio --full launches the first instance and toggles later ones over IPC.
+ShellRoot {
+    id: shell
+
+    readonly property var pickerCommand: ["{{ .chezmoi.homeDir }}/.local/bin/noctalia-primary-msg", "panel-open",
+                                          "liquidtron/wallpaper:picker"]
+
+    function screenFor(name) {
+        for (var i = 0; i < Quickshell.screens.length; i++) {
+            var s = Quickshell.screens[i]
+            if (s && s.name === name) return s
+        }
+        return Quickshell.screens.length > 0 ? Quickshell.screens[0] : null
+    }
+
+    property var studioScreen: null
+
+    function openFull() {
+        var mon = Hyprland.focusedMonitor
+        shell.studioScreen = shell.screenFor(mon ? mon.name : "")
+        studio.open()
+    }
+    function openCompact() {
+        studio.close()
+        if (studio.active) return  // studio is mid-apply; keep it
+        Quickshell.execDetached(shell.pickerCommand)
+    }
+    function toggleFull() {
+        if (studio.active) studio.close()
+        else shell.openFull()
+    }
+
+    Studio {
+        id: studio
+        screen: shell.studioScreen
+        onOpenRequested: shell.openFull()
+        onCompactRequested: shell.openCompact()
+    }
+
+    IpcHandler {
+        target: "wallpaperStudio"
+        function status(): string { return studio.active ? "full" : "idle" }
+        function toggle() { shell.toggleFull() }
+        function toggleFull() { shell.toggleFull() }
+        function compact() { shell.openCompact() }
+        function full() { shell.openFull() }
+        function close() { studio.close() }
+    }
+
+    Component.onCompleted: shell.openFull()
+}

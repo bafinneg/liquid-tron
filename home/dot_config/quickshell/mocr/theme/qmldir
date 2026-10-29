@@ -1,0 +1,7 @@
+module theme
+singleton Ambient 1.0 Ambient.qml
+singleton Colors 1.0 Colors.qml
+singleton Geometry 1.0 Geometry.qml
+singleton Motion 1.0 Motion.qml
+singleton SweepClock 1.0 SweepClock.qml
+singleton WorkspaceGlyphs 1.0 WorkspaceGlyphs.qml

@@ -1,0 +1,13 @@
+Type=X-GNOME-Metatheme
+[Desktop Entry]
+Name=Tokyonight-Tron
+Comment=Tokyonight-Teal-Dark fork mapped onto Tron Compute surface palette (compact)
+Encoding=UTF-8
+Version=1.1-tron-fork
+
+[X-GNOME-Metatheme]
+GtkTheme=Tokyonight-Tron
+MetacityTheme=Tokyonight-Tron
+IconTheme=Tela-circle-Dark
+CursorTheme=Tokyonight-Tron-cursors
+ButtonLayout=close,minimize,maximize:menu

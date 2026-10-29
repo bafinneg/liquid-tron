@@ -1,0 +1,65 @@
+# hyprlock — OLED-safe rescue-stable lock screen
+#
+# 2026-06-07 recovery note: hyprlock v0.9.5 repeatedly core-dumped while
+# testing the eight-label animated Herm Ares placement-rotation path. The live
+# config now restores only the original single cmd[update] Ares label while
+# preserving the visible recovery password field. Do not reintroduce multiple
+# concurrent animated labels without controlled crash-recovery testing.
+#
+# The corresponding Hyprland config enables misc:allow_session_lock_restore so
+# a replacement lock client can attach after a future lockscreen crash rather
+# than leaving the compositor stuck behind a dead session-lock surface.
+
+general {
+    hide_cursor = false
+}
+
+background {
+    monitor =
+    color = rgb(000000)
+}
+
+# Password input — hidden while empty, revealed when the keyboard is used, and
+# faded out again after 30 seconds if no password is submitted.
+# State outlines (LT26R-6): amber while PAM checks, red on failure, blue while
+# Caps Lock is on; hard edges stay (rounding 0, design system section 9).
+input-field {
+    monitor =
+    size = 520, 72
+    outline_thickness = 2
+    dots_size = 0.25
+    dots_spacing = 0.35
+    outer_color = rgba(10, 189, 198, 1)
+    check_color = rgba(255, 140, 0, 1)
+    fail_color = rgba(255, 0, 60, 1)
+    capslock_color = rgba(0, 114, 255, 1)
+    bothlock_color = rgba(0, 114, 255, 1)
+    inner_color = rgba(10, 10, 20, 1)
+    font_color = rgb(230, 230, 240)
+    font_family = IosevkaTerm Nerd Font Mono
+    fade_on_empty = true
+    fade_timeout = 30000
+    placeholder_text =
+    hide_input = false
+    rounding = 0
+    position = 0, 0
+    halign = center
+    valign = center
+}
+
+# Herm Ares eikon — single animated 48×24 braille avatar from Herm's bundled
+# ares.eikon. This restores the original one-label cmd[update] path without the
+# later eight-label placement-rotation experiment that triggered hyprlock v0.9.5
+# crashes on 2026-06-07.
+# Frames are plain text (tools/eikon/ares_frames.py), so this label's color is the
+# figure's only color. The display is chosen by EDID description, never by connector.
+label {
+    monitor = desc:ASUSTek COMPUTER INC PG42UQ {{ .monitors.center.serial }}
+    text = cmd[update:63] {{ .chezmoi.homeDir }}/.config/hypr/scripts/ares-eikon-frame
+    color = rgba(10, 189, 198, 1)
+    font_size = 10
+    font_family = IosevkaTerm Nerd Font Mono
+    position = 8, -38
+    halign = left
+    valign = top
+}

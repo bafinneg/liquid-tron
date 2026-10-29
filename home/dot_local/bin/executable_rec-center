@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Toggle a recording of the center monitor (PG42UQ) with GPU Screen Recorder.
+# First run starts, second run stops and saves. Output: ~/Videos/recordings/center-<timestamp>.mp4
+# Audio: desktop output only (no microphone).
+set -euo pipefail
+
+dir="$HOME/Videos/recordings"
+state="${XDG_RUNTIME_DIR:-/tmp}/rec-center.pid"
+mkdir -p "$dir"
+
+# Stop path: a recording from this script is running.
+if [[ -f $state ]]; then
+    pid=$(<"$state")
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -INT "$pid"
+        for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        rm -f "$state"
+        last=$(ls -t "$dir"/center-*.mp4 2>/dev/null | head -1)
+        notify-send -u normal -i media-playback-stop "Recording saved" "${last:-$dir}"
+        exit 0
+    fi
+    rm -f "$state"
+fi
+
+# Resolve the center monitor by EDID (description), not connector name.
+mon=$(hyprctl monitors -j | jq -r '.[] | select(.description | test("PG42UQ")) | .name' | head -1)
+if [[ -z $mon ]]; then
+    notify-send -u critical -i dialog-error "Recording" "Center monitor (PG42UQ) not found"
+    exit 1
+fi
+
+out="$dir/center-$(date +%Y%m%d-%H%M%S).mp4"
+gpu-screen-recorder -w "$mon" -f 60 -q very_high -cursor yes -a default_output -o "$out" \
+    >/dev/null 2>"${XDG_RUNTIME_DIR:-/tmp}/rec-center.log" &
+echo $! >"$state"
+sleep 0.5
+if ! kill -0 "$(<"$state")" 2>/dev/null; then
+    rm -f "$state"
+    notify-send -u critical -i dialog-error "Recording failed" "See ${XDG_RUNTIME_DIR:-/tmp}/rec-center.log"
+    exit 1
+fi
+notify-send -u low -i media-record "Recording center monitor" "Press Super+Alt+C again to stop"

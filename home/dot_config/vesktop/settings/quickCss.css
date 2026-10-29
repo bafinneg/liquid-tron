@@ -1,0 +1,314 @@
+/**
+ * TRON COMPUTE — Cyberpunk Terminal Discord
+ * Matched to Tron Compute unified palette
+ * bg: #0a0a14 | fg: #c0c0d0 | accent: #0abdc6
+ * blue: #0072ff | red: #ff003c | green: #00ff9f
+ */
+
+/* ── Kill title bar ─────────────────────────────────────── */
+.titleBar_a934d8,
+[class*="titleBar_"] {
+    display: none !important;
+}
+
+/* ── CSS Variables ──────────────────────────────────────── */
+.theme-dark {
+    /* Backgrounds — deep void from Tron Compute */
+    --background-primary:         #0a0a14;
+    --background-secondary:       #0d0d1a;
+    --background-secondary-alt:   #0e0e1c;
+    --background-tertiary:        #06060c;
+    --background-accent:          #0072ff;
+    --background-floating:        #0d0d1a;
+    --background-modifier-hover:  rgba(10, 189, 198, 0.06);
+    --background-modifier-active: rgba(10, 189, 198, 0.12);
+    --background-modifier-selected: rgba(0, 114, 255, 0.20);
+    --background-modifier-accent: rgba(10, 189, 198, 0.04);
+
+    --channeltextarea-background: #0e0e1c;
+
+    /* Text — light grey from Tron Compute fg */
+    --text-normal:    #c0c0d0;
+    --text-muted:     #707080;
+    --text-link:      #0abdc6;
+
+    --header-primary:   #c0c0d0;
+    --header-secondary: #707080;
+
+    --interactive-normal:  #c0c0d0;
+    --interactive-hover:   #0abdc6;
+    --interactive-active:  #00ff9f;
+    --interactive-muted:   #707080;
+
+    /* Brand — keep blue accent for buttons */
+    --brand-experiment:     #0072ff;
+    --brand-experiment-560: #0072ff;
+    --brand-experiment-600: #005ed4;
+
+    --scrollbar-thin-thumb:       #1a1a2a;
+    --scrollbar-thin-track:       transparent;
+    --scrollbar-auto-thumb:       #1a1a2a;
+    --scrollbar-auto-track:       #0a0a14;
+
+    --input-background:       #0e0e1c;
+    --input-placeholder-text: #707080;
+
+    --status-danger:          #ff003c;
+    --info-danger-foreground:  #ff003c;
+    --status-positive:         #00ff9f;
+
+    /* Monospace everything */
+    --font-primary: "IosevkaTerm Nerd Font Mono", "Courier New", monospace;
+    --font-display: "IosevkaTerm Nerd Font Mono", monospace;
+    --font-code:    "IosevkaTerm Nerd Font Mono", monospace;
+    --font-headline: "IosevkaTerm Nerd Font Mono", monospace;
+}
+
+/* ── Force monospace on everything ───────────────────────── */
+* {
+    font-family: "IosevkaTerm Nerd Font Mono", monospace !important;
+}
+
+/* ── App shell — override oklab backgrounds ─────────────── */
+[class*="appMount_"],
+[class*="app_"],
+[class*="bg_"],
+[class*="baseLayer_"],
+[class*="layers_"],
+[class*="layer_"],
+html,
+body {
+    background-color: #0a0a14 !important;
+}
+
+[class*="container_"][class*="themed_"],
+[class*="content_"],
+[class*="chatContent_"],
+[class*="mainContent_"],
+[class*="scroller_"],
+[class*="messagesWrapper_"],
+[class*="scrollerContent_"] {
+    background-color: #0a0a14 !important;
+}
+
+/* ── Server nav bar ─────────────────────────────────────── */
+[class*="wrapper_"][class*="guilds_"],
+nav[class*="wrapper_"] {
+    background-color: #06060c !important;
+}
+
+/* ── Panel bottom (user area) ───────────────────────────── */
+[class*="panels_"],
+[class*="panel_"] {
+    background-color: #06060c !important;
+}
+
+/* ── Server list — darkest ──────────────────────────────── */
+nav[class*="guilds_"] {
+    background-color: #06060c !important;
+    border-right: 1px solid #1a1a2a !important;
+}
+
+/* ── Channel sidebar ────────────────────────────────────── */
+[class*="sidebar_"] {
+    background-color: #0d0d1a !important;
+    border-right: 1px solid #1a1a2a !important;
+}
+
+/* ── Chat area ──────────────────────────────────────────── */
+[class*="chat_"] {
+    background-color: #0a0a14 !important;
+}
+
+/* ── Members list ───────────────────────────────────────── */
+[class*="membersWrap_"] {
+    background-color: #0d0d1a !important;
+    border-left: 1px solid #1a1a2a !important;
+}
+
+/* ── Channel names — cyan like terminal prompt ──────────── */
+[class*="name_"][class*="channelName_"],
+[class*="channelName_"] {
+    color: #0abdc6 !important;
+    text-transform: lowercase !important;
+}
+
+/* ── Category headers — dim with terminal prefix ────────── */
+[class*="containerDefault_"] [class*="name_"],
+[class*="wrapper_"][class*="clickable_"] [class*="name_"] {
+    text-transform: uppercase !important;
+    letter-spacing: 1.5px !important;
+    font-size: 10px !important;
+    color: #707080 !important;
+}
+
+/* ── Usernames — green ─────────────────────────────────── */
+[class*="username_"],
+[class*="headerText_"] [class*="nickname_"] {
+    color: #00ff9f !important;
+}
+
+/* ── Timestamps — dim ──────────────────────────────────── */
+[class*="timestamp_"] {
+    color: #505060 !important;
+    font-size: 10px !important;
+}
+
+/* ── Message text — fg ─────────────────────────────────── */
+[class*="messageContent_"] {
+    color: #c0c0d0 !important;
+}
+
+/* ── Message hover — subtle scan line effect ────────────── */
+[class*="message_"]:hover {
+    background-color: rgba(10, 189, 198, 0.04) !important;
+    border-left: 2px solid #0072ff !important;
+}
+
+/* ── Active channel — blue highlight ────────────────────── */
+[class*="link_"][class*="selected_"],
+[class*="channel_"][class*="selected_"] {
+    background-color: rgba(0, 114, 255, 0.20) !important;
+    border-left: 2px solid #0072ff !important;
+}
+
+/* ── Message input — terminal prompt style ──────────────── */
+[class*="channelTextArea_"] [class*="scrollableContainer_"] {
+    background-color: #0e0e1c !important;
+    border: 1px solid #1a1a2a !important;
+    border-radius: 2px !important;
+}
+
+[class*="channelTextArea_"] [class*="scrollableContainer_"]:focus-within {
+    border-color: #0072ff !important;
+    box-shadow: 0 0 6px rgba(0, 114, 255, 0.3) !important;
+}
+
+/* ── Placeholder text — prompt hint ─────────────────────── */
+[class*="placeholder_"] {
+    color: #707080 !important;
+    font-style: italic !important;
+}
+
+/* ── Code blocks — deeper bg ────────────────────────────── */
+code, [class*="codeBlock_"], [class*="markup_"] code {
+    background-color: #06060c !important;
+    border: 1px solid #1a1a2a !important;
+    border-radius: 2px !important;
+    color: #00ff9f !important;
+}
+
+/* ── Embeds — dark with cyan border ─────────────────────── */
+[class*="embedWrapper_"],
+article[class*="embed_"] {
+    background-color: #0d0d1a !important;
+    border-left: 3px solid #0abdc6 !important;
+    border-radius: 2px !important;
+}
+
+/* ── Mention pill — magenta (urgent role) ──────────────── */
+[class*="mention"] {
+    background-color: rgba(255, 0, 60, 0.15) !important;
+    color: #ff003c !important;
+}
+
+[class*="mention"]:hover {
+    background-color: rgba(255, 0, 60, 0.25) !important;
+}
+
+/* ── Unread indicators — red ───────────────────────────── */
+[class*="unreadPill_"] span,
+[class*="bar_"][class*="unread_"] {
+    background-color: #ff003c !important;
+}
+
+/* ── Buttons — blue accent ──────────────────────────────── */
+[class*="lookFilled_"][class*="colorBrand_"],
+[class*="button_"][class*="lookFilled_"][class*="colorBrand_"] {
+    background-color: #0072ff !important;
+    border-radius: 2px !important;
+}
+
+[class*="lookFilled_"][class*="colorBrand_"]:hover {
+    background-color: #0065e0 !important;
+    box-shadow: 0 0 8px rgba(0, 114, 255, 0.4) !important;
+}
+
+/* ── Autocomplete / popout / modal ──────────────────────── */
+[class*="autocomplete_"],
+[class*="popout_"],
+[class*="modal_"],
+[class*="layerContainer_"] [class*="layer_"] [class*="content_"] {
+    background-color: #0d0d1a !important;
+    border: 1px solid #1a1a2a !important;
+    border-radius: 2px !important;
+}
+
+/* ── Header / toolbar ───────────────────────────────────── */
+[class*="toolbar_"],
+[class*="header_"][class*="container_"] {
+    background-color: #0d0d1a !important;
+    border-bottom: 1px solid #1a1a2a !important;
+    box-shadow: none !important;
+}
+
+/* ── Dividers — subtle ──────────────────────────────────── */
+[class*="divider_"],
+[class*="separator_"] {
+    border-color: #1a1a2a !important;
+}
+
+/* ── Scrollbars — thin, dark ────────────────────────────── */
+::-webkit-scrollbar {
+    width: 4px;
+}
+::-webkit-scrollbar-thumb {
+    background-color: #1a1a2a;
+    border-radius: 0;
+}
+::-webkit-scrollbar-track {
+    background-color: transparent;
+}
+
+/* ── Selection — cyan ───────────────────────────────────── */
+::selection {
+    background-color: rgba(10, 189, 198, 0.2);
+    color: #0a0a14;
+}
+
+/* ── Reactions — terminal style ─────────────────────────── */
+[class*="reaction_"] {
+    background-color: #0e0e1c !important;
+    border: 1px solid #1a1a2a !important;
+    border-radius: 2px !important;
+}
+
+[class*="reaction_"]:hover {
+    border-color: #0abdc6 !important;
+}
+
+/* ── Server name header ─────────────────────────────────── */
+[class*="header_"][class*="bannerVisible_"],
+[class*="header_"][class*="clickable_"] {
+    background-color: #0d0d1a !important;
+    text-transform: uppercase !important;
+}
+
+/* ── Settings panels ────────────────────────────────────── */
+[class*="contentRegion_"],
+[class*="sidebarRegion_"],
+[class*="standardSidebarView_"] {
+    background-color: #0a0a14 !important;
+}
+
+[class*="sidebarRegion_"] [class*="side_"] {
+    background-color: #0d0d1a !important;
+}
+
+/* ── Glow on focused elements ───────────────────────────── */
+[class*="focused_"],
+*:focus-visible {
+    outline: 1px solid #0072ff !important;
+    outline-offset: -1px;
+    box-shadow: 0 0 4px rgba(0, 114, 255, 0.3) !important;
+}

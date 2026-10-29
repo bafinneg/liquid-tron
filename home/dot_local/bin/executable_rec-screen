@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Record the focused monitor at native resolution via wf-recorder
+# Output: ~/Videos/recordings/<timestamp>.mp4
+
+dir="$HOME/Videos/recordings"
+mkdir -p "$dir"
+
+outfile="$dir/$(date +%Y%m%d-%H%M%S).mp4"
+
+wf-recorder -f "$outfile" &
+notify-send -u normal -i media-record "Recording" "Screen → $outfile (PID $!)"

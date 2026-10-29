@@ -1,0 +1,161 @@
+#!/usr/bin/python3 -I
+"""ares-rgb-alert deny|clear: turn the 7800x case RGB red while the Ares lock shows red, then restore it.
+
+Talks to the running OpenRGB SDK server (openrgb-server.service, 127.0.0.1:6742) directly; the `openrgb --client`
+CLI takes about 5 s per call, this takes well under a second. On deny, the current LED colours of every device are
+saved to $XDG_RUNTIME_DIR/ares-lock/rgb-saved.json (only if no save exists, so repeated denials never save red),
+then every LED is set to Ares red. On clear, the saved colours are written back and the save is removed; with no
+save it loads the `tron-compute` profile. Only colours are written (no mode changes), two writes per alert, so the
+SMBus load is negligible. Exits 0 when the server is not reachable; never blocks the lock (called detached).
+"""
+import json
+import os
+import socket
+import struct
+import sys
+
+HOST, PORT = "127.0.0.1", 6742
+RED = (0xFF, 0x00, 0x3C)          # Ares red (#ff003c)
+PROFILE = "tron-compute"
+SAVE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "ares-lock", "rgb-saved.json")
+
+COUNT, DATA, CLIENT_NAME, LOAD_PROFILE, UPDATE_LEDS = 0, 1, 50, 152, 1050
+
+
+class Sdk:
+    def __init__(self, timeout=3.0):
+        self.s = socket.create_connection((HOST, PORT), timeout=timeout)
+        self.send(0, CLIENT_NAME, b"ares-rgb-alert\0")
+
+    def send(self, dev, pid, payload=b""):
+        self.s.sendall(b"ORGB" + struct.pack("<III", dev, pid, len(payload)) + payload)
+
+    def _recv(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.s.recv(n - len(buf))
+            if not chunk:
+                raise OSError("closed")
+            buf += chunk
+        return buf
+
+    def reply(self, want):
+        while True:
+            hdr = self._recv(16)
+            if hdr[:4] != b"ORGB":
+                raise OSError("bad magic")
+            _, pid, size = struct.unpack("<III", hdr[4:])
+            body = self._recv(size)
+            if pid == want:
+                return body
+
+    def count(self):
+        self.send(0, COUNT)
+        return struct.unpack("<I", self.reply(COUNT)[:4])[0]
+
+    def colors(self, dev):
+        """Current LED colours of a device, parsed from the controller data block (SDK protocol 0)."""
+        self.send(dev, DATA)
+        d = self.reply(DATA)
+        o = [8]                                   # skip data_size (u32) and device type (i32)
+
+        def u16():
+            v = struct.unpack_from("<H", d, o[0])[0]; o[0] += 2; return v
+
+        def u32():
+            v = struct.unpack_from("<I", d, o[0])[0]; o[0] += 4; return v
+
+        def string():
+            ln = u16()                            # u16() moves o first; add the length afterwards
+            o[0] += ln
+
+        for _ in range(5):                        # name, description, version, serial, location
+            string()
+        n_modes = u16()
+        o[0] += 4                                 # active mode
+        for _ in range(n_modes):
+            string()
+            o[0] += 4 * 9                         # value, flags, speed min/max, colours min/max, speed, direction, colour mode
+            nc = u16()
+            o[0] += 4 * nc                        # mode colours
+        for _ in range(u16()):                    # zones
+            string()
+            o[0] += 4 * 4                         # type, leds min/max/count
+            if u16() > 0:                         # matrix map: height, width, data
+                h, w = u32(), u32()
+                o[0] += 4 * h * w
+        for _ in range(u16()):                    # LEDs: name + value
+            string()
+            o[0] += 4
+        n = u16()
+        if o[0] + 4 * n != len(d):
+            raise ValueError(f"device {dev}: unexpected controller data layout")
+        return [tuple(d[o[0] + 4 * i: o[0] + 4 * i + 3]) for i in range(n)]
+
+    def set_colors(self, dev, cols):
+        body = struct.pack("<H", len(cols)) + b"".join(struct.pack("BBBx", *c) for c in cols)
+        self.send(dev, UPDATE_LEDS, struct.pack("<I", len(body) + 4) + body)
+
+    def load_profile(self, name):
+        self.send(0, LOAD_PROFILE, name.encode() + b"\0")
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def deny(sdk):
+    devs = range(sdk.count())
+    current = {str(i): sdk.colors(i) for i in devs}
+    if not os.path.exists(SAVE):
+        os.makedirs(os.path.dirname(SAVE), exist_ok=True)
+        tmp = SAVE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(current, f)
+        os.replace(tmp, SAVE)
+    for i in devs:
+        sdk.set_colors(i, [RED] * len(current[str(i)]))
+
+
+def clear(sdk):
+    try:
+        with open(SAVE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = None
+    if saved:
+        n = sdk.count()
+        for k, cols in saved.items():
+            if int(k) < n and len(sdk.colors(int(k))) == len(cols):
+                sdk.set_colors(int(k), [tuple(c) for c in cols])
+    else:
+        sdk.load_profile(PROFILE)
+    try:
+        os.remove(SAVE)
+    except OSError:
+        pass
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in ("deny", "clear"):
+        print("usage: ares-rgb-alert deny|clear", file=sys.stderr)
+        return 2
+    try:
+        sdk = Sdk()
+    except OSError:
+        return 0
+    try:
+        (deny if argv[1] == "deny" else clear)(sdk)
+        sdk.count()          # round trip: the server has processed the writes before we disconnect
+    except (OSError, ValueError, struct.error) as e:
+        print(f"ares-rgb-alert: {e}", file=sys.stderr)
+        return 1
+    finally:
+        sdk.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

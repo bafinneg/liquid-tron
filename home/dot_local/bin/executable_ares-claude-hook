@@ -1,0 +1,269 @@
+#!/usr/bin/env -S python3 -I
+"""ares-claude-hook: content-free Claude Code session state for the Ares bar (FEAT-ares-bar-ai-clients C2).
+
+Hook mode (no args): reads one hook payload on stdin and updates
+  $XDG_RUNTIME_DIR/ares/claude/<session_id>.json
+keeping only session id, event name, model, cwd, title, subagent id/type and notification type. Prompts, tool
+input/output, messages and transcript paths are never stored. Always exits 0 and prints nothing. A payload larger than 1 MiB (a big
+tool_response) is ignored; the next event restores the state.
+
+  --install   [--settings PATH]   register an async hook for every event in ~/.claude/settings.json
+  --uninstall [--settings PATH]   remove only the entries this script added
+"""
+import fcntl
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+
+MAX_STDIN = 1 << 20
+SID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+MAX_SUBAGENTS = 32
+EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "StopFailure",
+          "SubagentStart", "SubagentStop", "Notification", "PermissionRequest", "SessionEnd")
+MATCHER_EVENTS = ("PreToolUse", "PostToolUse")
+KEEP = ("session_id", "hook_event_name", "model", "cwd", "session_title", "agent_id", "agent_type",
+        "notification_type")
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def _s(v, n):
+    return v[:n] if isinstance(v, str) else ""
+
+
+def sanitize(payload):
+    """Allow-list copy of the payload; None if it is unusable."""
+    if not isinstance(payload, dict):
+        return None
+    p = {k: payload[k] for k in KEEP if isinstance(payload.get(k), str)}
+    if not SID_RE.match(p.get("session_id", "")):
+        return None
+    return p
+
+
+def apply_event(state, p, t, hermes_parent=""):
+    """Pure transition: returns the new state dict (or None to delete the session)."""
+    ev = p.get("hook_event_name", "")
+    if ev == "SessionEnd":
+        return None
+    cur = dict(state) if isinstance(state, dict) else {}
+    old = cur.get("state")
+    subs = [x for x in cur.get("subagents") or [] if isinstance(x, dict) and isinstance(x.get("id"), str)]
+    new = old
+    if ev == "SessionStart":
+        new = "idle"
+        # A resume/compact SessionStart may omit model or title: keep the previous value then.
+        cur["model"] = _s(p.get("model"), 64) or cur.get("model", "")
+        cur["title"] = _s(p.get("session_title"), 120) or cur.get("title", "")
+    elif ev in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
+        new = "working"
+    elif ev == "SubagentStart":
+        aid = _s(p.get("agent_id"), 64)
+        if aid and all(x["id"] != aid for x in subs) and len(subs) < MAX_SUBAGENTS:
+            subs.append({"id": aid, "type": _s(p.get("agent_type"), 40)})
+        new = "working"
+    elif ev == "SubagentStop":
+        aid = _s(p.get("agent_id"), 64)
+        subs = [x for x in subs if x["id"] != aid]
+    elif ev == "Stop":
+        new, subs = "done", []
+    elif ev == "StopFailure":
+        new = "error"
+    elif ev == "PermissionRequest" or (ev == "Notification" and p.get("notification_type") == "permission_prompt"):
+        new = "needs_you"
+    elif ev == "Notification" and p.get("notification_type") == "idle_prompt":
+        new = "idle"
+    new = new or "idle"
+    if p.get("cwd"):
+        cur["cwd"] = _s(p["cwd"], 512)
+    cur.setdefault("model", "")
+    cur.setdefault("title", "")
+    cur.setdefault("cwd", "")
+    cur["session_id"] = p["session_id"]
+    cur["state"] = new
+    cur["subagents"] = subs
+    cur["since_ms"] = cur["since_ms"] if new == old and isinstance(cur.get("since_ms"), int) else t
+    cur["updated_ms"] = t
+    if hermes_parent:
+        cur["hermes_parent"] = hermes_parent
+    return cur
+
+
+def claude_dir():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    d = os.path.join(runtime, "ares", "claude")
+    for path in (os.path.dirname(d), d):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        os.chmod(path, 0o700)
+    return d
+
+
+def _same_inode(fd, path):
+    try:
+        a, b = os.fstat(fd), os.stat(path)
+    except OSError:
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def handle(payload, hermes_parent=""):
+    p = sanitize(payload)
+    if p is None:
+        return
+    d = claude_dir()
+    path = os.path.join(d, p["session_id"] + ".json")
+    lock = os.path.join(d, p["session_id"] + ".lock")
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if p.get("hook_event_name") != "SessionStart" and not _same_inode(fd, lock):
+            # SessionEnd removed this lock while we waited on it: the session is over, do not resurrect it.
+            return
+        try:
+            with open(path) as f:
+                cur = json.load(f)
+        except (OSError, ValueError):
+            cur = {}
+        new = apply_event(cur, p, now_ms(), hermes_parent)
+        if new is None:
+            for x in (path, lock):
+                try:
+                    os.unlink(x)
+                except OSError:
+                    pass
+            return
+        tmp = tempfile.NamedTemporaryFile("w", dir=d, prefix=".tmp-", suffix=".json", delete=False)
+        try:
+            json.dump(new, tmp)
+            tmp.close()
+            os.chmod(tmp.name, 0o600)
+            os.replace(tmp.name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(fd)
+
+
+# ------------------------------------------------------------------ install / uninstall
+
+def hook_command():
+    return os.path.join(os.environ.get("HOME") or os.path.expanduser("~"), ".local", "bin", "ares-claude-hook")
+
+
+def default_settings():
+    return os.path.join(os.environ.get("HOME") or os.path.expanduser("~"), ".claude", "settings.json")
+
+
+def _group_has(group, cmd):
+    return isinstance(group, dict) and any(isinstance(h, dict) and h.get("command") == cmd
+                                           for h in group.get("hooks") or [])
+
+
+def edit_settings(cfg, cmd, install):
+    """Pure edit; returns (cfg, changed_event_count)."""
+    hooks = cfg.setdefault("hooks", {})       # never deleted on uninstall: an empty "hooks" key is harmless
+    changed = 0
+    for ev in EVENTS:
+        groups = hooks.get(ev)
+        groups = groups if isinstance(groups, list) else []
+        if install:
+            if any(_group_has(g, cmd) for g in groups):
+                continue
+            g = {"hooks": [{"type": "command", "command": cmd, "async": True, "timeout": 5}]}
+            if ev in MATCHER_EVENTS:
+                g = {"matcher": "*", **g}
+            hooks[ev] = groups + [g]
+            changed += 1
+        else:
+            kept = [g for g in groups if not _group_has(g, cmd)]
+            if len(kept) != len(groups):
+                changed += 1
+                if kept:
+                    hooks[ev] = kept
+                else:
+                    del hooks[ev]
+    return cfg, changed
+
+
+def rewrite_settings(path, install):
+    cmd = hook_command()
+    mode = 0o600
+    cfg = {}
+    raw = None
+    if os.path.exists(path):
+        mode = os.stat(path).st_mode & 0o777
+        with open(path) as f:
+            raw = f.read()
+        cfg = json.loads(raw) if raw.strip() else {}
+        if not isinstance(cfg, dict):
+            raise ValueError("settings.json is not an object")
+    elif not install:
+        print("ares-claude-hook: no settings file, nothing to uninstall")
+        return 0
+    cfg, changed = edit_settings(cfg, cmd, install)
+    verb = "installed" if install else "removed"
+    if changed == 0:
+        print(f"ares-claude-hook: {verb} 0 of {len(EVENTS)} events in {path} (unchanged, no backup)")
+        return 0
+    if raw is not None:
+        stamp = time.strftime('%Y%m%d%H%M%S')
+        for n in range(100):                                   # unique name; created owner-only (O_EXCL, 0600)
+            bak = f"{path}.ares-bak-{stamp}" + (f"-{n}" if n else "")
+            try:
+                fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(bak)
+        with os.fdopen(fd, "w") as f:
+            f.write(raw)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", prefix=".settings-", delete=False)
+    try:
+        json.dump(cfg, tmp, indent=2)
+        tmp.write("\n")
+        tmp.close()
+        os.chmod(tmp.name, mode)
+        os.replace(tmp.name, path)
+    except BaseException:
+        os.unlink(tmp.name)
+        raise
+    print(f"ares-claude-hook: {verb} {changed} of {len(EVENTS)} events in {path}")
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ("--install", "--uninstall"):
+        path = default_settings()
+        if "--settings" in argv:
+            i = argv.index("--settings")
+            if i + 1 >= len(argv):
+                print("ares-claude-hook: --settings needs a path", file=sys.stderr)
+                return 2
+            path = argv[i + 1]
+        try:
+            return rewrite_settings(path, argv[0] == "--install")
+        except Exception as e:
+            print(f"ares-claude-hook: {e}", file=sys.stderr)
+            return 1
+    try:
+        raw = sys.stdin.buffer.read(MAX_STDIN)
+        handle(json.loads(raw.decode("utf-8", "replace")), os.environ.get("HERMES_SESSION_ID", "")[:64])
+    except BaseException:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

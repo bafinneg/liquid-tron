@@ -1,0 +1,604 @@
+/*
+ * LIQUID TRON — Feishin custom theme stylesheet
+ * Loaded only while the "Liquid Tron" theme (Themes/liquid-tron.json) is selected.
+ * Source of truth: home-infra docs/aesthetic-design-system.md (Tron Compute palette).
+ *
+ *   bg #0a0a14 | bg_dark #06060c | bg_alt #0d0d1a | bg_inset #0e0e1c | border_dark #1a1a2a
+ *   fg #c0c0d0 | fg_dim #707080 | fg_dark #505060 | white #e0e0f0
+ *   cyan #0abdc6 (chrome/identity) | blue #0072ff (selected fill) | amber #ff8c00 (current location)
+ *   red #ff003c (error/urgent) | green #00ff9f (bounded success)
+ *
+ * Grammar: phosphor typography (IosevkaTerm, uppercase labels; content keeps its casing)
+ * inside softly rounded Tron chrome (8px containers, 6px interactive, 10px ceiling).
+ * No magenta, no decorative glow, one amber signal per surface.
+ */
+
+/* ── Tokens ─────────────────────────────────────────────────────────── */
+:root {
+    --lt-bg: #0a0a14;
+    --lt-bg-dark: #06060c;
+    --lt-bg-alt: #0d0d1a;
+    --lt-bg-inset: #0e0e1c;
+    --lt-border: #1a1a2a;
+    --lt-fg: #c0c0d0;
+    --lt-fg-dim: #707080;
+    --lt-fg-dark: #505060;
+    --lt-white: #e0e0f0;
+    --lt-cyan: #0abdc6;
+    --lt-cyan-40: rgb(10 189 198 / 40%);
+    --lt-cyan-25: rgb(10 189 198 / 25%);
+    --lt-cyan-12: rgb(10 189 198 / 12%);
+    --lt-cyan-06: rgb(10 189 198 / 6%);
+    --lt-blue: #0072ff;
+    --lt-blue-hover: #0065e0;
+    --lt-blue-20: rgb(0 114 255 / 20%);
+    --lt-amber: #ff8c00;
+    --lt-red: #ff003c;
+    --lt-green: #00ff9f;
+    --lt-font: "IosevkaTerm Nerd Font", "IosevkaTerm NF", "Noto Sans JP", "Noto Sans Hebrew", monospace;
+    --lt-radius-chrome: 8px;
+    --lt-radius-interactive: 6px;
+    --lt-label-tracking: 0.06em;
+
+    /* Feishin / Mantine overrides. !important wins over the inline accent and font
+       properties Feishin writes onto <html> from the accent/font settings. */
+    --theme-content-font-family: var(--lt-font) !important;
+    --mantine-font-family: var(--lt-font) !important;
+    --mantine-font-family-headings: var(--lt-font) !important;
+    --theme-colors-primary: var(--lt-cyan) !important;
+    --theme-colors-primary-filled: var(--lt-blue) !important;
+    --theme-colors-primary-contrast: var(--lt-bg-dark) !important;
+    --mantine-primary-color-filled: var(--lt-blue) !important;
+    --mantine-primary-color-filled-hover: var(--lt-blue-hover) !important;
+    --mantine-primary-color-light: var(--lt-blue-20) !important;
+    --mantine-primary-color-light-hover: rgb(0 114 255 / 28%) !important;
+    --mantine-primary-color-light-color: var(--lt-cyan) !important;
+    --mantine-primary-color-contrast: var(--lt-bg-dark) !important;
+    --theme-background-noise: none;
+    --theme-fullscreen-player-text-shadow: none;
+}
+
+:root[data-mantine-color-scheme='dark'] {
+    --theme-colors-border: var(--lt-border);
+    --mantine-color-body: var(--lt-bg);
+    --mantine-color-text: var(--lt-fg);
+    --mantine-color-dimmed: var(--lt-fg-dim);
+    --mantine-color-error: var(--lt-red);
+    --mantine-color-placeholder: var(--lt-fg-dim);
+    --mantine-color-anchor: var(--lt-cyan);
+    --mantine-color-default: var(--lt-bg-inset);
+    --mantine-color-default-hover: var(--lt-bg-alt);
+    --mantine-color-default-color: var(--lt-fg);
+    --mantine-color-default-border: var(--lt-border);
+}
+
+html,
+body {
+    background: var(--lt-bg);
+    font-family: var(--lt-font);
+}
+
+::selection {
+    color: var(--lt-white);
+    background: rgb(0 114 255 / 45%);
+}
+
+:focus-visible {
+    outline-color: var(--lt-cyan) !important;
+}
+
+/* Unclassed links in rendered markdown (release notes, bios) default to browser violet */
+a:not([class]),
+a:not([class]):visited {
+    color: var(--lt-cyan);
+}
+
+/* ── Window bar (custom frame) ──────────────────────────────────────── */
+.fs-window-bar-module-windows-container,
+.fs-window-bar-module-macos-container {
+    background: var(--lt-bg-dark);
+    border-bottom: 1px solid var(--lt-cyan-40);
+}
+
+.fs-window-bar-module-player-status-text {
+    font-size: var(--theme-font-size-sm);
+    color: var(--lt-fg-dim);
+    letter-spacing: var(--lt-label-tracking);
+}
+
+.fs-window-bar-module-windows-button:hover {
+    background: var(--lt-cyan-12);
+}
+
+.fs-window-bar-module-windows-button.fs-window-bar-module-exit:hover {
+    background: var(--lt-red);
+}
+
+/* ── Shell: sidebars and main content ───────────────────────────────── */
+.fs-main-content-module-main-content-container {
+    background: var(--lt-bg);
+}
+
+.fs-left-sidebar-module-container,
+.fs-sidebar-module-container,
+.fs-sidebar-module-accordion-content {
+    background: var(--lt-bg-dark);
+}
+
+.fs-left-sidebar-module-container {
+    border-right: 1px solid var(--lt-border);
+}
+
+.fs-right-sidebar-module-right-sidebar-container {
+    background: var(--lt-bg-dark);
+    border-left: 1px solid var(--lt-border);
+}
+
+.fs-right-sidebar-module-right-sidebar-container.fs-right-sidebar-module-vertical-layout {
+    border-top: 1px solid var(--lt-border);
+}
+
+/* Navigation labels: phosphor uppercase */
+.fs-sidebar-item-module-item,
+.fs-sidebar-item-module-label,
+.fs-sidebar-module-accordion-control,
+.fs-collapsed-sidebar-item-module-text-wrapper {
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+.fs-sidebar-item-module-link {
+    color: var(--lt-fg);
+    border-radius: var(--lt-radius-interactive);
+}
+
+.fs-sidebar-item-module-link:hover,
+.fs-sidebar-module-accordion-control:hover {
+    color: var(--lt-cyan);
+    background: var(--lt-cyan-06);
+}
+
+/* Current location = amber, with a 2px amber rail (mirrors the bar's active workspace) */
+.fs-sidebar-item-module-link.fs-sidebar-item-module-active {
+    color: var(--lt-amber);
+    box-shadow: inset 2px 0 0 var(--lt-amber);
+}
+
+.fs-collapsed-sidebar-item-module-active-tab-indicator {
+    background: var(--lt-amber);
+}
+
+.fs-collapsed-sidebar-item-module-container.fs-collapsed-sidebar-item-module-active svg {
+    fill: var(--lt-amber);
+}
+
+.fs-collapsed-sidebar-item-module-text-wrapper.fs-collapsed-sidebar-item-module-active {
+    color: var(--lt-amber);
+}
+
+.fs-sidebar-collection-list-module-row-active,
+.fs-sidebar-playlist-list-module-row-hover {
+    background-color: var(--lt-cyan-06);
+}
+
+.fs-sidebar-collection-list-module-row-active .fs-sidebar-collection-list-module-row-link,
+.fs-sidebar-playlist-list-module-name-active {
+    color: var(--lt-amber);
+}
+
+/* ── Player bar ─────────────────────────────────────────────────────── */
+[data-mantine-color-scheme='dark'] .fs-player-bar-module-container {
+    background: var(--lt-bg-dark);
+    border-top: 1px solid var(--lt-cyan-40);
+}
+
+.fs-left-controls-module-line-item.fs-left-controls-module-secondary {
+    color: var(--lt-fg-dim);
+}
+
+/* Primary transport: cyan key on void, 6px interactive radius instead of a white disc */
+.fs-player-button-module-main {
+    background: var(--lt-cyan) !important;
+    border-radius: var(--lt-radius-interactive);
+    transition: background-color 0.15s ease-out;
+}
+
+.fs-player-button-module-main:hover {
+    background: var(--lt-white) !important;
+}
+
+.fs-player-button-module-main svg {
+    color: var(--lt-bg-dark);
+    fill: var(--lt-bg-dark);
+}
+
+.fs-player-button-module-secondary,
+.fs-player-button-module-secondary svg {
+    color: var(--lt-fg);
+}
+
+.fs-player-button-module-player-button:hover svg {
+    color: var(--lt-cyan);
+}
+
+.fs-player-button-module-player-button.fs-player-button-module-active svg {
+    fill: var(--lt-cyan);
+    color: var(--lt-cyan);
+}
+
+/* Seek bar: cyan progress, amber playhead */
+.fs-playerbar-slider-module-bar {
+    background-color: var(--lt-cyan);
+}
+
+.fs-playerbar-slider-module-root:hover .fs-playerbar-slider-module-bar {
+    background-color: var(--lt-cyan);
+}
+
+.fs-playerbar-slider-module-thumb {
+    background: var(--lt-amber);
+    border-color: var(--lt-amber);
+}
+
+.fs-slider-module-thumb {
+    background: var(--lt-cyan);
+    border-color: var(--lt-cyan);
+}
+
+.fs-slider-module-track::before {
+    background: var(--lt-border);
+}
+
+.fs-playerbar-slider-module-label,
+.fs-slider-module-label,
+.fs-center-controls-module-slider-value-wrapper,
+.fs-playerbar-slider-module-slider-value-wrapper {
+    font-variant-numeric: tabular-nums;
+}
+
+.fs-playerbar-slider-module-label,
+.fs-slider-module-label {
+    color: var(--lt-fg);
+    background: var(--lt-bg-alt);
+    border: 1px solid var(--lt-cyan-40);
+    border-radius: var(--lt-radius-interactive);
+    box-shadow: none;
+}
+
+/* ── Play buttons (headers, cards) ──────────────────────────────────── */
+.fs-play-button-module-play-button,
+.fs-play-button-module-text-button,
+[data-mantine-color-scheme='dark'] .fs-play-button-module-text-button.fs-play-button-module-unthemed {
+    color: var(--lt-bg-dark);
+    background: var(--lt-cyan);
+    border-radius: var(--lt-radius-interactive);
+}
+
+.fs-play-button-module-play-button::before {
+    background-color: var(--lt-blue);
+    border-radius: var(--lt-radius-interactive);
+}
+
+.fs-play-button-module-play-button svg,
+[data-mantine-color-scheme='dark'] .fs-play-button-module-text-button.fs-play-button-module-unthemed svg {
+    color: var(--lt-bg-dark);
+    stroke: var(--lt-bg-dark);
+}
+
+.fs-play-button-module-play-button.fs-play-button-module-fill svg {
+    fill: var(--lt-bg-dark);
+}
+
+[data-mantine-color-scheme='dark'] .fs-play-button-module-text-button.fs-play-button-module-unthemed:hover {
+    background: var(--lt-white);
+}
+
+.fs-play-button-module-wide-text-button,
+[data-mantine-color-scheme='dark'] .fs-play-button-module-wide-text-button.fs-play-button-module-unthemed {
+    background: var(--lt-cyan);
+    border-radius: var(--lt-radius-interactive);
+}
+
+.fs-play-button-module-wide-text-button-label,
+.fs-play-button-module-wide-text-button-label svg,
+[data-mantine-color-scheme='dark'] .fs-play-button-module-wide-text-button.fs-play-button-module-unthemed svg {
+    color: var(--lt-bg-dark);
+    fill: var(--lt-bg-dark);
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+/* ── Buttons, badges, tabs, segmented controls ──────────────────────── */
+.fs-button-module-root {
+    border-radius: var(--lt-radius-interactive);
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+.fs-button-module-root[data-variant='filled'] {
+    color: var(--lt-bg-dark);
+    background: var(--lt-blue);
+}
+
+.fs-button-module-root[data-variant='filled']:hover,
+.fs-button-module-root[data-variant='filled']:focus-visible {
+    background: var(--lt-blue-hover);
+}
+
+[data-mantine-color-scheme='dark'] .fs-button-module-root[data-variant='subtle']:hover,
+[data-mantine-color-scheme='dark'] .fs-button-module-root[data-variant='subtle']:active,
+[data-mantine-color-scheme='dark'] .fs-button-module-root[data-variant='subtle']:focus-visible,
+[data-mantine-color-scheme='dark'] .fs-action-icon-module-root[data-variant='subtle']:hover,
+[data-mantine-color-scheme='dark'] .fs-action-icon-module-root[data-variant='subtle']:active,
+[data-mantine-color-scheme='dark'] .fs-action-icon-module-root[data-variant='subtle']:focus-visible {
+    color: var(--lt-cyan);
+    background: var(--lt-cyan-12);
+}
+
+.fs-action-icon-module-root {
+    border-radius: var(--lt-radius-interactive);
+}
+
+.fs-badge-module-root {
+    color: var(--lt-fg);
+    background: var(--lt-bg-inset);
+    border: 1px solid var(--lt-border);
+    border-radius: var(--lt-radius-interactive);
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+.fs-badge-module-root[data-variant='filled'] {
+    color: var(--lt-bg-dark);
+    background: var(--lt-blue);
+    border-color: transparent;
+}
+
+.fs-tabs-module-tab {
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+.fs-tabs-module-tab:hover {
+    color: var(--lt-cyan);
+    background: var(--lt-cyan-06);
+}
+
+.fs-tabs-module-tab[data-active] {
+    color: var(--lt-amber);
+    border-color: var(--lt-amber);
+}
+
+.fs-segmented-control-module-root {
+    background: var(--lt-bg-inset);
+    border: 1px solid var(--lt-border);
+    border-radius: var(--lt-radius-interactive);
+}
+
+.fs-segmented-control-module-label {
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+[data-mantine-color-scheme='dark'] .fs-segmented-control-module-label[data-active='true'] {
+    color: var(--lt-bg-dark);
+    background-color: var(--lt-blue);
+}
+
+.fs-switch-module-track {
+    background-color: var(--lt-bg-inset);
+    border-color: var(--lt-border);
+}
+
+input:checked + .fs-switch-module-track {
+    background-color: var(--lt-blue);
+}
+
+.fs-pill-module-root {
+    border-color: var(--lt-border);
+    border-radius: var(--lt-radius-interactive);
+}
+
+.fs-pill-module-root.fs-pill-module-link:hover {
+    color: var(--lt-cyan);
+    background: var(--lt-cyan-06);
+    border-color: var(--lt-cyan-40);
+}
+
+/* ── Inputs ─────────────────────────────────────────────────────────── */
+.fs-text-input-module-input,
+.fs-password-input-module-input,
+.fs-number-input-module-input,
+.fs-select-module-input,
+.fs-multi-select-module-input,
+.fs-autocomplete-module-input,
+.fs-textarea-module-input,
+.fs-tags-input-module-input,
+.fs-date-picker-module-input,
+.fs-date-time-picker-module-input,
+.fs-file-input-module-input,
+.fs-color-input-module-input,
+.fs-json-input-module-input {
+    color: var(--lt-fg);
+    background: var(--lt-bg-inset) !important;
+    border: 1px solid var(--lt-border) !important;
+    border-radius: var(--lt-radius-interactive);
+}
+
+.fs-text-input-module-input:focus,
+.fs-password-input-module-input:focus-within,
+.fs-number-input-module-input:focus,
+.fs-select-module-input:focus,
+.fs-multi-select-module-input:focus-within,
+.fs-autocomplete-module-input:focus,
+.fs-textarea-module-input:focus,
+.fs-tags-input-module-input:focus-within {
+    border-color: var(--lt-cyan) !important;
+}
+
+.fs-text-input-module-label,
+.fs-select-module-label,
+.fs-file-input-module-label,
+.fs-color-input-module-label {
+    color: var(--lt-fg-dim);
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+.fs-checkbox-module-input:checked {
+    background: var(--lt-blue);
+    border-color: var(--lt-blue);
+}
+
+/* ── Floating chrome: menus, popovers, tooltips, modals ─────────────── */
+.fs-context-menu-module-content,
+.fs-dropdown-menu-module-menu-dropdown,
+.fs-popover-module-dropdown,
+.fs-hover-card-module-dropdown,
+.fs-select-module-dropdown,
+.fs-multi-select-module-dropdown,
+.fs-autocomplete-module-dropdown,
+.fs-tags-input-module-dropdown,
+.fs-color-input-module-dropdown {
+    color: var(--lt-fg);
+    background: var(--lt-bg-alt);
+    border: 1px solid var(--lt-cyan-40);
+    border-radius: var(--lt-radius-chrome);
+    filter: none;
+    box-shadow: 0 8px 24px rgb(0 0 0 / 55%);
+}
+
+.fs-context-menu-module-item,
+.fs-dropdown-menu-module-menu-item,
+.fs-select-module-option {
+    border-radius: var(--lt-radius-interactive);
+}
+
+.fs-context-menu-module-item:hover,
+.fs-context-menu-module-item[data-highlighted],
+.fs-dropdown-menu-module-menu-item:hover,
+.fs-select-module-option:hover {
+    color: var(--lt-cyan);
+    background: var(--lt-cyan-12);
+}
+
+.fs-context-menu-module-divider,
+.fs-dropdown-menu-module-menu-divider {
+    border-color: var(--lt-border);
+    background: var(--lt-border);
+}
+
+.fs-dropdown-menu-module-menu-item-label-danger {
+    color: var(--lt-red);
+}
+
+.fs-tooltip-module-tooltip {
+    font-size: var(--theme-font-size-sm);
+    color: var(--lt-fg);
+    background: var(--lt-bg-alt);
+    border: 1px solid var(--lt-cyan-40);
+    border-radius: var(--lt-radius-interactive);
+    box-shadow: none;
+}
+
+.fs-modal-module-content {
+    background: var(--lt-bg-alt);
+    border: 1px solid var(--lt-cyan-40);
+    border-radius: var(--lt-radius-chrome);
+    filter: none;
+    box-shadow: 0 12px 40px rgb(0 0 0 / 60%);
+}
+
+.fs-modal-module-header {
+    background: var(--lt-bg-alt);
+    border-bottom: 1px solid var(--lt-border);
+}
+
+.fs-modal-module-header h2 {
+    font-size: var(--theme-font-size-xl);
+    color: var(--lt-cyan);
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+/* ── Lists and tables ───────────────────────────────────────────────── */
+.fs-item-table-list-column-module-header-content,
+.fs-item-detail-list-module-track-header-cell {
+    color: var(--lt-fg-dim);
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+.fs-item-table-list-column-module-header-container {
+    border-bottom: 1px solid var(--lt-cyan-25);
+}
+
+.fs-item-table-list-column-module-container.fs-item-table-list-column-module-data-row.fs-item-table-list-column-module-row-hover-highlight-enabled[data-row-hovered='true'],
+.fs-item-detail-list-module-track-row.fs-item-detail-list-module-track-row-hover-highlight-enabled:hover {
+    background-color: var(--lt-cyan-06);
+    box-shadow: none;
+}
+
+[data-mantine-color-scheme='dark'] .fs-item-table-list-column-module-container.fs-item-table-list-column-module-data-row.fs-item-table-list-column-module-row-selected,
+.fs-item-detail-list-module-track-row.fs-item-detail-list-module-track-row-selected {
+    background-color: var(--lt-blue-20);
+    box-shadow: none;
+}
+
+/* Now playing = current location */
+.fs-title-column-module-active,
+.fs-title-artist-column-module-active,
+.fs-title-combined-column-module-active {
+    color: var(--lt-amber);
+}
+
+/* Drag-and-drop insertion markers */
+.fs-item-table-list-column-module-container.fs-item-table-list-column-module-data-row[data-row-dragged-over='top']::after,
+.fs-item-table-list-column-module-container.fs-item-table-list-column-module-data-row[data-row-dragged-over='bottom']::after {
+    background-color: var(--lt-cyan);
+}
+
+/* ── Cards, headers, section titles ─────────────────────────────────── */
+.fs-item-card-module-image-container,
+.fs-library-header-module-image,
+.fs-sidebar-module-sidebar-image {
+    border-radius: var(--lt-radius-chrome);
+}
+
+.fs-item-card-module-favorite-badge,
+.fs-item-card-module-rating-badge,
+.fs-item-detail-list-module-favorite-badge,
+.fs-item-detail-list-module-rating-badge {
+    color: var(--lt-amber);
+}
+
+.fs-grid-carousel-module-custom-title-content,
+.fs-album-artist-detail-content-module-album-section-title,
+.fs-album-artist-detail-content-module-similar-artists-title {
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+.fs-library-header-module-title {
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+
+.fs-feature-carousel-module-badge {
+    color: var(--lt-bg-dark);
+    background: var(--lt-cyan);
+    border-radius: var(--lt-radius-interactive);
+    text-transform: uppercase;
+    letter-spacing: var(--lt-label-tracking);
+}
+
+/* ── Lyrics ─────────────────────────────────────────────────────────── */
+.fs-lyric-line-module-lyric-line.lyrics-line-active,
+.synchronized-lyrics .lyric-line.lyrics-line-active {
+    color: var(--lt-cyan);
+}
+
+/* ── Spinner ────────────────────────────────────────────────────────── */
+.fs-spinner-module-icon {
+    color: var(--lt-cyan);
+}

@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""Exact compare-and-swap of the Noctalia GUI overlay's wallpaper widget membership.
+
+Subcommands:
+  apply                                    add "wallpaper" to bar.main capsule group g2
+  rollback-immediate <backup> <post-sha>   restore the exact pre-apply bytes (hash-guarded)
+  remove-membership                        drift-safe inverse edit for feature removal
+
+Only one line is ever replaced textually; the file is validated with tomllib but never
+re-serialized. The state root is $NOCTALIA_STATE_HOME (default
+~/.local/state/noctalia-primary); the overlay is <root>/noctalia/settings.toml.
+"""
+from __future__ import annotations
+
+import datetime
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import sys
+import tomllib
+from pathlib import Path
+
+PRE_MEMBERS = '[ "status", "system_map" ]'
+POST_MEMBERS = '[ "status", "system_map", "wallpaper" ]'
+PRE_LINE = f"members = {PRE_MEMBERS}"
+POST_LINE = f"members = {POST_MEMBERS}"
+GROUP_HEADER = "[[bar.main.capsule_group]]"
+ID_RE = re.compile(r'^\s*id\s*=\s*"g2"\s*$')
+MEMBERS_RE = re.compile(r"^\s*members\s*=")
+
+
+class Refused(Exception):
+    pass
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def state_root() -> Path:
+    env = os.environ.get("NOCTALIA_STATE_HOME")
+    return Path(env) if env else Path.home() / ".local/state/noctalia-primary"
+
+
+def settings_path() -> Path:
+    return state_root() / "noctalia" / "settings.toml"
+
+
+def backup_dir() -> Path:
+    return state_root() / "wallpaper-control" / "settings-backups"
+
+
+def _no_symlink_dir(path: Path) -> None:
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        raise Refused(f"cannot stat {path}: {e.strerror}") from e
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused(f"{path} is not a real directory")
+
+
+def read_settings() -> tuple[bytes, os.stat_result]:
+    root = state_root()
+    _no_symlink_dir(root)
+    _no_symlink_dir(root / "noctalia")
+    path = settings_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise Refused(f"cannot open overlay (symlink or missing): {e.strerror}") from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused("overlay is not a regular file")
+        if st.st_uid != os.getuid():
+            raise Refused("overlay is owned by a different user")
+        with os.fdopen(os.dup(fd), "rb") as f:
+            return f.read(), st
+    finally:
+        os.close(fd)
+
+
+def _parse(data: bytes) -> dict:
+    try:
+        return tomllib.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise Refused(f"overlay does not parse: {e}") from e
+
+
+def _all_groups(doc: dict) -> list[dict]:
+    groups: list[dict] = []
+    bar = doc.get("bar", {})
+    if isinstance(bar, dict):
+        for section in bar.values():
+            if isinstance(section, dict) and isinstance(section.get("capsule_group"), list):
+                groups.extend(g for g in section["capsule_group"] if isinstance(g, dict))
+    return groups
+
+
+def analyze(data: bytes) -> tuple[str, int, list[str]]:
+    """Return (state, member-line index, lines); state is 'pre' or 'post'. Raises Refused."""
+    doc = _parse(data)
+    groups = _all_groups(doc)
+    g2 = [g for g in groups if g.get("id") == "g2"]
+    if len(g2) != 1:
+        raise Refused(f"expected exactly one capsule group g2, found {len(g2)}")
+    main = doc.get("bar", {}).get("main", {}).get("capsule_group", [])
+    if sum(1 for g in main if isinstance(g, dict) and g.get("id") == "g2") != 1:
+        raise Refused("g2 is not in bar.main")
+    members = g2[0].get("members")
+    if not isinstance(members, list):
+        raise Refused("g2 members is not a list")
+    wall_total = sum(1 for g in groups for m in (g.get("members") or []) if m == "wallpaper")
+
+    lines = data.decode("utf-8").splitlines(keepends=True)
+    blocks: list[tuple[int, int]] = []
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("["):
+            if start is not None:
+                blocks.append((start, i))
+            start = i if line.strip() == GROUP_HEADER else None
+    if start is not None:
+        blocks.append((start, len(lines)))
+    g2_blocks = [(a, b) for a, b in blocks if any(ID_RE.match(lines[j].rstrip("\r\n")) for j in range(a + 1, b))]
+    if len(g2_blocks) != 1:
+        raise Refused("g2 capsule group is not uniquely identifiable in the file text")
+    a, b = g2_blocks[0]
+    member_lines = [j for j in range(a + 1, b) if MEMBERS_RE.match(lines[j])]
+    if len(member_lines) != 1:
+        raise Refused("g2 does not have exactly one members line")
+    idx = member_lines[0]
+    text = lines[idx].strip()
+    if text == PRE_LINE and members == ["status", "system_map"] and wall_total == 0:
+        return "pre", idx, lines
+    if text == POST_LINE and members == ["status", "system_map", "wallpaper"] and wall_total == 1:
+        return "post", idx, lines
+    raise Refused("g2 members line is not the exact feature preimage or postimage (drift or duplicate)")
+
+
+def _fsync_dir(d: Path) -> None:
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_install(target: Path, data: bytes, mode: int, uid: int, gid: int) -> None:
+    tmp = target.with_name(f".{target.name}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fchmod(f.fileno(), mode)
+            if (uid, gid) != (os.getuid(), os.getgid()):
+                os.fchown(f.fileno(), uid, gid)
+            os.fsync(f.fileno())
+        os.rename(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(target.parent)
+
+
+def make_backup(data: bytes, st: os.stat_result) -> Path:
+    d = backup_dir()
+    wc = d.parent
+    root = state_root()
+    _no_symlink_dir(root)
+    for p in (wc, d):
+        if p.exists() or p.is_symlink():
+            _no_symlink_dir(p)
+        else:
+            os.mkdir(p, 0o700)
+        os.chmod(p, 0o700)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name = f"settings-{stamp}-{secrets.token_hex(4)}.toml"
+    path = d / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    meta = {"sha256": sha256(data), "mode": stat.S_IMODE(st.st_mode), "uid": st.st_uid, "gid": st.st_gid}
+    mfd = os.open(str(path) + ".meta.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(mfd, "w") as f:
+        json.dump(meta, f)
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_dir(d)
+    return path
+
+
+def _swap_line(lines: list[str], idx: int, old: str, new: str) -> bytes:
+    if old not in lines[idx]:
+        raise Refused("member line changed during edit")
+    out = list(lines)
+    out[idx] = lines[idx].replace(old, new, 1)
+    return "".join(out).encode("utf-8")
+
+
+def _install_checked(data: bytes, new: bytes, expect_state: str, st: os.stat_result) -> None:
+    state, _, _ = analyze(new)  # parse + structural validation before rename
+    if state != expect_state:
+        raise Refused("reconstructed overlay failed validation")
+    if len(data.splitlines()) != len(new.splitlines()):
+        raise Refused("reconstructed overlay changed line count")
+    atomic_install(settings_path(), new, stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+
+
+def cmd_apply() -> int:
+    data, st = read_settings()
+    state, idx, lines = analyze(data)
+    if state == "post":
+        print("already-applied")
+        print(f"sha256={sha256(data)}")
+        return 0
+    new = _swap_line(lines, idx, PRE_LINE, POST_LINE)
+    _parse(new)
+    backup = make_backup(data, st)
+    _install_checked(data, new, "post", st)
+    print(f"backup={backup}")
+    print(f"original_sha256={sha256(data)}")
+    print(f"new_sha256={sha256(new)}")
+    return 0
+
+
+def cmd_rollback_immediate(backup_arg: str, post_sha: str) -> int:
+    if not re.fullmatch(r"[0-9a-f]{64}", post_sha):
+        raise Refused("post-apply sha256 must be 64 lowercase hex")
+    backup = Path(backup_arg)
+    d = backup_dir()
+    _no_symlink_dir(d)
+    if backup.parent != d or backup.is_symlink() or not backup.name.startswith("settings-"):
+        raise Refused("backup is not a managed backup file")
+    bst = os.lstat(backup)
+    if not stat.S_ISREG(bst.st_mode) or stat.S_IMODE(bst.st_mode) != 0o600:
+        raise Refused("backup is not a regular mode-0600 file")
+    try:
+        meta = json.loads(Path(str(backup) + ".meta.json").read_text())
+        old = backup.read_bytes()
+    except (OSError, ValueError) as e:
+        raise Refused(f"backup metadata unreadable: {e}") from e
+    if not isinstance(meta, dict) or meta.get("sha256") != sha256(old):
+        raise Refused("backup bytes do not match recorded hash")
+    mode, uid, gid = meta.get("mode"), meta.get("uid"), meta.get("gid")
+    if not all(type(v) is int for v in (mode, uid, gid)):
+        raise Refused("backup metadata malformed")
+    current, _ = read_settings()
+    if sha256(current) != post_sha:
+        raise Refused("overlay no longer matches the recorded post-apply hash; use remove-membership")
+    _parse(old)
+    atomic_install(settings_path(), old, mode, uid, gid)
+    print(f"restored_sha256={sha256(old)}")
+    return 0
+
+
+def cmd_remove_membership() -> int:
+    data, st = read_settings()
+    state, idx, lines = analyze(data)
+    if state != "post":
+        raise Refused("wallpaper membership is not present in the exact feature form")
+    new = _swap_line(lines, idx, ', "wallpaper"', "")
+    _parse(new)
+    backup = make_backup(data, st)
+    _install_checked(data, new, "pre", st)
+    print(f"backup={backup}")
+    print(f"original_sha256={sha256(data)}")
+    print(f"new_sha256={sha256(new)}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    try:
+        if argv == ["apply"]:
+            return cmd_apply()
+        if len(argv) == 3 and argv[0] == "rollback-immediate":
+            return cmd_rollback_immediate(argv[1], argv[2])
+        if argv == ["remove-membership"]:
+            return cmd_remove_membership()
+        print("usage: noctalia-wallpaper-widget-migrate apply | rollback-immediate <backup> <post-sha256> | remove-membership", file=sys.stderr)
+        return 64
+    except Refused as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

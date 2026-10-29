@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Emit one frame of Herm's bundled Ares eikon for hyprlock's cmd[update] label.
+#
+# With no arguments, this behaves as the plain frame emitter used by the single
+# hyprlock label (display chosen by EDID desc: in hyprlock.conf). The optional
+# placement argument is retained only as inert
+# compatibility for the retired placement-rotation experiment; current hyprlock
+# must not wire it into multiple labels after the 2026-06-07 crash.
+set -euo pipefail
+
+BASE_DIR="${HOME}/.config/hypr/assets/eikons/ares"
+FPS=16
+TICK_NS=$((1000000000 / FPS))
+TOTAL_FRAMES=360
+ROTATE_SECONDS=180
+PLACEMENTS=(
+  top-left
+  top-center
+  top-right
+  middle-left
+  middle-right
+  bottom-left
+  bottom-center
+  bottom-right
+)
+
+placement_arg="${1:-}"
+runtime_dir="${TMPDIR:-/tmp}"
+state_dir="${runtime_dir}/hyprlock-ares-eikon-${UID:-$(id -u)}"
+seed_file="${state_dir}/placement-seed"
+
+ensure_seed() {
+  mkdir -p "$state_dir"
+  if [[ ! -s "$seed_file" ]]; then
+    local seed
+    seed="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ ! "$seed" =~ ^[0-9]+$ ]]; then
+      seed="$(( ($(date +%s) << 16) ^ $$ ^ RANDOM ))"
+    fi
+    printf '%s\n' "$seed" > "$seed_file"
+  fi
+}
+
+placement_index_for_bucket() {
+  local bucket="$1"
+  local count="${#PLACEMENTS[@]}"
+  local seed mixed candidate prev prev_mixed offset
+
+  seed="$(<"$seed_file")"
+  if [[ ! "$seed" =~ ^[0-9]+$ ]]; then
+    seed=1
+  fi
+
+  mixed=$(( (seed + bucket * 1103515245 + bucket * bucket * 12345) & 0x7fffffff ))
+  candidate=$(( mixed % count ))
+
+  if (( bucket > 0 && count > 1 )); then
+    prev_mixed=$(( (seed + (bucket - 1) * 1103515245 + (bucket - 1) * (bucket - 1) * 12345) & 0x7fffffff ))
+    prev=$(( prev_mixed % count ))
+    if (( candidate == prev )); then
+      offset=$(( 1 + (mixed / count) % (count - 1) ))
+      candidate=$(( (candidate + offset) % count ))
+    fi
+  fi
+
+  printf '%s\n' "$candidate"
+}
+
+active_placement() {
+  local now_s bucket index
+  ensure_seed
+  now_s="$(date +%s)"
+  bucket=$(( now_s / ROTATE_SECONDS ))
+  index="$(placement_index_for_bucket "$bucket")"
+  printf '%s\n' "${PLACEMENTS[$index]}"
+}
+
+if [[ "$placement_arg" == "--active-placement" ]]; then
+  active_placement
+  exit 0
+fi
+
+if [[ -n "$placement_arg" ]]; then
+  active="$(active_placement)"
+  if [[ "$placement_arg" != "$active" ]]; then
+    exit 0
+  fi
+fi
+
+# GNU date is available on the 7800X Arch host. Fall back to seconds if a
+# future environment lacks %N, degrading cadence but still rendering safely.
+now_ns="$(date +%s%N 2>/dev/null || true)"
+if [[ ! "$now_ns" =~ ^[0-9]+$ ]]; then
+  now_ns="$(( $(date +%s) * 1000000000 ))"
+fi
+
+tick=$(( (now_ns / TICK_NS) % TOTAL_FRAMES ))
+state="idle"
+frame="$tick"
+
+if (( tick < 65 )); then
+  state="idle"
+  frame="$tick"
+elif (( tick < 147 )); then
+  state="listening"
+  frame="$((tick - 65))"
+elif (( tick < 180 )); then
+  state="thinking"
+  frame="$((tick - 147))"
+elif (( tick < 262 )); then
+  state="speaking"
+  frame="$((tick - 180))"
+elif (( tick < 327 )); then
+  state="working"
+  frame="$((tick - 262))"
+else
+  state="error"
+  frame="$((tick - 327))"
+fi
+
+printf -v file '%s/frames/%s/%03d.txt' "$BASE_DIR" "$state" "$frame"
+
+if [[ -r "$file" ]]; then
+  cat "$file"
+else
+  printf '<span foreground="#ff003c">ARES EIKON FRAME MISSING: %s/%03d</span>\n' "$state" "$frame"
+fi

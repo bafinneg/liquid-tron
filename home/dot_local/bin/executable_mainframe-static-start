@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Mainframe Static Wallpaper — low-overhead desktop default.
+# Preserves the production triptych mapping while avoiding three continuous
+# 4K/60 HEVC mpvpaper decoders. Run mainframe-parallax-start to restore motion.
+
+# Every direct and startup route goes through the wallpaper control plane (state +
+# lock owner). The controller re-enters this body with WALLPAPER_CONTROL_INTERNAL=1.
+if [[ "${WALLPAPER_CONTROL_INTERNAL:-}" != "1" ]]; then
+    exec "$HOME/.local/bin/wallpaper-control" apply-mainframe mainframe-static
+fi
+
+WALLPAPER_DIR="$HOME/Pictures/Wallpapers/parallax"
+STATIC_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mainframe-static"
+PID_FILE="/tmp/tron-parallax.pid"
+PID_MAP_FILE="/tmp/tron-parallax-logs/pids.tsv"
+
+mkdir -p "$STATIC_DIR"
+
+declare -A MONITOR_IMAGE
+declare -a MONITOR_ORDER
+
+resolve_monitors() {
+    local monitors center left right
+    monitors=$(hyprctl monitors -j)
+
+    center=$(python3 -c '
+import json, sys
+for monitor in json.load(sys.stdin):
+    if "PG42UQ" in monitor.get("description", ""):
+        print(monitor["name"])
+        break
+' <<<"$monitors")
+    left=$(python3 -c '
+import json, sys
+monitors = [m for m in json.load(sys.stdin) if "AW2725Q" in m.get("description", "")]
+monitors.sort(key=lambda m: m["x"])
+if monitors:
+    print(monitors[0]["name"])
+' <<<"$monitors")
+    right=$(python3 -c '
+import json, sys
+monitors = [m for m in json.load(sys.stdin) if "AW2725Q" in m.get("description", "")]
+monitors.sort(key=lambda m: m["x"])
+if len(monitors) >= 2:
+    print(monitors[1]["name"])
+' <<<"$monitors")
+
+    if [[ -z "$center" || -z "$left" || -z "$right" ]]; then
+        printf 'ERROR: expected center PG42UQ and two AW2725Q displays\n' >&2
+        return 1
+    fi
+
+    MONITOR_ORDER=("$left" "$center" "$right")
+    # Asset names describe source art, not physical monitor roles.
+    MONITOR_IMAGE["$left"]="$STATIC_DIR/mainframe-center.png"
+    MONITOR_IMAGE["$center"]="$STATIC_DIR/mainframe-left.png"
+    MONITOR_IMAGE["$right"]="$STATIC_DIR/mainframe-right.png"
+}
+
+extract_frame_if_needed() {
+    local role="$1"
+    local source="$WALLPAPER_DIR/mainframe-${role}-parallax.mp4"
+    local target="$STATIC_DIR/mainframe-${role}.png"
+
+    if [[ ! -s "$target" || "$source" -nt "$target" ]]; then
+        ffmpeg -nostdin -hide_banner -loglevel error \
+            -ss 5 -i "$source" -frames:v 1 -y "$target"
+    fi
+}
+
+stop_animated_stack() {
+    systemctl --user stop mpvpaper-restart.timer 2>/dev/null || true
+    systemctl --user stop wallpaper-rotate.timer 2>/dev/null || true
+    local monitor
+    for monitor in DP-2 DP-3 DP-4; do
+        systemctl --user stop "mpvpaper-parallax-${monitor}.service" 2>/dev/null || true
+    done
+    killall mpvpaper 2>/dev/null || true
+    rm -f "$PID_FILE" "$PID_MAP_FILE"
+}
+
+ensure_awww() {
+    if ! pgrep -x awww-daemon >/dev/null 2>&1; then
+        awww-daemon -q >/dev/null 2>&1 &
+        disown
+    fi
+
+    local socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-1}-awww-daemon.sock"
+    for _ in {1..40}; do
+        [[ -S "$socket" ]] && return 0
+        sleep 0.1
+    done
+
+    printf 'ERROR: awww-daemon socket did not become ready: %s\n' "$socket" >&2
+    return 1
+}
+
+main() {
+    extract_frame_if_needed left
+    extract_frame_if_needed center
+    extract_frame_if_needed right
+    resolve_monitors
+    stop_animated_stack
+    ensure_awww
+
+    local monitor
+    for monitor in "${MONITOR_ORDER[@]}"; do
+        awww img "${MONITOR_IMAGE[$monitor]}" \
+            --outputs "$monitor" \
+            --resize crop \
+            --transition-type none
+    done
+
+    awww query
+}
+
+main "$@"

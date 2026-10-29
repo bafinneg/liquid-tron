@@ -1,0 +1,56 @@
+{
+  "mode": "dark",
+  "colors": {
+    "background": "#0a0a14",
+    "background-alternate": "#06060c",
+    "black": "#06060c",
+    "foreground": "#c0c0d0",
+    "foreground-muted": "#707080",
+    "primary": "#0abdc6",
+    "state-error": "#ff003c",
+    "state-info": "#0abdc6",
+    "state-success": "#00ff9f",
+    "state-warning": "#ff8c00",
+    "surface": "#0d0d1a",
+    "surface-foreground": "#c0c0d0",
+    "white": "#e0e0f0"
+  },
+  "app": {
+    "overlay-header": "linear-gradient(transparent 0%, rgb(6 6 12 / 88%) 100%)",
+    "overlay-subheader": "linear-gradient(180deg, rgb(6 6 12 / 5%) 0%, var(--theme-colors-background) 100%)",
+    "scrollbar-handle-active-background": "rgb(10 189 198 / 60%)",
+    "scrollbar-handle-background": "rgb(10 189 198 / 20%)",
+    "scrollbar-handle-border-radius": "0",
+    "scrollbar-handle-hover-background": "rgb(10 189 198 / 40%)",
+    "scrollbar-size": "8px",
+    "scrollbar-track-active-background": "transparent",
+    "scrollbar-track-background": "transparent",
+    "scrollbar-track-border-radius": "0",
+    "scrollbar-track-hover-background": "transparent"
+  },
+  "mantineOverride": {
+    "defaultRadius": "sm",
+    "radius": {
+      "xs": "3px",
+      "sm": "6px",
+      "md": "8px",
+      "lg": "8px",
+      "xl": "10px"
+    },
+    "colors": {
+      "dark": [
+        "#c0c0d0",
+        "#a8a8b8",
+        "#707080",
+        "#505060",
+        "#1a1a2a",
+        "#141424",
+        "#0e0e1c",
+        "#0a0a14",
+        "#0d0d1a",
+        "#06060c"
+      ]
+    }
+  },
+  "stylesheets": ["liquid-tron.css"]
+}

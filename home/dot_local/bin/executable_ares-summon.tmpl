@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# ares-summon (FEAT-lt29 C3): bring the Hermes desktop window to the focused monitor's workspace.
+#
+#   ares-summon           move Hermes to the focused workspace and focus it (launch it when not running);
+#                         does nothing while blocked
+#   ares-summon --guard   exit 1 when blocked, else 0 (the Ares panel refuses to open on 1)
+#   ares-summon --hermes <id>
+#                         open that Conversation in the Hermes desktop (hermes://open/<id>), then summon the window
+#   ares-summon --claude <uuid> <cwd>
+#                         open kitty running `claude --resume <uuid>` in <cwd> (an existing directory under $HOME)
+#
+# Blocked = session locked (hyprlock, the ares-lock Quickshell session, or Noctalia's own lockscreen), gaming mode,
+# or a fullscreen window on the active workspace. Lock signals are only read; this never starts or stops a lock.
+set -euo pipefail
+
+export HOME={{ .chezmoi.homeDir }}
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
+
+HERMES_CLASS="com.nousresearch.hermes"
+WINDOW="class:^(${HERMES_CLASS})\$"
+SYSTEM_MODE="${ARES_SYSTEM_MODE_FILE:-$HOME/.local/state/system-mode}"
+HERMES_DESKTOP_BIN="${HERMES_DESKTOP_BIN:-{{ .chezmoi.homeDir }}/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes}"
+CLAUDE_BIN="${ARES_CLAUDE_BIN:-{{ .chezmoi.homeDir }}/.local/bin/claude}"
+KITTY_BIN="${ARES_KITTY_BIN:-kitty}"
+
+usage() {
+    echo "usage: ares-summon [--guard | --hermes <id> | --claude <uuid> <cwd>]" >&2
+}
+
+if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+    newest=""
+    for entry in "$XDG_RUNTIME_DIR"/hypr/*; do
+        [[ -e "$entry" ]] || continue
+        if [[ -z "$newest" || "$entry" -nt "$newest" ]]; then
+            newest="$entry"
+        fi
+    done
+    if [[ -n "$newest" ]]; then
+        export HYPRLAND_INSTANCE_SIGNATURE="${newest##*/}"
+    fi
+fi
+
+blocked() {
+    if pidof hyprlock >/dev/null 2>&1; then
+        return 0
+    fi
+    if pgrep -u "$(id -u)" -f 'qs -n -c ares-lock' >/dev/null 2>&1; then
+        return 0
+    fi
+    if noctalia-primary-msg status 2>/dev/null | jq -e '.locked == true' >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ -r "$SYSTEM_MODE" ]]; then
+        local mode
+        mode="$(<"$SYSTEM_MODE")"
+        mode="${mode//[[:space:]]/}"
+        if [[ "$mode" == "gaming" ]]; then
+            return 0
+        fi
+    fi
+    if hyprctl -j activeworkspace 2>/dev/null | jq -e '.hasfullscreen == true' >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+hermes_clients() {
+    hyprctl -j clients | jq --arg c "$HERMES_CLASS" '[.[] | select(.class == $c)] | length'
+}
+
+# The running app receives the URL through second-instance argv; a cold start gets it as its own argv.
+open_hermes_conversation() {
+    setsid -f "$HERMES_DESKTOP_BIN" --ozone-platform=wayland "hermes://open/$1" </dev/null >/dev/null 2>&1
+}
+
+summon() {
+    local id clients
+    id="$(hyprctl -j monitors | jq -r '.[] | select(.focused) | .activeWorkspace.id' | head -n 1)"
+    clients="$(hermes_clients)"
+    if [[ "$clients" == "0" ]]; then
+        gtk-launch "$HERMES_CLASS"
+        return 0
+    fi
+    if [[ ! "$id" =~ ^-?[0-9]+$ ]]; then
+        return 0
+    fi
+    hyprctl dispatch "hl.dsp.window.move({workspace=\"${id}\", window=\"${WINDOW}\"})"
+    hyprctl dispatch "hl.dsp.focus({window=\"${WINDOW}\"})"
+}
+
+summon_hermes() {
+    local clients
+    clients="$(hermes_clients)"
+    open_hermes_conversation "$1"
+    if [[ "$clients" == "0" ]]; then
+        return 0
+    fi
+    summon
+}
+
+case "$#:${1:-}" in
+    1:--guard)
+        if blocked; then
+            exit 1
+        fi
+        exit 0
+        ;;
+    0:)
+        if blocked; then
+            exit 0
+        fi
+        summon
+        ;;
+    2:--hermes)
+        if [[ ! "$2" =~ ^[A-Za-z0-9_.-]{1,128}$ ]]; then
+            usage
+            exit 2
+        fi
+        if blocked; then
+            exit 0
+        fi
+        summon_hermes "$2"
+        ;;
+    3:--claude)
+        if [[ ! "$2" =~ ^[0-9a-fA-F-]{36}$ || "$3" != /* || ! -d "$3" ]]; then
+            usage
+            exit 2
+        fi
+        real="$(cd -P -- "$3" && pwd -P)"
+        if [[ "$real" != "$HOME"/* ]]; then
+            usage
+            exit 2
+        fi
+        if blocked; then
+            exit 0
+        fi
+        setsid -f "$KITTY_BIN" --directory "$real" -- "$CLAUDE_BIN" --resume "$2" </dev/null >/dev/null 2>&1
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
